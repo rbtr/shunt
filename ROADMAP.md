@@ -15,8 +15,18 @@ welcome.
   is up-to-one-interval latency and steady API traffic. The
   `auto_merge_pull_request` webhook is not wired yet.
 - **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
-- **Serial per branch.** One batch is in flight at a time per `(repo, base)`. No
-  speculative parallel batches, so throughput is bounded by gate-CI latency.
+- **Serial per branch, serial bisection.** One batch is in flight at a time per
+  `(repo, base)`, and the bisection tree is walked depth-first one node at a time.
+  When more than one PR in a batch is broken, the independent subtrees that
+  isolate them are tested sequentially even though they could run concurrently —
+  so time-to-merge grows with the number of broken PRs. No speculative parallel
+  batches, so throughput is bounded by gate-CI latency.
+- **Global-only configuration.** Every knob is a process-wide environment
+  variable; there are no per-repository overrides yet.
+- **No batch-accumulation window.** A batch is formed the moment the engine is
+  idle and any PR is ready, so under low or bursty traffic batching is incidental
+  (it only happens because earlier batches were still testing) rather than an
+  intentional, tunable wait.
 - **Coarse conflict handling.** A PR that conflicts only with a *batch-mate*
   (not the base) is bounced, even though it would merge fine on its own.
 - **No automated forge-integration tests.** The bisection state machine is unit
@@ -36,7 +46,28 @@ welcome.
 - Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
   immediately, keeping the poll as a backstop.
 
-### v0.3 — Correctness & safety
+### v0.3 — Throughput & configurability
+- **Per-repository configuration.** A mechanism for per-repo overrides on top of
+  the global defaults (the natural carrier is a small config file in the repo,
+  e.g. `.shunt.yml`, discovered alongside the existing topic opt-in). This is a
+  prerequisite for the two items below, which both need to be tunable globally
+  **and** per repo.
+- **Parallelizable bisection.** When a batch fails and splits, test the
+  independent subtrees concurrently instead of strictly depth-first, so isolating
+  N>1 broken PRs costs closer to the depth of the tree than the sum of its nodes.
+  Bounded by a configurable fan-out limit (global default + per-repo override),
+  since each parallel branch consumes a runner and a staging branch. Must
+  preserve the two invariants in `docs/design.md`: the ascending merge-order
+  guarantee, and "every batch is validated against the real base it lands on"
+  (parallel subtrees are staged speculatively on the pre-merge base, so a winning
+  subtree is re-validated or ordered before it lands rather than fast-tracked).
+- **Configurable batch-linger window.** Before forming the first batch, optionally
+  wait up to a duration *or* until a target number of PRs are ready
+  (whichever comes first), so bursty and low-traffic repos batch intentionally.
+  Global default with per-repo override; `0` preserves today's
+  form-immediately behavior.
+
+### v0.4 — Correctness & safety
 - Retry a conflicting PR on its own before bouncing it.
 - Re-validate a PR's head SHA immediately before the gated merge (close the
   mid-test-update race).
@@ -44,7 +75,7 @@ welcome.
   interactions; document supported combinations.
 - Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
 
-### v0.4 — Observability & ops
+### v0.5 — Observability & ops
 - Prometheus metrics (batches, runs, bounces, queue depth, time-in-queue).
 - A queue status surface (a sticky per-repo PR comment and/or a small status
   page) since the forge can't host a native one.
