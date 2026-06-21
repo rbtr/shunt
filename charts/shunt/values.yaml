@@ -1,0 +1,58 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/rbtr/shunt
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+config:
+  instance: "https://forge.example.com"
+  publicUrl: ""
+  topic: "merge-queue"
+  repo: ""
+  base: "main"
+  botUser: "mq-bot"
+  botEmail: ""
+  statusContext: "merge-queue"
+  mergeStyle: "merge"
+  maxBatch: "0"
+  pollInterval: "10s"
+  listen: ":8080"
+
+token:
+  existingSecret: shunt-bot
+  key: token
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

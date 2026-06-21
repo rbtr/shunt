@@ -104,14 +104,24 @@ is discovered and managed automatically. For a single repo, set
 
 ## Deploy
 
-Single static binary or a tiny container (`alpine/git` base — shunt shells out
-to `git`). Build for your runtime arch:
+Download a binary from the GitHub release, run the GHCR image, or deploy with
+Helm/Kustomize. The container intentionally includes native `git` rather than a
+pure-Go git library so staging merges match real Git behavior.
 
 ```sh
-make docker PLATFORM=linux/amd64   # or linux/arm64
+cp examples/.env.example .env
+$EDITOR .env
+docker run --rm --env-file .env ghcr.io/rbtr/shunt:latest
+
+helm install shunt oci://ghcr.io/rbtr/charts/shunt \
+  --version 0.1.0 \
+  --set config.instance=https://forge.example.com \
+  --set token.existingSecret=shunt-bot
+
+kubectl apply -k deploy/kustomize/base
 ```
 
-- Kubernetes: [`examples/kubernetes.yaml`](examples/kubernetes.yaml)
+- Kubernetes manifest: [`examples/kubernetes.yaml`](examples/kubernetes.yaml)
 - Docker Compose: [`examples/docker-compose.yml`](examples/docker-compose.yml)
 
 ## Compatibility

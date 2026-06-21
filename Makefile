@@ -2,7 +2,7 @@ BINARY   := shunt
 IMAGE    ?= shunt:dev
 PLATFORM ?= linux/amd64
 
-.PHONY: build test vet fmt lint docker run tidy clean
+.PHONY: build test vet fmt lint docker helm-lint kustomize run tidy clean
 
 build: ## Build the static binary
 	CGO_ENABLED=0 go build -trimpath -o $(BINARY) ./cmd/shunt
@@ -22,6 +22,12 @@ lint: ## gofmt + vet check (CI gate)
 
 docker: ## Build the container image (set PLATFORM=linux/arm64 to cross-build)
 	podman build --platform $(PLATFORM) -t $(IMAGE) .
+
+helm-lint: ## Lint the Helm chart
+	helm lint charts/shunt
+
+kustomize: ## Render the Kustomize base
+	kubectl kustomize deploy/kustomize/base >/dev/null
 
 run: build ## Build + run (expects SHUNT_* env)
 	./$(BINARY)
