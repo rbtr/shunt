@@ -45,10 +45,14 @@ func (s *Stager) BuildStaging(base, stagingBranch string, refs []MergedRef) (sha
 
 	dir := parent + "/repo"
 	askpass := parent + "/askpass.sh"
+	tokenFile := parent + "/token"
+	if err := os.WriteFile(tokenFile, []byte(s.gitToken), 0600); err != nil {
+		return "", 0, err
+	}
 	if err := os.WriteFile(askpass, []byte(`#!/bin/sh
 case "$1" in
 *Username*) printf '%s\n' "$SHUNT_GIT_USER" ;;
-*Password*) printf '%s\n' "$SHUNT_GIT_TOKEN" ;;
+*Password*) cat "$SHUNT_GIT_TOKEN_FILE" ;;
 *) exit 1 ;;
 esac
 `), 0700); err != nil {
@@ -61,11 +65,11 @@ esac
 		if len(args) > 0 && args[0] != "clone" {
 			cmd.Dir = dir
 		}
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(filteredEnv(),
 			"GIT_ASKPASS="+askpass,
 			"GIT_TERMINAL_PROMPT=0",
 			"SHUNT_GIT_USER="+s.gitUser,
-			"SHUNT_GIT_TOKEN="+s.gitToken,
+			"SHUNT_GIT_TOKEN_FILE="+tokenFile,
 		)
 		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err
@@ -100,4 +104,17 @@ esac
 		return "", 0, fmt.Errorf("push staging: %v: %s", err, out)
 	}
 	return sha, 0, nil
+}
+
+func filteredEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "SHUNT_TOKEN=") ||
+			strings.HasPrefix(kv, "SHUNT_GIT_TOKEN=") ||
+			strings.HasPrefix(kv, "SHUNT_GIT_TOKEN_FILE=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

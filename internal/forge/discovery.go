@@ -56,7 +56,9 @@ type BranchProtection struct {
 // push. It is additive: it never removes existing contexts or whitelist entries.
 func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser string) (changed bool, err error) {
 	var bp BranchProtection
-	getErr := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/%s/branch_protections/%s", owner, repo, base), nil, &bp)
+	path := repoPath(owner, repo)
+	branch := url.PathEscape(base)
+	getErr := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), nil, &bp)
 	if getErr != nil {
 		if !strings.Contains(getErr.Error(), "http 404") {
 			return false, getErr
@@ -71,7 +73,7 @@ func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser st
 			"required_approvals":       0,
 			"block_on_outdated_branch": false,
 		}
-		return true, c.do(http.MethodPost, fmt.Sprintf("/repos/%s/%s/branch_protections", owner, repo), body, nil)
+		return true, c.do(http.MethodPost, fmt.Sprintf("/repos/%s/branch_protections", path), body, nil)
 	}
 	ctxs, wl := bp.StatusCheckContexts, bp.PushWhitelistUsernames
 	need := false
@@ -96,7 +98,7 @@ func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser st
 		"enable_push_whitelist":    true,
 		"push_whitelist_usernames": wl,
 	}
-	return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/%s/branch_protections/%s", owner, repo, base), body, nil)
+	return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), body, nil)
 }
 
 func contains(s []string, v string) bool {
