@@ -10,4 +10,4 @@ resources:
 
 images:
   - name: ghcr.io/rbtr/shunt
-    newTag: latest
+    newTag: 0.1.0

@@ -111,7 +111,7 @@ pure-Go git library so staging merges match real Git behavior.
 ```sh
 cp examples/.env.example .env
 $EDITOR .env
-docker run --rm --env-file .env ghcr.io/rbtr/shunt:latest
+docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.1.0
 
 helm install shunt oci://ghcr.io/rbtr/charts/shunt \
   --version 0.1.0 \

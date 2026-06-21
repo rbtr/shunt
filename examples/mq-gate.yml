@@ -11,9 +11,9 @@ on:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       # Replace with your real suite (build + unit + the heavy end-to-end tests).
       - run: |
           echo "running the full gate suite on $(git rev-parse HEAD)"
