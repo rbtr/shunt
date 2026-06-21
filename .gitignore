@@ -1,0 +1,17 @@
+/shunt
+*.test
+*.out
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+!examples/.env.example
+*.pem
+*.key
+*.crt
+
+# Local build/cache output.
+coverage.*
+dist/
+tmp/

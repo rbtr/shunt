@@ -1,0 +1,77 @@
+# Minimal Kubernetes deployment for shunt. Replace the <...> placeholders.
+#
+# Create the bot token out-of-band (do not commit real secrets):
+#   kubectl -n shunt create secret generic shunt-bot --from-literal=token=<bot-token>
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shunt
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shunt
+  namespace: shunt
+  labels:
+    app: shunt
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # exactly one queue manager; never run two
+  selector:
+    matchLabels:
+      app: shunt
+  template:
+    metadata:
+      labels:
+        app: shunt
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: shunt
+          image: <your-registry>/shunt:latest
+          env:
+            - name: SHUNT_INSTANCE
+              value: "https://forge.example.com"
+            - name: SHUNT_TOPIC
+              value: "merge-queue"
+            - name: HOME # git writes config/temp here
+              value: "/tmp"
+            - name: SHUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: shunt-bot
+                  key: token
+          ports:
+            - containerPort: 8080
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

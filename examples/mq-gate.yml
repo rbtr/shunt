@@ -1,0 +1,20 @@
+# Copy to your repo as .forgejo/workflows/mq-gate.yml (or .github/workflows/).
+#
+# shunt tests batches on `mq/<base>/staging` branches. Scope your heavy suite to
+# those branches so it runs ONCE PER BATCH instead of once per PR. Per-PR
+# workflows can keep a lighter, faster check.
+name: mq-gate
+on:
+  push:
+    branches:
+      - "mq/**"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Replace with your real suite (build + unit + the heavy end-to-end tests).
+      - run: |
+          echo "running the full gate suite on $(git rev-parse HEAD)"
+          # e.g. make test && make e2e
