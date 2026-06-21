@@ -28,7 +28,7 @@ fixture, example, log line, and comment as publishable.
 ```bash
 SLUG=<short-task-slug>
 BRANCH=<branch-name>
-WT="$HOME/.copilot/session-state/${COPILOT_AGENT_SESSION_ID:-manual}/files/worktrees/$SLUG"
+WT="<path-outside-the-shared-repo>/$SLUG"
 
 git fetch origin main --quiet
 git worktree add -b "$BRANCH" "$WT" origin/main
