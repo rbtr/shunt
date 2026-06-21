@@ -42,12 +42,14 @@ func (m *Manager) Refresh() error {
 	if err != nil {
 		return err
 	}
+	seen := make(map[string]bool, len(repos))
 	for _, r := range repos {
 		base := r.DefaultBranch
 		if base == "" {
 			base = "main"
 		}
 		k := keyOf(r.Owner, r.Name, base)
+		seen[k] = true
 		if _, ok := m.engines[k]; ok {
 			continue
 		}
@@ -70,6 +72,12 @@ func (m *Manager) Refresh() error {
 			MaxBatch:      m.cfg.MaxBatch,
 		}, m.fc, st)
 		log.Printf("manager: managing %s", k)
+	}
+	for k := range m.engines {
+		if !seen[k] {
+			delete(m.engines, k)
+			log.Printf("manager: stopped managing %s (topic removed or repo archived)", k)
+		}
 	}
 	return nil
 }

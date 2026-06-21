@@ -1,7 +1,8 @@
 # Minimal Kubernetes deployment for shunt. Replace the <...> placeholders.
 #
-# Create the bot token out-of-band (do not commit real secrets):
-#   kubectl -n shunt create secret generic shunt-bot --from-literal=token=<bot-token>
+# Create the bot token out-of-band from a protected local file or secret manager
+# output. Do not put real tokens directly in shell commands:
+#   kubectl -n shunt create secret generic shunt-bot --from-file=token=./shunt-token
 apiVersion: v1
 kind: Namespace
 metadata:
