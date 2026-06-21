@@ -33,7 +33,6 @@ welcome.
   tested with a mock; live API coverage is still manual.
 - **Limited observability.** Structured logs only — no metrics, no queue UI
   (Forgejo has no plugin surface for a native one).
-- **Single-arch image** is published per build; no multi-arch manifest yet.
 - **Merge commits only.** `rebase` and `squash` merge styles are intentionally
   disabled until their branch-protection and tested-tree semantics are verified.
 
@@ -79,8 +78,7 @@ welcome.
 - Prometheus metrics (batches, runs, bounces, queue depth, time-in-queue).
 - A queue status surface (a sticky per-repo PR comment and/or a small status
   page) since the forge can't host a native one.
-- Multi-arch container manifest; staging-branch GC on startup; optional
-  leader-elected HA.
+- Staging-branch GC on startup; optional leader-elected HA.
 
 ### Validation
 - Burn-in on a real, busy repository with a heavy end-to-end suite and

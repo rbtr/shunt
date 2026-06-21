@@ -23,3 +23,6 @@ jobs:
         run: go build ./...
       - name: test
         run: go test ./...
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint charts/shunt

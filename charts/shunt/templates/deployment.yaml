@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shunt.fullname" . }}
+  labels:
+    {{- include "shunt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "shunt.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "shunt.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: shunt
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: SHUNT_INSTANCE
+              value: {{ .Values.config.instance | quote }}
+            {{- if .Values.config.topic }}
+            - name: SHUNT_TOPIC
+              value: {{ .Values.config.topic | quote }}
+            {{- end }}
+            {{- if .Values.config.repo }}
+            - name: SHUNT_REPO
+              value: {{ .Values.config.repo | quote }}
+            {{- end }}
+            - name: SHUNT_BASE
+              value: {{ .Values.config.base | quote }}
+            - name: SHUNT_BOT_USER
+              value: {{ .Values.config.botUser | quote }}
+            {{- if .Values.config.botEmail }}
+            - name: SHUNT_BOT_EMAIL
+              value: {{ .Values.config.botEmail | quote }}
+            {{- end }}
+            - name: SHUNT_STATUS_CONTEXT
+              value: {{ .Values.config.statusContext | quote }}
+            - name: SHUNT_MERGE_STYLE
+              value: {{ .Values.config.mergeStyle | quote }}
+            - name: SHUNT_MAX_BATCH
+              value: {{ .Values.config.maxBatch | quote }}
+            - name: SHUNT_POLL_INTERVAL
+              value: {{ .Values.config.pollInterval | quote }}
+            {{- if .Values.config.publicUrl }}
+            - name: SHUNT_PUBLIC_URL
+              value: {{ .Values.config.publicUrl | quote }}
+            {{- end }}
+            - name: SHUNT_LISTEN
+              value: {{ .Values.config.listen | quote }}
+            - name: HOME
+              value: /tmp
+            - name: SHUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.token.existingSecret | quote }}
+                  key: {{ .Values.token.key | quote }}
+          ports:
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
