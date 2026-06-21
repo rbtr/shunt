@@ -1,0 +1,11 @@
+services:
+  shunt:
+    build: .
+    image: shunt:dev
+    restart: unless-stopped
+    environment:
+      SHUNT_INSTANCE: https://forge.example.com
+      SHUNT_TOPIC: merge-queue
+      SHUNT_TOKEN: ${SHUNT_TOKEN:?set SHUNT_TOKEN in your environment or .env}
+    ports:
+      - "8080:8080" # /healthz

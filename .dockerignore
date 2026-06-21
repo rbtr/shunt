@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+*.pem
+*.key
+*.crt
+shunt
+*.test
+*.out
+coverage.*
+dist
+tmp
