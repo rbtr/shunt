@@ -14,6 +14,7 @@ import (
 
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
+	"github.com/rbtr/shunt/internal/metrics"
 )
 
 type Config struct {
@@ -28,12 +29,14 @@ type Config struct {
 	MaxBatch      int    // cap the initial rollup size (0 = unlimited)
 	BatchLinger   time.Duration
 	BatchTarget   int
+	Metrics       *metrics.Collector
 }
 
 type activeBatch struct {
 	prs           []forge.PullRequest
 	stagingBranch string
 	stagingSHA    string
+	gateOutcome   string
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -72,10 +75,17 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile() error {
+	var err error
 	if e.active != nil {
-		return e.checkActive()
+		err = e.checkActive()
+	} else {
+		err = e.startNext()
 	}
-	return e.startNext()
+	if err != nil {
+		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+	}
+	e.observeQueue()
+	return err
 }
 
 // readyNumbers lists open PRs targeting base that currently have auto-merge
@@ -156,11 +166,13 @@ func (e *Engine) startNext() error {
 	sha, conflictPR, err := e.st.BuildStaging(e.cfg.Base, e.cfg.StagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
+			e.cfg.Metrics.IncStagingConflict(e.metricLabels())
 			return e.handleStagingConflict(numbersOf(prs), conflictPR)
 		}
 		return err
 	}
 	e.active = &activeBatch{prs: prs, stagingBranch: e.cfg.StagingBranch, stagingSHA: sha}
+	e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
 	log.Printf("queue: testing batch %v on staging sha=%s", numbersOf(prs), short(sha))
 	return nil
 }
@@ -189,8 +201,10 @@ func (e *Engine) checkActive() error {
 	}
 	switch status {
 	case "success":
+		e.recordGateOutcome(status)
 		return e.land()
 	case "failure", "cancelled", "error":
+		e.recordGateOutcome(status)
 		return e.bisectOrBounce(status)
 	default: // "", running, waiting, blocked -> keep waiting
 		return nil
@@ -250,6 +264,7 @@ func (e *Engine) land() error {
 			requeueFrom = i
 			break
 		}
+		e.cfg.Metrics.IncPRMerge(e.metricLabels())
 		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, pr.Number, "Landed via merge queue.")
 		log.Printf("queue: merged #%d", pr.Number)
 	}
@@ -347,9 +362,33 @@ func (e *Engine) bisectOrBounce(status string) error {
 }
 
 func (e *Engine) bounce(num int, reason string) {
+	e.cfg.Metrics.IncBounce(e.metricLabels())
 	_ = e.fc.CancelAutomerge(e.cfg.Owner, e.cfg.Repo, num)
 	_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, num, "Bounced from the merge queue: "+reason)
 	log.Printf("queue: bounced #%d: %s", num, reason)
+}
+
+func (e *Engine) recordGateOutcome(status string) {
+	if e.active != nil && e.active.gateOutcome == "" {
+		e.active.gateOutcome = status
+		e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
+	}
+}
+
+func (e *Engine) observeQueue() {
+	depth := 0
+	for _, cand := range e.pending {
+		depth += len(cand)
+	}
+	active := e.active != nil
+	if active {
+		depth += len(e.active.prs)
+	}
+	e.cfg.Metrics.ObserveQueue(e.metricLabels(), depth, active)
+}
+
+func (e *Engine) metricLabels() metrics.Labels {
+	return metrics.Labels{Owner: e.cfg.Owner, Repo: e.cfg.Repo, Base: e.cfg.Base}
 }
 
 func (e *Engine) commitURL(sha string) string {

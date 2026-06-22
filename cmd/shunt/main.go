@@ -15,6 +15,7 @@ import (
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
 	"github.com/rbtr/shunt/internal/manager"
+	"github.com/rbtr/shunt/internal/metrics"
 )
 
 func env(k, def string) string {
@@ -55,7 +56,8 @@ func main() {
 		log.Fatalf("bad SHUNT_BATCH_LINGER: must be a non-negative duration")
 	}
 
-	go serveHealth(env("SHUNT_LISTEN", ":8080"))
+	metricsCollector := metrics.New()
+	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector)
 
 	fc := forge.New(instance, token)
 
@@ -63,6 +65,7 @@ func main() {
 		mgr := manager.New(fc, manager.Config{
 			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
+			Metrics: metricsCollector,
 		})
 		log.Printf("shunt: multi-repo mode, topic=%q every %s", topic, interval)
 		for {
@@ -86,6 +89,7 @@ func main() {
 		Owner: owner, Repo: repo, Base: base,
 		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
+		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
 
 	log.Printf("shunt: watching %s/%s base=%s every %s", owner, repo, base, interval)
@@ -97,12 +101,20 @@ func main() {
 	}
 }
 
-func serveHealth(addr string) {
+func serveHealth(addr string, metricsCollector *metrics.Collector) {
+	if err := http.ListenAndServe(addr, newHTTPMux(metricsCollector)); err != nil {
+		log.Printf("health server: %v", err)
+	}
+}
+
+func newHTTPMux(metricsCollector *metrics.Collector) *http.ServeMux {
+	if metricsCollector == nil {
+		metricsCollector = metrics.New()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("health server: %v", err)
-	}
+	mux.Handle("/metrics", metricsCollector.Handler())
+	return mux
 }
