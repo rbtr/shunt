@@ -52,19 +52,20 @@ State, per `(repo, base)`:
 
 - `pending [][]int` — a work queue of **candidate batches** (each a list of PR
   numbers, in order).
-- `active` — the candidate currently being tested (PRs + staging branch + SHA).
+- `active` — candidates currently being tested (PRs + staging branch + SHA).
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
 Each `Reconcile()` tick advances one step:
 
 ```
-if active != nil:
+for active candidate whose earlier candidates are resolved:
     status = RunStatus(active.staging_sha, staging_branch)
-    success            -> land(active.prs); active = nil
+    success            -> land(active.prs); requeue later speculative runs if base advanced
     failure            -> bisectOrBounce(active)
     running/unknown    -> wait
-else:
+
+while active count < bisection fan-out:
     if pending empty:
         ready = ready auto-merge PRs
         if ready empty: clear linger; return
@@ -83,7 +84,7 @@ else:
         suffix = conflictPR and following items
         requeue(prefix, suffix)           # prefix keeps its queue position
         return
-    active = { prs, staging_sha: sha }
+    active += { prs, staging_branch, staging_sha, base_generation }
 ```
 
 `SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` only apply when seeding the first
@@ -92,6 +93,11 @@ start immediately. A linger duration of `0` preserves form-immediately behavior;
 with a non-zero duration, shunt waits until either the target count is reached or
 the window expires. These knobs are process-wide today; per-repository overrides
 remain future work.
+
+`SHUNT_BISECT_FANOUT` caps concurrent bisection staging runs per queue. A value
+of `1` preserves serial bisection. Higher values use sibling staging branches
+such as `mq/main/staging-1`, `mq/main/staging-2`, so the gate workflow must keep
+matching `mq/**`.
 
 `land` sets the status and merges each PR in order. `bisectOrBounce`:
 
@@ -104,7 +110,8 @@ else:               mid = len/2
 
 Because candidates are just lists of PR numbers and staging is always rebuilt
 from the *current* base tip, a successful sub-batch that advances the base is
-handled for free — the next candidate is re-staged on top of it.
+handled safely: any later speculative staging run from the old base generation is
+deleted and re-queued, then re-staged before it can land.
 
 ### Worked example
 
@@ -149,6 +156,11 @@ against the unchanged current base, so `2` can still pass.
   conflicts, `B` is bounced. A conflict on the first PR in a candidate means
   that PR conflicts with the current base, so it is bounced and the remaining
   suffix is re-queued.
+- **Parallel bisection preserves ordered landing.** Later speculative subtrees may
+  run before earlier ones finish, but their results cannot land or bounce ahead of
+  lower-numbered candidates. If an earlier successful candidate advances the base,
+  later speculative branches are discarded and re-staged on the new base before
+  any PR lands.
 - **Crash safety (today).** State is in-memory; a restart re-derives the queue
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.

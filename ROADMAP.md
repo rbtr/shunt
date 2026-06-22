@@ -24,12 +24,9 @@ welcome.
   is up-to-one-interval latency and steady API traffic. The
   `auto_merge_pull_request` webhook is not wired yet.
 - **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
-- **Serial per branch, serial bisection.** One batch is in flight at a time per
-  `(repo, base)`, and the bisection tree is walked depth-first one node at a time.
-  When more than one PR in a batch is broken, the independent subtrees that
-  isolate them are tested sequentially even though they could run concurrently —
-  so time-to-merge grows with the number of broken PRs. No speculative parallel
-  batches, so throughput is bounded by gate-CI latency.
+- **Serial initial batches.** One rollup batch is seeded at a time per
+  `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
+  parallel batches from fresh queue entries.
 - **Global-only configuration.** Every knob is a process-wide environment
   variable; there are no per-repository overrides yet. Batch accumulation can be
   tuned globally, but not per repo.
@@ -57,15 +54,13 @@ welcome.
   e.g. `.shunt.yml`, discovered alongside the existing topic opt-in). This is a
   prerequisite for the two items below, which both need to be tunable globally
   **and** per repo.
-- **Parallelizable bisection.** When a batch fails and splits, test the
-  independent subtrees concurrently instead of strictly depth-first, so isolating
-  N>1 broken PRs costs closer to the depth of the tree than the sum of its nodes.
-  Bounded by a configurable fan-out limit (global default + per-repo override),
-  since each parallel branch consumes a runner and a staging branch. Must
-  preserve the invariants in `docs/design.md`: ascending merge order, and
-  "every batch is validated against the real base it lands on"
-  (parallel subtrees are staged speculatively on the pre-merge base, so a winning
-  subtree is re-validated or ordered before it lands rather than fast-tracked).
+- ~~**Parallelizable bisection.** When a batch fails and splits, test independent
+  subtrees concurrently instead of strictly depth-first, bounded by a configurable
+  fan-out limit.~~ Completed: `SHUNT_BISECT_FANOUT` controls process-wide
+  bisection concurrency; a value of `1` preserves serial behavior. Ordered
+  landing is still enforced, and later speculative runs are re-staged if an
+  earlier candidate advances the base. Per-repository overrides remain covered by
+  the pending per-repository configuration item above.
 - ~~**Configurable batch-linger window.** Before forming the first batch,
   optionally wait up to a duration *or* until a target number of PRs are ready
   (whichever comes first), so bursty and low-traffic repos batch intentionally.~~

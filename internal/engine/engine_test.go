@@ -135,7 +135,7 @@ func TestBatchLingerDisabledByDefaultStartsImmediately(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	if e.active == nil {
+	if len(e.active) == 0 {
 		t.Fatal("default config should start a batch immediately")
 	}
 	if got := len(m.batchOf); got != 1 {
@@ -157,7 +157,7 @@ func TestBatchLingerWaitsWhileUnderTargetAndWindow(t *testing.T) {
 		t.Fatalf("continue linger: %v", err)
 	}
 
-	if e.active != nil {
+	if len(e.active) != 0 {
 		t.Fatal("batch should not start before target or linger window")
 	}
 	if got := len(m.batchOf); got != 0 {
@@ -180,10 +180,10 @@ func TestBatchLingerStartsWhenTargetReached(t *testing.T) {
 		t.Fatalf("target reached: %v", err)
 	}
 
-	if e.active == nil {
+	if len(e.active) == 0 {
 		t.Fatal("batch should start once target is reached")
 	}
-	if got := fmt.Sprint(m.batchOf[e.active.stagingSHA]); got != "[1 2 3]" {
+	if got := fmt.Sprint(m.batchOf[e.active[0].stagingSHA]); got != "[1 2 3]" {
 		t.Errorf("staged batch = %s, want [1 2 3]", got)
 	}
 	if !e.lingerSince.IsZero() {
@@ -205,10 +205,10 @@ func TestBatchLingerStartsWhenWindowExpires(t *testing.T) {
 		t.Fatalf("window expired: %v", err)
 	}
 
-	if e.active == nil {
+	if len(e.active) == 0 {
 		t.Fatal("batch should start once linger window expires")
 	}
-	if got := fmt.Sprint(m.batchOf[e.active.stagingSHA]); got != "[1 2]" {
+	if got := fmt.Sprint(m.batchOf[e.active[0].stagingSHA]); got != "[1 2]" {
 		t.Errorf("staged batch = %s, want [1 2]", got)
 	}
 }
@@ -240,7 +240,7 @@ func TestBatchLingerResetsAfterBatchStarts(t *testing.T) {
 		t.Fatalf("start second linger: %v", err)
 	}
 
-	if e.active != nil {
+	if len(e.active) != 0 {
 		t.Fatal("new ready PR should get a fresh linger window after prior batch")
 	}
 	if got := len(m.batchOf); got != 1 {
@@ -266,6 +266,37 @@ func TestBisectionIsolatesBadPR(t *testing.T) {
 	}
 	if m.prs[3].Merged {
 		t.Error("PR 3 must not be merged")
+	}
+}
+
+func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
+	m := newMock(1, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BisectFanout: 2}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start root batch: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("split root batch: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start split subtrees: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2] [3 4]]" {
+		t.Fatalf("staged = %s, want root plus both split subtrees", got)
+	}
+	if got := len(e.active); got != 2 {
+		t.Fatalf("active batches = %d, want 2", got)
+	}
+
+	drive(e, 30)
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[2 3 4]" {
+		t.Errorf("merged = %s, want [2 3 4]", got)
+	}
+	if !m.bounced[1] {
+		t.Error("PR 1 should have been bounced")
 	}
 }
 

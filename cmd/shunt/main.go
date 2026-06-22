@@ -47,6 +47,10 @@ func main() {
 	if err != nil || batchTarget < 0 {
 		log.Fatalf("bad SHUNT_BATCH_TARGET: must be a non-negative integer")
 	}
+	bisectFanout, err := strconv.Atoi(env("SHUNT_BISECT_FANOUT", "1"))
+	if err != nil || bisectFanout < 1 {
+		log.Fatalf("bad SHUNT_BISECT_FANOUT: must be a positive integer")
+	}
 	interval, err := time.ParseDuration(env("SHUNT_POLL_INTERVAL", "10s"))
 	if err != nil {
 		log.Fatalf("bad SHUNT_POLL_INTERVAL: %v", err)
@@ -63,7 +67,7 @@ func main() {
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
-			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
+			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector,
 		})
@@ -87,7 +91,7 @@ func main() {
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
-		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
+		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))

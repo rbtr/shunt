@@ -41,15 +41,16 @@ Per `(repo, base-branch)`, on a fixed interval:
 1. **Find the queue** — open PRs with auto-merge enabled (detected from the PR
    timeline; Forgejo doesn't expose this on the PR object).
 2. **Stage** — create `mq/<base>/staging` from the base tip and merge each PR's
-   head into it. A PR that conflicts is bounced; the rest continue.
+   head into it. A staging conflict splits the candidate at the conflict point so
+   earlier PRs keep their place.
 3. **Gate** — pushing the staging branch triggers your `on: push: [mq/**]`
    workflow. shunt reads that run's status.
 4. **Resolve:**
    - **pass** → set the required `merge-queue` status on each PR and merge it via
      the API (Forgejo records a proper merge).
    - **fail, 1 PR** → bounce it (cancel auto-merge + comment).
-   - **fail, >1 PR** → split in half, test the first half next; recursion
-     isolates the bad PR(s). Innocent PRs are **never** bounced.
+   - **fail, >1 PR** → split in half and test sub-batches, up to the configured
+     bisection fan-out. Innocent PRs are **never** bounced.
 
 Branch protection requires the `merge-queue` status and restricts pushes to the
 bot, so nothing reaches the base branch except a batch shunt has tested. Full
@@ -100,6 +101,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_MAX_BATCH` | `0` | Cap the initial rollup size (0 = unlimited) |
 | `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). Process-wide until per-repo config lands. |
+| `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` and `/metrics` endpoints |
