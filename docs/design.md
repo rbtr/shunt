@@ -241,12 +241,19 @@ webhook for each managed repo. Hooks with different URLs are left alone; shunt
 only manages the hook whose URL matches the configured listener URL.
 
 Metrics are Prometheus text format, intentionally dependency-free and
-process-local: they cover queue depth, active batch presence, batches started, PR
-merges, bounces, staging conflicts, reconcile errors, and terminal gate outcomes.
+process-local: they are scoped per managed `(owner, repo, base)` queue and cover
+queue depth, active batch presence, oldest queued PR age, batches started, PR
+merges, bounces, staging conflicts, reconcile errors, terminal gate outcomes,
+and time-in-queue histograms for PRs that merge, bounce, or drop out of the
+in-memory queue. They reset on restart, so queue-age and time-in-queue
+observations start when the current process first observes a PR; persisted
+metrics history remains a roadmap item.
+
 The JSON status endpoint complements those counters with safe queue membership:
 owner, repo, base, depth, active/pending PR-number batches, and active-batch
-presence. Observability resets on restart and does not yet include time-in-queue
-histograms or persisted history; those remain roadmap items.
+presence. It omits staging SHAs and runtime configuration. When
+`SHUNT_QUEUE_COMMENTS=true`, shunt also keeps one sticky status comment on each
+queued PR and updates terminal queue outcomes there.
 
 ## Running against a real instance (safely)
 

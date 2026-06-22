@@ -78,9 +78,10 @@ type Engine struct {
 	active  []*activeBatch
 	now     func() time.Time
 
-	lingerSince time.Time
-	baseGen     int
-	stagingSeq  int
+	lingerSince    time.Time
+	queueFirstSeen map[int]time.Time
+	baseGen        int
+	stagingSeq     int
 
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
@@ -94,7 +95,16 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		logger = slog.Default().With("component", "engine")
 	}
 	logger = logger.With("owner", cfg.Owner, "repo", cfg.Repo, "base", cfg.Base)
-	return &Engine{cfg: cfg, fc: fc, st: st, logger: logger, now: time.Now, queueComments: map[int]string{}, terminalQueueComments: map[int]string{}}
+	return &Engine{
+		cfg:                   cfg,
+		fc:                    fc,
+		st:                    st,
+		logger:                logger,
+		now:                   time.Now,
+		queueFirstSeen:        map[int]time.Time{},
+		queueComments:         map[int]string{},
+		terminalQueueComments: map[int]string{},
+	}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
@@ -166,6 +176,7 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 			return nil, err
 		}
 		if pr.State != "open" || pr.Merged {
+			e.observeQueueExit(n, "dropped")
 			continue
 		}
 		ok, err := e.fc.AutomergeScheduled(ctx, e.cfg.Owner, e.cfg.Repo, n)
@@ -174,6 +185,8 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 		}
 		if ok {
 			out = append(out, pr)
+		} else {
+			e.observeQueueExit(n, "dropped")
 		}
 	}
 	return out, nil
@@ -185,9 +198,13 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		ready, err := e.readyNumbers(ctx)
-		if err != nil || len(ready) == 0 {
-			e.lingerSince = time.Time{}
+		if err != nil {
 			return false, err
+		}
+		e.observeReady(ready)
+		if len(ready) == 0 {
+			e.lingerSince = time.Time{}
+			return false, nil
 		}
 		if e.linger(ready) {
 			return false, nil
@@ -355,6 +372,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (bool, error) {
 			break
 		}
 		e.cfg.Metrics.IncPRMerge(e.metricLabels())
+		e.observeQueueExit(pr.Number, "merged")
 		e.notifyPR(ctx, pr.Number, pr.Head.Sha, "", "Landed via merge queue", "shunt tested this PR in a staging batch and merged it after the gate passed.", a.debugURL, true)
 		e.logger.Info("PR merged", "pr", pr.Number)
 		merged++
@@ -465,6 +483,7 @@ func gateOutcomeStatus(status string) string {
 
 func (e *Engine) bounce(ctx context.Context, num int, reason, statusState, debugURL string) {
 	e.cfg.Metrics.IncBounce(e.metricLabels())
+	e.observeQueueExit(num, "bounced")
 	if pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, num); err == nil && pr.State == "open" && !pr.Merged {
 		e.notifyPR(ctx, num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true)
 	}
@@ -494,7 +513,9 @@ func (e *Engine) enqueue(cands ...[]int) {
 		if len(cand) == 0 {
 			continue
 		}
-		e.pending = append(e.pending, append([]int(nil), cand...))
+		copyCand := append([]int(nil), cand...)
+		e.markQueued(copyCand...)
+		e.pending = append(e.pending, copyCand)
 	}
 	sort.SliceStable(e.pending, func(i, j int) bool {
 		return e.pending[i][0] < e.pending[j][0]
@@ -584,6 +605,7 @@ func (e *Engine) observeQueue() {
 		active = append(active, numbersOf(a.prs))
 	}
 	e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active)
+	e.cfg.Metrics.ObserveQueueAge(e.metricLabels(), e.oldestQueueAge())
 }
 
 const queueCommentMarker = "<!-- shunt:queue-status -->"
@@ -812,6 +834,62 @@ func (e *Engine) activeSummary() string {
 
 func (e *Engine) metricLabels() metrics.Labels {
 	return metrics.Labels{Owner: e.cfg.Owner, Repo: e.cfg.Repo, Base: e.cfg.Base}
+}
+
+func (e *Engine) markQueued(nums ...int) {
+	if e.queueFirstSeen == nil {
+		e.queueFirstSeen = map[int]time.Time{}
+	}
+	now := e.now()
+	for _, n := range nums {
+		if _, ok := e.queueFirstSeen[n]; !ok {
+			e.queueFirstSeen[n] = now
+		}
+	}
+}
+
+func (e *Engine) observeReady(nums []int) {
+	ready := make(map[int]bool, len(nums))
+	for _, n := range nums {
+		ready[n] = true
+	}
+	for n := range e.queueFirstSeen {
+		if !ready[n] {
+			e.observeQueueExit(n, "dropped")
+		}
+	}
+	e.markQueued(nums...)
+}
+
+func (e *Engine) observeQueueExit(num int, outcome string) {
+	if e.queueFirstSeen == nil {
+		return
+	}
+	seen, ok := e.queueFirstSeen[num]
+	if !ok {
+		return
+	}
+	age := e.now().Sub(seen)
+	if age < 0 {
+		age = 0
+	}
+	e.cfg.Metrics.ObserveTimeInQueue(e.metricLabels(), outcome, age)
+	delete(e.queueFirstSeen, num)
+}
+
+func (e *Engine) oldestQueueAge() time.Duration {
+	now := e.now()
+	var oldest time.Duration
+	for _, seen := range e.queueFirstSeen {
+		age := now.Sub(seen)
+		if age > oldest {
+			oldest = age
+		}
+	}
+	if oldest < 0 {
+		return 0
+	}
+	return oldest
 }
 
 func (e *Engine) commitURL(sha string) string {

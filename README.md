@@ -156,16 +156,22 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 - `shunt_queue_depth` — PRs currently known in the in-memory queue, including
   active batches and queued bisection candidates.
 - `shunt_active_batch` — `1` while a queue has a staging batch under gate test.
+- `shunt_queue_oldest_age_seconds` — process-local age of the oldest PR currently
+  known in the in-memory queue.
 - `shunt_batches_started_total`, `shunt_pr_merges_total`,
   `shunt_bounces_total`, `shunt_staging_conflicts_total`, and
   `shunt_reconcile_errors_total`.
 - `shunt_gate_outcomes_total{outcome="success|failure|cancelled|error"}` for
   terminal gate results.
+- `shunt_time_in_queue_seconds_bucket/_sum/_count{outcome="merged|bounced|dropped"}`
+  histogram for process-local time from first queue observation until the PR
+  leaves the queue.
 
 Logs are structured JSON on stdout, with stable fields such as `component`,
 `owner`, `repo`, and `base` where they apply. Metrics are process-local and
-intentionally minimal in v0.3: they do not include persisted history or
-time-in-queue histograms.
+intentionally minimal in v0.3: queue-age and time-in-queue observations restart
+from when the current process first sees a PR, and metrics do not include
+persisted history.
 
 `GET /status` exposes the process-local queue membership as JSON for lightweight
 ops surfaces that need more detail than counters. The response contains only

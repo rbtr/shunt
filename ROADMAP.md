@@ -67,11 +67,11 @@ welcome.
 - **No automated end-to-end burn-in.** The forge client now has an env-gated live
   integration harness, but disposable-repo and busy-repo queue burn-in are still
   manual.
-- **Basic observability only.** Prometheus text metrics, JSON status, and optional
-  sticky PR queue-status comments cover process-local queue depth, active/pending
-  PR numbers, and key counters. There is still no persisted metrics history, no
-  time-in-queue histogram, and no native queue UI (Forgejo has no plugin surface
-  for one).
+- **Process-local observability only.** Prometheus text metrics, JSON status, and
+  optional sticky PR queue-status comments cover process-local queue depth,
+  active/pending PR numbers, oldest queued PR age, time-in-queue histograms, and
+  key counters. There is still no persisted metrics history and no native queue
+  UI (Forgejo has no plugin surface for one).
 
 ## Milestones
 
@@ -130,8 +130,10 @@ welcome.
   `/metrics` exposes process-local Prometheus text metrics for queue depth,
   active batch presence, batches started, PR merges, bounces, staging conflicts,
   reconcile errors, and terminal gate outcomes.
-- Deeper observability: time-in-queue histograms and any persistence needed to
-  preserve operational history across restarts.
+- ~~Process-local queue age and time-in-queue histograms.~~ Completed:
+  `/metrics` now exposes the oldest PR age currently known in memory and
+  time-in-queue histograms for merged, bounced, and dropped PRs. These reset on
+  restart until durable queue state/metrics history exists.
 - ~~A sticky per-repo PR queue-status comment.~~ Completed as an opt-in
   (`SHUNT_QUEUE_COMMENTS=true`) so write traffic remains an operator choice.
 - ~~A queue status surface (a sticky per-repo PR comment and/or a small status
@@ -141,6 +143,8 @@ welcome.
 - ~~PR-visible rejection/debug feedback.~~ Completed: terminal queue outcomes
   update source PR statuses and post durable comments with staging debug links
   where available.
+- Deeper observability: persisted metrics history and a small status page to
+  preserve and expose operational history across restarts.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.
