@@ -157,9 +157,9 @@ func (c *Client) SetCommitStatus(owner, repo, sha, context, state, desc, targetU
 	}, nil)
 }
 
-func (c *Client) MergePR(owner, repo string, index int, style string) error {
+func (c *Client) MergePR(owner, repo string, index int, style, headSHA string) error {
 	return c.do(http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
-		"Do": style,
+		"Do": style, "head_commit_id": headSHA,
 	}, nil)
 }
 
