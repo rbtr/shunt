@@ -103,11 +103,27 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_MERGE_STYLE` | `merge` | Merge method passed to the forge: `merge`, `squash`, or `rebase`. Must be enabled in the repository settings; for squash-only repos, set this to `squash`. |
 | `SHUNT_MAX_BATCH` | `0` | Cap the initial rollup size (0 = unlimited) |
 | `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
-| `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). Process-wide until per-repo config lands. |
+| `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). |
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` and `/metrics` endpoints |
+
+Repos can override safe queue tunables with `.shunt.yml` in the repo root. In
+multi-repo mode, shunt reads it from the discovered default branch before
+choosing the managed base; in single-repo mode, it reads from `SHUNT_BASE`.
+Missing files keep the global defaults. Invalid files are logged/rejected without
+applying partial settings.
+
+```yaml
+base: trunk
+status_context: shunt
+merge_style: squash # merge, squash, or rebase
+max_batch: 4
+batch_linger: 30s
+batch_target: 3
+bisect_fanout: 2
+```
 
 ## Observability
 

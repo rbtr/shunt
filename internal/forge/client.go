@@ -6,6 +6,7 @@ package forge
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrNotFound = errors.New("forge: not found")
 
 type Client struct {
 	apiBase string
@@ -98,6 +101,41 @@ func (c *Client) do(method, path string, body, out any) error {
 	return nil
 }
 
+func (c *Client) doRaw(method, path string, body any) ([]byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, c.apiBase+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "token "+c.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: %s %s", ErrNotFound, method, path)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s %s: http %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return data, nil
+}
+
 // ListOpenPRs returns open PRs, optionally filtered to those targeting base.
 func (c *Client) ListOpenPRs(owner, repo, base string) ([]PullRequest, error) {
 	var prs []PullRequest
@@ -121,6 +159,14 @@ func (c *Client) GetPR(owner, repo string, index int) (PullRequest, error) {
 	var pr PullRequest
 	err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repoPath(owner, repo), index), nil, &pr)
 	return pr, err
+}
+
+func (c *Client) ReadFile(owner, repo, ref, path string) ([]byte, error) {
+	u := fmt.Sprintf("/repos/%s/raw/%s", repoPath(owner, repo), url.PathEscape(path))
+	if ref != "" {
+		u += "?ref=" + url.QueryEscape(ref)
+	}
+	return c.doRaw(http.MethodGet, u, nil)
 }
 
 // AutomergeScheduled scans the PR timeline newest-first for the canonical

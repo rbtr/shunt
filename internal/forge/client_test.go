@@ -2,6 +2,7 @@ package forge
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -107,5 +108,41 @@ func TestIsShuntStagingBranchSupportsSlashedBases(t *testing.T) {
 		if got := isShuntStagingBranch("release/v1", tc.branch); got != tc.want {
 			t.Errorf("isShuntStagingBranch(%q) = %v, want %v", tc.branch, got, tc.want)
 		}
+	}
+}
+
+func TestReadFileUsesRawEndpointAndRef(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/api/v1/repos/o/r/raw/.shunt.yml" {
+			t.Errorf("path = %s, want /api/v1/repos/o/r/raw/.shunt.yml", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("ref"); got != "main" {
+			t.Errorf("ref = %q, want main", got)
+		}
+		_, _ = w.Write([]byte("max_batch: 3\n"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	got, err := c.ReadFile("o", "r", "main", ".shunt.yml")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "max_batch: 3\n" {
+		t.Fatalf("ReadFile = %q", got)
+	}
+}
+
+func TestReadFileReturnsErrNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	_, err := c.ReadFile("o", "r", "main", ".shunt.yml")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ReadFile error = %v, want ErrNotFound", err)
 	}
 }

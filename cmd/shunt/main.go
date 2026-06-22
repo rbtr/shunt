@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/rbtr/shunt/internal/gitops"
 	"github.com/rbtr/shunt/internal/manager"
 	"github.com/rbtr/shunt/internal/metrics"
+	"github.com/rbtr/shunt/internal/repoconfig"
 )
 
 func env(k, def string) string {
@@ -89,6 +91,17 @@ func main() {
 	}
 	owner, repo := parts[0], parts[1]
 	base := env("SHUNT_BASE", "main")
+	settings := repoconfig.Settings{
+		Base: base, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
+	}
+	if data, err := fc.ReadFile(owner, repo, base, repoconfig.FileName); errors.Is(err, forge.ErrNotFound) {
+		// No per-repo config; keep global defaults.
+	} else if err != nil {
+		log.Fatalf("%s/%s: read %s: %v", owner, repo, repoconfig.FileName, err)
+	} else if settings, err = repoconfig.Apply(data, settings); err != nil {
+		log.Fatalf("%s/%s: invalid %s: %v", owner, repo, repoconfig.FileName, err)
+	}
+	base = settings.Base
 	if deleted, err := fc.PruneStagingBranches(owner, repo, base); err != nil {
 		log.Printf("shunt: %s/%s@%s: staging branch gc: %v", owner, repo, base, err)
 	} else if len(deleted) > 0 {
@@ -97,7 +110,7 @@ func main() {
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
-		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
+		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))

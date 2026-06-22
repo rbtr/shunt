@@ -10,6 +10,9 @@ welcome.
   head revalidation, order-preserving staging-conflict handling, Prometheus
   metrics, configurable batch linger, configurable bisection fan-out, and
   `merge`/`squash`/`rebase` landing support.
+- **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
+  queue tunables such as status context, merge style, batch sizing/linger,
+  bisection fan-out, and managed base branch on top of process defaults.
 - **Order-preserving conflict handling.** A staging conflict splits the candidate
   at the conflict point: earlier PRs are tested first, then the conflicting
   suffix is retried on the current base. If the conflict is already first in a
@@ -35,9 +38,6 @@ welcome.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
   parallel batches from fresh queue entries.
-- **Global-only configuration.** Every knob is a process-wide environment
-  variable; there are no per-repository overrides yet. Batch accumulation can be
-  tuned globally, but not per repo.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
 - **Basic observability only.** Prometheus text metrics cover process-local queue
@@ -55,9 +55,11 @@ welcome.
   immediately, keeping the poll as a backstop.
 
 ### v0.4 — Per-repo configurability
-- **Per-repository configuration.** A mechanism for per-repo overrides on top of
-  the global defaults (the natural carrier is a small config file in the repo,
-  e.g. `.shunt.yml`, discovered alongside the existing topic opt-in).
+- ~~**Per-repository configuration.** A mechanism for per-repo overrides on top
+  of the global defaults (the natural carrier is a small config file in the
+  repo, e.g. `.shunt.yml`, discovered alongside the existing topic opt-in).~~
+  Completed: `.shunt.yml` supports status context, merge style, max batch,
+  batch linger/target, bisection fan-out, and base-branch overrides.
 - ~~**Parallelizable bisection.** When a batch fails and splits, test independent
   subtrees concurrently instead of strictly depth-first, bounded by a configurable
   fan-out limit.~~ Completed: `SHUNT_BISECT_FANOUT` controls process-wide
