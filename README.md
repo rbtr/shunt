@@ -60,11 +60,12 @@ detail and the validated Forgejo mechanics are in
 
 ## Quickstart
 
-shunt needs a **bot account** with a token, repository admin access to the
-managed repos, and a slot in each protected branch's push allow-list. Repository
-admin is required because Forgejo/Gitea branch-protection APIs reject even read
-requests from normal write collaborators; shunt must read and reconcile those
-rules to keep the required `merge-queue` gate in place.
+shunt needs a dedicated **bot account**, access only to the repositories it
+manages, a token with the repository permissions described in
+[Security posture](#security-posture), and a slot in each protected branch's
+push allow-list. Current Forgejo/Gitea branch-protection APIs require repository
+admin access even for read requests, so the bot must have that permission on
+managed repositories to keep the required `merge-queue` gate in place.
 
 ```sh
 go build -o shunt ./cmd/shunt
@@ -94,7 +95,7 @@ is discovered and managed automatically. For a single repo, set
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SHUNT_INSTANCE` | — (required) | Forge base URL, e.g. `https://forge.example.com` |
-| `SHUNT_TOKEN` | — (required) | Bot API token (repo scope) |
+| `SHUNT_TOKEN` | — (required) | Bot API token; see [Security posture](#security-posture) |
 | `SHUNT_TOPIC` | — | Manage every repo with this topic (multi-repo mode) |
 | `SHUNT_REPO` | — | `owner/repo` for single-repo mode (use this *or* `SHUNT_TOPIC`) |
 | `SHUNT_BASE` | `main` | Protected base branch (single-repo mode) |
@@ -217,15 +218,36 @@ a merge queue.
 
 ## Security posture
 
-shunt needs a bot token with repository admin access to the repositories it
-manages so it can reconcile branch protection, optionally configure webhooks, set
-commit statuses, push staging branches, and merge PRs. Keep that token in your
-runtime secret store, not in the repository. The examples use placeholders only;
-real tokens should be supplied through environment variables, Docker secrets, or
-Kubernetes Secrets.
+Run shunt as a dedicated bot identity and give it access only to repositories it
+is allowed to manage. Prefer per-repository bot tokens for single-repo
+deployments, or tightly scoped bot/org tokens for the opted-in repositories when
+your Forgejo/Gitea version supports that model.
+
+Current Forgejo/Gitea APIs still require repository admin permission on every
+managed repository because shunt reads and reconciles branch-protection rules,
+and because managed webhooks are repository settings. The token should still be
+scoped to the minimum managed repositories and operations. Token models vary, so
+map the token to these permission categories rather than assuming a specific
+scope name:
+
+- read repository, pull request, timeline, commit-status, and workflow-run state;
+- discover opted-in repositories by topic in multi-repo mode;
+- manage branch protection for opted-in repositories;
+- create or update the shunt-managed repository webhook when
+  `SHUNT_WEBHOOK_URL` is set;
+- create commit statuses, merge pull requests, write PR comments, and cancel
+  scheduled auto-merge when a PR lands, is bounced, or becomes stale;
+- use Git to fetch PR heads and push/delete only `mq/...` staging branches. Base
+  branch changes go through the forge merge API after the queue status passes.
+
+Keep tokens in your runtime secret store, never in the repository. The examples
+use placeholders only; real tokens should be supplied through environment
+variables, Docker secrets, Kubernetes Secrets, or an equivalent secret manager.
 
 If `/webhook` is exposed beyond a trusted private network, set
-`SHUNT_WEBHOOK_SECRET`; managed repository hooks use the same secret.
+`SHUNT_WEBHOOK_SECRET`; managed repository hooks use the same secret. Set
+`SHUNT_PUBLIC_URL` when shunt reaches the forge over an internal URL so PR
+comments link to a public-safe forge URL instead of private infrastructure names.
 
 ## Status & roadmap
 

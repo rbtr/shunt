@@ -14,6 +14,16 @@ API, outbound webhooks, Actions (CI), and OAuth/OIDC. So a merge queue must run
 communicates through commit statuses, PR comments, and branch names rather than
 native UI. That's a platform ceiling, not a design choice.
 
+The bot token should be limited to the repositories shunt manages. At minimum,
+shunt needs API permission to read PR, timeline, commit-status, and workflow-run
+state; manage branch protection for opted-in repos; create or update the
+shunt-managed repository webhook when enabled; create source-head statuses; merge
+PRs; write outcome/queue comments; cancel scheduled auto-merge; and, via Git,
+fetch PR heads and push/delete only `mq/...` staging branches. Current
+Forgejo/Gitea branch-protection and repository-hook APIs require repository
+admin permission, so the admin grant is scoped by repository rather than avoided
+entirely. Store the token in the runtime secret store, not in this repository.
+
 ## Forge mechanics (validated)
 
 These are the facts shunt is built on. Several differ from how GitHub behaves.

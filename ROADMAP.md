@@ -59,6 +59,8 @@ welcome.
   tolerate missed webhooks, so there is some steady API traffic even when webhook
   wakeups are configured.
 - **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
+  Same-host file locks are intentionally not supported as a leadership scheme;
+  safe multi-replica operation needs a durable external lease/lock.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
   parallel batches from fresh queue entries.
@@ -117,7 +119,10 @@ welcome.
   now accepts `merge`, `squash`, and `rebase`; shunt still pins the expected PR
   head SHA at merge time and documents keeping "block on outdated branch"
   disabled so queue validation remains authoritative.
-- Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
+- ~~Least-privilege bot token guidance (scope down from broad tokens; per-repo
+  tokens).~~ Completed: README and design docs now describe the minimum
+  repository permission categories and secret-storage guidance without relying on
+  forge-version-specific token scope names.
 
 ### v0.6 — Observability & ops
 - ~~Prometheus metrics (batches, runs, bounces, queue depth).~~ Completed:
@@ -136,7 +141,8 @@ welcome.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.
-- Optional leader-elected HA.
+- Optional leader-elected HA backed by a durable external lease/lock; same-host
+  file-lock standby is not a supported HA mode.
 
 ### Validation
 - Burn-in on a real, busy repository with a heavy end-to-end suite and
