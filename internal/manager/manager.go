@@ -5,6 +5,7 @@ package manager
 import (
 	"log"
 	"strings"
+	"time"
 
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
@@ -16,6 +17,8 @@ type Config struct {
 	StatusCtx   string
 	MergeStyle  string
 	MaxBatch    int
+	BatchLinger time.Duration
+	BatchTarget int
 	InstanceURL string
 	PublicURL   string
 	Token       string
@@ -70,6 +73,8 @@ func (m *Manager) Refresh() error {
 			InstanceURL:   m.cfg.InstanceURL,
 			PublicURL:     m.cfg.PublicURL,
 			MaxBatch:      m.cfg.MaxBatch,
+			BatchLinger:   m.cfg.BatchLinger,
+			BatchTarget:   m.cfg.BatchTarget,
 		}, m.fc, st)
 		log.Printf("manager: managing %s", k)
 	}

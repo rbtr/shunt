@@ -20,6 +20,8 @@ config:
   statusContext: "merge-queue"
   mergeStyle: "merge"
   maxBatch: "0"
+  batchLinger: "0"
+  batchTarget: "0"
   pollInterval: "10s"
   listen: ":8080"
 

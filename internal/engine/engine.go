@@ -26,6 +26,8 @@ type Config struct {
 	InstanceURL   string // used for API/git (may be an in-cluster URL)
 	PublicURL     string // used for user-facing links (defaults to InstanceURL)
 	MaxBatch      int    // cap the initial rollup size (0 = unlimited)
+	BatchLinger   time.Duration
+	BatchTarget   int
 }
 
 type activeBatch struct {
@@ -59,10 +61,13 @@ type Engine struct {
 	st      Stager
 	pending [][]int // work queue of candidate batches (PR numbers, in order)
 	active  *activeBatch
+	now     func() time.Time
+
+	lingerSince time.Time
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
-	return &Engine{cfg: cfg, fc: fc, st: st}
+	return &Engine{cfg: cfg, fc: fc, st: st, now: time.Now}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
@@ -124,9 +129,14 @@ func (e *Engine) startNext() error {
 	if len(e.pending) == 0 {
 		ready, err := e.readyNumbers()
 		if err != nil || len(ready) == 0 {
+			e.lingerSince = time.Time{}
 			return err
 		}
+		if e.linger(ready) {
+			return nil
+		}
 		e.pending = [][]int{ready}
+		e.lingerSince = time.Time{}
 	}
 	cand := e.pending[0]
 	e.pending = e.pending[1:]
@@ -153,6 +163,22 @@ func (e *Engine) startNext() error {
 	e.active = &activeBatch{prs: prs, stagingBranch: e.cfg.StagingBranch, stagingSHA: sha}
 	log.Printf("queue: testing batch %v on staging sha=%s", numbersOf(prs), short(sha))
 	return nil
+}
+
+func (e *Engine) linger(ready []int) bool {
+	if e.cfg.BatchLinger <= 0 {
+		return false
+	}
+	if e.cfg.BatchTarget > 0 && len(ready) >= e.cfg.BatchTarget {
+		return false
+	}
+	now := e.now()
+	if e.lingerSince.IsZero() {
+		e.lingerSince = now
+		log.Printf("queue: lingering up to %s for batch target %d; currently ready=%v", e.cfg.BatchLinger, e.cfg.BatchTarget, ready)
+		return true
+	}
+	return now.Sub(e.lingerSince) < e.cfg.BatchLinger
 }
 
 func (e *Engine) checkActive() error {

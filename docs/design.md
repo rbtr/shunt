@@ -53,6 +53,8 @@ State, per `(repo, base)`:
 - `pending [][]int` — a work queue of **candidate batches** (each a list of PR
   numbers, in order).
 - `active` — the candidate currently being tested (PRs + staging branch + SHA).
+- `lingerSince` — when the idle engine first saw ready PRs while the optional
+  batch-accumulation window was active.
 
 Each `Reconcile()` tick advances one step:
 
@@ -63,7 +65,14 @@ if active != nil:
     failure            -> bisectOrBounce(active)
     running/unknown    -> wait
 else:
-    if pending empty:  pending = [[ ready auto-merge PRs ]]   # re-seed
+    if pending empty:
+        ready = ready auto-merge PRs
+        if ready empty: clear linger; return
+        if batch_linger > 0 and (batch_target == 0 or ready below batch_target)
+           and window not expired:
+            remember first-ready time; return
+        pending = [[ ready ]]              # re-seed
+        clear linger
     cand = pending.pop_front()
     prs  = resolve(cand)                 # drop closed / no-longer-auto-merge
     sha, conflictPR = BuildStaging(base, "mq/<base>/staging", prs)
@@ -76,6 +85,13 @@ else:
         return
     active = { prs, staging_sha: sha }
 ```
+
+`SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` only apply when seeding the first
+candidate batch from the ready queue. Bisection candidates already in `pending`
+start immediately. A linger duration of `0` preserves form-immediately behavior;
+with a non-zero duration, shunt waits until either the target count is reached or
+the window expires. These knobs are process-wide today; per-repository overrides
+remain future work.
 
 `land` sets the status and merges each PR in order. `bisectOrBounce`:
 
