@@ -108,8 +108,8 @@ while active count < bisection fan-out:
 candidate batch from the ready queue. Bisection candidates already in `pending`
 start immediately. A linger duration of `0` preserves form-immediately behavior;
 with a non-zero duration, shunt waits until either the target count is reached or
-the window expires. These knobs are process-wide today; per-repository overrides
-remain future work.
+the window expires. These knobs have process-wide defaults and can be overridden
+per repository with `.shunt.yml`.
 
 `SHUNT_BISECT_FANOUT` caps concurrent bisection staging runs per queue. A value
 of `1` preserves serial bisection. Higher values use sibling staging branches
@@ -219,11 +219,11 @@ against the unchanged current base, so `2` can still pass.
 
 ## Observability
 
-The same HTTP listener serves `/healthz`, `/metrics`, and `/webhook`.
-`/webhook` accepts Forgejo/Gitea events and wakes reconciliation for
-auto-merge, pull-request, review, status, and push activity. A buffered wake
-channel coalesces bursts so several webhook deliveries schedule one prompt
-reconcile; the polling timer remains the correctness backstop.
+The same HTTP listener serves `/healthz`, `/metrics`, `/status`, and `/webhook`.
+`/webhook` accepts Forgejo/Gitea events and wakes reconciliation for auto-merge,
+pull-request, review, status, and push activity. A buffered wake channel coalesces
+bursts so several webhook deliveries schedule one prompt reconcile; the polling
+timer remains the correctness backstop.
 
 When `SHUNT_WEBHOOK_URL` is set, shunt uses the same repository-admin token it
 already needs for branch protection to create or update a matching repository
@@ -233,8 +233,10 @@ only manages the hook whose URL matches the configured listener URL.
 Metrics are Prometheus text format, intentionally dependency-free and
 process-local: they cover queue depth, active batch presence, batches started, PR
 merges, bounces, staging conflicts, reconcile errors, and terminal gate outcomes.
-They reset on restart and do not yet include time-in-queue histograms or a queue
-status UI; those remain roadmap items.
+The JSON status endpoint complements those counters with safe queue membership:
+owner, repo, base, depth, active/pending PR-number batches, and active-batch
+presence. Observability resets on restart and does not yet include time-in-queue
+histograms or persisted history; those remain roadmap items.
 
 ## Running against a real instance (safely)
 

@@ -110,7 +110,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
-| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, and `/webhook` endpoints |
+| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, `/status`, and `/webhook` endpoints |
 | `SHUNT_WEBHOOK_URL` | — | Public URL Forgejo/Gitea should call, usually `https://shunt.example.com/webhook`. When set, shunt creates/updates a repository webhook for each managed repo. |
 | `SHUNT_WEBHOOK_SECRET` | — | Optional shared secret for Forgejo/Gitea HMAC-SHA256 webhook signature validation |
 
@@ -152,8 +152,8 @@ bisect_fanout: 2
 for each managed `(owner, repo, base)` queue. `POST /webhook` accepts
 Forgejo/Gitea events and wakes reconciliation promptly.
 
-- `shunt_queue_depth` — PRs currently known in the in-memory queue, including an
-  active batch and queued bisection candidates.
+- `shunt_queue_depth` — PRs currently known in the in-memory queue, including
+  active batches and queued bisection candidates.
 - `shunt_active_batch` — `1` while a queue has a staging batch under gate test.
 - `shunt_batches_started_total`, `shunt_pr_merges_total`,
   `shunt_bounces_total`, `shunt_staging_conflicts_total`, and
@@ -163,8 +163,14 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 
 Logs are structured JSON on stdout, with stable fields such as `component`,
 `owner`, `repo`, and `base` where they apply. Metrics are process-local and
-intentionally minimal in v0.3: they do not include persisted history,
-time-in-queue histograms, or a queue UI.
+intentionally minimal in v0.3: they do not include persisted history or
+time-in-queue histograms.
+
+`GET /status` exposes the process-local queue membership as JSON for lightweight
+ops surfaces that need more detail than counters. The response contains only
+queue identity (`owner`, `repo`, `base`), depth, active/pending PR-number
+batches, and whether any batch is active; it omits tokens, clone URLs, staging
+SHAs, and other internal details.
 
 Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
 keeps one sticky comment per queued PR, identified by a stable hidden marker, and

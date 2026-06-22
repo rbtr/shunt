@@ -13,9 +13,9 @@ import (
 	"github.com/rbtr/shunt/internal/metrics"
 )
 
-func TestHTTPMuxServesHealthAndMetrics(t *testing.T) {
+func TestHTTPMuxServesHealthMetricsAndStatus(t *testing.T) {
 	c := metrics.New()
-	c.ObserveQueue(metrics.Labels{Owner: "o", Repo: "r", Base: "main"}, 1, true)
+	c.ObserveQueueStatus(metrics.Labels{Owner: "o", Repo: "r", Base: "main"}, [][]int{{2}}, [][]int{{1}})
 	mux := newHTTPMux(c, webhookConfig{})
 
 	health := httptest.NewRecorder()
@@ -29,8 +29,20 @@ func TestHTTPMuxServesHealthAndMetrics(t *testing.T) {
 	if got := metricsResp.Header().Get("Content-Type"); got != "text/plain; version=0.0.4; charset=utf-8" {
 		t.Fatalf("/metrics Content-Type = %q", got)
 	}
-	if body := metricsResp.Body.String(); !strings.Contains(body, `shunt_queue_depth{owner="o",repo="r",base="main"} 1`) {
+	if body := metricsResp.Body.String(); !strings.Contains(body, `shunt_queue_depth{owner="o",repo="r",base="main"} 2`) {
 		t.Fatalf("/metrics missing queue depth in:\n%s", body)
+	}
+
+	statusResp := httptest.NewRecorder()
+	mux.ServeHTTP(statusResp, httptest.NewRequest("GET", "/status", nil))
+	if got := statusResp.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("/status Content-Type = %q", got)
+	}
+	statusBody := statusResp.Body.String()
+	for _, want := range []string{`"owner":"o"`, `"repo":"r"`, `"base":"main"`, `"active_batches":[[1]]`, `"pending_batches":[[2]]`} {
+		if !strings.Contains(statusBody, want) {
+			t.Fatalf("/status missing %q in:\n%s", want, statusBody)
+		}
 	}
 }
 
