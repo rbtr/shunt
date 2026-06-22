@@ -89,6 +89,11 @@ func main() {
 	}
 	owner, repo := parts[0], parts[1]
 	base := env("SHUNT_BASE", "main")
+	if deleted, err := fc.PruneStagingBranches(owner, repo, base); err != nil {
+		log.Printf("shunt: %s/%s@%s: staging branch gc: %v", owner, repo, base, err)
+	} else if len(deleted) > 0 {
+		log.Printf("shunt: %s/%s@%s: deleted stale staging branches: %s", owner, repo, base, strings.Join(deleted, ", "))
+	}
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,

@@ -65,6 +65,11 @@ func (m *Manager) Refresh() error {
 		} else if changed {
 			log.Printf("manager: %s: configured branch protection", k)
 		}
+		if deleted, err := m.fc.PruneStagingBranches(r.Owner, r.Name, base); err != nil {
+			log.Printf("manager: %s: staging branch gc: %v", k, err)
+		} else if len(deleted) > 0 {
+			log.Printf("manager: %s: deleted stale staging branches: %s", k, strings.Join(deleted, ", "))
+		}
 		st := gitops.NewStager(cloneURL(m.cfg.InstanceURL, r.Owner, r.Name), m.cfg.BotUser, m.cfg.Token, m.cfg.BotUser, m.cfg.BotEmail)
 		m.engines[k] = engine.New(engine.Config{
 			Owner:         r.Owner,

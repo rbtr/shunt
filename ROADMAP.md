@@ -16,6 +16,10 @@ welcome.
   candidate, that PR is bounced and the remaining suffix is re-queued. This
   replaces the former coarse conflict handling that could bounce a PR which only
   conflicted with a batch-mate that ultimately did not land.
+- **Startup staging-branch garbage collection.** When a queue is first managed,
+  shunt deletes stale shunt-owned staging branches (`mq/<base>/staging` and
+  `mq/<base>/staging-N`) left behind by earlier processes before it starts
+  reconciling that `(repo, base)`.
 
 ## Current limitations
 
@@ -90,7 +94,10 @@ welcome.
   persistence needed to preserve operational history across restarts.
 - A queue status surface (a sticky per-repo PR comment and/or a small status
   page) since the forge can't host a native one.
-- Staging-branch GC on startup; optional leader-elected HA.
+- ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
+  are pruned on startup or first discovery before reconciliation begins for a
+  managed `(repo, base)`.
+- Optional leader-elected HA.
 
 ### Validation
 - Burn-in on a real, busy repository with a heavy end-to-end suite and
