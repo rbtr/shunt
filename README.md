@@ -108,6 +108,8 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
+| `SHUNT_LEADER_LOCK` | — | Optional filesystem lock path. When set, only the process holding this lock reconciles queues; other replicas wait and take over after the lock is released. Use only on a single host or shared filesystem with reliable POSIX locks. |
+| `SHUNT_LEADER_RETRY` | `5s` | How often a standby process retries `SHUNT_LEADER_LOCK`. |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, and `/webhook` endpoints |
 | `SHUNT_WEBHOOK_URL` | — | Public URL Forgejo/Gitea should call, usually `https://shunt.example.com/webhook`. When set, shunt creates/updates a repository webhook for each managed repo. |
@@ -191,6 +193,20 @@ kubectl apply -k deploy/kustomize/base
 
 - Kubernetes manifest: [`examples/kubernetes.yaml`](examples/kubernetes.yaml)
 - Docker Compose: [`examples/docker-compose.yml`](examples/docker-compose.yml)
+
+### Optional standby replicas
+
+For single-host deployments, or deployments where replicas share a filesystem with
+reliable POSIX locks, set the same `SHUNT_LEADER_LOCK` path on each process. One
+replica becomes active; the others keep serving `/healthz` and wait for the lock.
+If the active process exits, the kernel releases the lock and a standby takes
+over on its next `SHUNT_LEADER_RETRY`.
+
+This is a narrow safety mechanism, not full durable HA: queue and bisection state
+are still in memory, so failover behaves like a restart and may re-run in-flight
+CI. Do not use per-pod local files as a Kubernetes leader election mechanism;
+those would let every pod become leader. A durable database or API-backed lease
+is still future work.
 
 ## Compatibility
 

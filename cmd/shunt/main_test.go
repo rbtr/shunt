@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/rbtr/shunt/internal/leader"
 	"github.com/rbtr/shunt/internal/metrics"
 )
 
@@ -184,5 +189,44 @@ func TestEnvBool(t *testing.T) {
 	t.Setenv("SHUNT_TEST_BOOL", "sometimes")
 	if _, err := envBool("SHUNT_TEST_BOOL", false); err == nil {
 		t.Fatal("envBool should reject invalid values")
+	}
+}
+
+func TestAcquireLeadershipDisabled(t *testing.T) {
+	release, err := acquireLeadership(context.Background(), "", time.Millisecond)
+	if err != nil {
+		t.Fatalf("acquireLeadership disabled: %v", err)
+	}
+	if err := release(); err != nil {
+		t.Fatalf("disabled release: %v", err)
+	}
+}
+
+func TestAcquireLeadershipWaitsForHeldLock(t *testing.T) {
+	dir := filepath.Join("testdata", "main-leader-lock")
+	path := filepath.Join(dir, "shunt.lock")
+	t.Cleanup(func() {
+		_ = os.Remove(path)
+		_ = os.Remove(dir)
+	})
+
+	lock, err := leader.NewFileLock(path)
+	if err != nil {
+		t.Fatalf("NewFileLock: %v", err)
+	}
+	lease, err := lock.TryAcquire()
+	if err != nil {
+		t.Fatalf("TryAcquire: %v", err)
+	}
+	defer func() {
+		if err := lease.Release(); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := acquireLeadership(ctx, path, time.Hour); err != context.Canceled {
+		t.Fatalf("acquireLeadership held lock error = %v, want context.Canceled", err)
 	}
 }

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
+	"github.com/rbtr/shunt/internal/leader"
 	"github.com/rbtr/shunt/internal/manager"
 	"github.com/rbtr/shunt/internal/metrics"
 	"github.com/rbtr/shunt/internal/repoconfig"
@@ -87,6 +89,10 @@ func main() {
 	if err != nil || batchLinger < 0 {
 		log.Fatalf("bad SHUNT_BATCH_LINGER: must be a non-negative duration")
 	}
+	leaderRetry, err := time.ParseDuration(env("SHUNT_LEADER_RETRY", "5s"))
+	if err != nil || leaderRetry <= 0 {
+		log.Fatalf("bad SHUNT_LEADER_RETRY: must be a positive duration")
+	}
 
 	metricsCollector := metrics.New()
 	wake := make(chan struct{}, 1)
@@ -94,6 +100,15 @@ func main() {
 		Secret: webhookSecret,
 		Wake:   wakeReconcile(wake),
 	})
+	releaseLeadership, err := acquireLeadership(context.Background(), os.Getenv("SHUNT_LEADER_LOCK"), leaderRetry)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := releaseLeadership(); err != nil {
+			log.Printf("leader lock release: %v", err)
+		}
+	}()
 
 	fc := forge.New(instance, token)
 
@@ -292,6 +307,35 @@ func drainWake(wake <-chan struct{}) {
 		case <-wake:
 		default:
 			return
+		}
+	}
+}
+
+func acquireLeadership(ctx context.Context, path string, retry time.Duration) (func() error, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return func() error { return nil }, nil
+	}
+	fileLock, err := leader.NewFileLock(path)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		lease, err := fileLock.TryAcquire()
+		if err == nil {
+			log.Printf("shunt: acquired leader lock %s", path)
+			return lease.Release, nil
+		}
+		if !errors.Is(err, leader.ErrLocked) {
+			return nil, err
+		}
+		log.Printf("shunt: waiting for leader lock %s", path)
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
 		}
 	}
 }

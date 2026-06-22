@@ -43,6 +43,9 @@ welcome.
   aggregate status for staging branches before falling back to task aggregation,
   so multi-job gates are not considered green while dependent jobs are still
   being materialized.
+- **Optional file-lock leadership.** `SHUNT_LEADER_LOCK` lets single-host or
+  shared-filesystem deployments run standby replicas while one leader reconciles
+  queues. This is restart-equivalent failover, not durable HA.
 
 ## Current limitations
 
@@ -54,7 +57,9 @@ welcome.
 - **Polling backstop.** shunt still reconciles on a timer (default 10s) to
   tolerate missed webhooks, so there is some steady API traffic even when webhook
   wakeups are configured.
-- **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
+- **Limited HA.** Optional file-lock leadership can keep a standby ready on one
+  host or a suitable shared filesystem. Queue state is still in memory, so
+  failover behaves like a restart and may re-run in-flight CI.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
   parallel batches from fresh queue entries.
@@ -125,7 +130,9 @@ welcome.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.
-- Optional leader-elected HA.
+- Durable leader election backed by persisted state or an external lease. The
+  optional file-lock leader covers only single-host or shared-filesystem standby
+  deployments.
 
 ### Validation
 - Burn-in on a real, busy repository with a heavy end-to-end suite and

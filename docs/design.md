@@ -109,6 +109,17 @@ of `1` preserves serial bisection. Higher values use sibling staging branches
 such as `mq/main/staging-1`, `mq/main/staging-2`, so the gate workflow must keep
 matching `mq/**`.
 
+`SHUNT_LEADER_LOCK` optionally gates reconciliation behind an advisory
+filesystem lock. When unset, shunt keeps its default single-process behavior.
+When set to a path, each replica starts the health/metrics/webhook listener, then
+tries to take an exclusive non-blocking file lock. The holder proceeds as the
+active queue manager; standbys retry every `SHUNT_LEADER_RETRY` and take over
+after the kernel releases the lock on process exit. This is intentionally generic
+and dependency-free, and is only safe when all contenders see the same
+POSIX-locking file (for example, one host or a suitable shared filesystem).
+Per-pod local files do not provide Kubernetes HA, and a database/API-backed
+durable lease remains future work.
+
 `land` sets the source-head status and merges each PR in order. Terminal queue
 outcomes are also written back to source PRs:
 
@@ -195,6 +206,9 @@ against the unchanged current base, so `2` can still pass.
 - **Crash safety (today).** State is in-memory; a restart re-derives the queue
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.
+- **Optional file-lock leadership.** Multiple local or shared-filesystem
+  replicas can be configured so only the lock holder reconciles queues. Failover
+  is restart-equivalent because queue and bisection state are still in memory.
 
 ## Observability
 
