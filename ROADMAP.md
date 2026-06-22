@@ -74,8 +74,11 @@ welcome.
   mid-test-update race).~~ Completed: the engine refetches each PR and verifies
   it is still open, unmerged, auto-merge scheduled, and still at the tested head
   SHA immediately before marking it successful and merging.
-- Verify `rebase`/`squash` merge styles and `block_on_outdated_branch`
-  interactions; document supported combinations.
+- ~~Verify `rebase`/`squash` merge styles and `block_on_outdated_branch`
+  interactions; document supported combinations.~~ Completed: `SHUNT_MERGE_STYLE`
+  now accepts `merge`, `squash`, and `rebase`; shunt still pins the expected PR
+  head SHA at merge time and documents keeping "block on outdated branch"
+  disabled so queue validation remains authoritative.
 - Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
 
 ### v0.5 — Observability & ops

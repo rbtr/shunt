@@ -31,7 +31,8 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
    - set the required `merge-queue` commit status to `success` on the PR head
      (`POST /repos/{o}/{r}/statuses/{sha}`), then
    - `POST /repos/{o}/{r}/pulls/{n}/merge`.
-   The forge performs the merge and records the PR as properly merged.
+   The forge performs the configured merge method (`merge`, `squash`, or
+   `rebase`) and records the PR as properly merged.
 
 3. **The required status check is the gate.** With branch protection requiring
    the `merge-queue` status and restricting pushes to the bot, a PR merge is
@@ -161,6 +162,11 @@ against the unchanged current base, so `2` can still pass.
   lower-numbered candidates. If an earlier successful candidate advances the base,
   later speculative branches are discarded and re-staged on the new base before
   any PR lands.
+- **Merge method is an API landing choice, not a staging shortcut.** shunt always
+  tests the integration tree on a staging branch first, then asks the forge to
+  land each PR with the configured `merge`, `squash`, or `rebase` method while
+  pinning the expected PR head SHA. Keep "block on outdated branch" disabled so
+  the queue, not per-PR freshness checks, decides when a tested PR can land.
 - **Crash safety (today).** State is in-memory; a restart re-derives the queue
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.
