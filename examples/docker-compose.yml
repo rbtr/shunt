@@ -8,4 +8,4 @@ services:
       SHUNT_TOPIC: merge-queue
       SHUNT_TOKEN: ${SHUNT_TOKEN:?set SHUNT_TOKEN in your environment or .env}
     ports:
-      - "8080:8080" # /healthz
+      - "8080:8080" # /healthz and /metrics

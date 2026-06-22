@@ -35,8 +35,10 @@ welcome.
   tuned globally, but not per repo.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
-- **Limited observability.** Structured logs only — no metrics, no queue UI
-  (Forgejo has no plugin surface for a native one).
+- **Basic observability only.** Prometheus text metrics cover process-local queue
+  depth and key counters, but there is no persisted metrics history, no
+  time-in-queue histogram, and no queue UI (Forgejo has no plugin surface for a
+  native one).
 - **Merge commits only.** `rebase` and `squash` merge styles are intentionally
   disabled until their branch-protection and tested-tree semantics are verified.
 
@@ -82,7 +84,12 @@ welcome.
 - Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
 
 ### v0.5 — Observability & ops
-- Prometheus metrics (batches, runs, bounces, queue depth, time-in-queue).
+- ~~Prometheus metrics (batches, runs, bounces, queue depth).~~ Completed:
+  `/metrics` exposes process-local Prometheus text metrics for queue depth,
+  active batch presence, batches started, PR merges, bounces, staging conflicts,
+  reconcile errors, and terminal gate outcomes.
+- Deeper observability: time-in-queue histograms, a status surface, and any
+  persistence needed to preserve operational history across restarts.
 - A queue status surface (a sticky per-repo PR comment and/or a small status
   page) since the forge can't host a native one.
 - Staging-branch GC on startup; optional leader-elected HA.

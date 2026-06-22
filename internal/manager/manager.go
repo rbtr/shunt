@@ -10,6 +10,7 @@ import (
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
+	"github.com/rbtr/shunt/internal/metrics"
 )
 
 type Config struct {
@@ -24,6 +25,7 @@ type Config struct {
 	Token       string
 	BotUser     string
 	BotEmail    string
+	Metrics     *metrics.Collector
 }
 
 type Manager struct {
@@ -75,12 +77,14 @@ func (m *Manager) Refresh() error {
 			MaxBatch:      m.cfg.MaxBatch,
 			BatchLinger:   m.cfg.BatchLinger,
 			BatchTarget:   m.cfg.BatchTarget,
+			Metrics:       m.cfg.Metrics,
 		}, m.fc, st)
 		log.Printf("manager: managing %s", k)
 	}
 	for k := range m.engines {
 		if !seen[k] {
 			delete(m.engines, k)
+			m.cfg.Metrics.ForgetQueue(labelsOfKey(k))
 			log.Printf("manager: stopped managing %s (topic removed or repo archived)", k)
 		}
 	}
@@ -98,4 +102,16 @@ func (m *Manager) Tick() {
 
 func cloneURL(instance, owner, repo string) string {
 	return strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
+}
+
+func labelsOfKey(k string) metrics.Labels {
+	ownerRepo, base, ok := strings.Cut(k, "@")
+	if !ok {
+		return metrics.Labels{}
+	}
+	owner, repo, ok := strings.Cut(ownerRepo, "/")
+	if !ok {
+		return metrics.Labels{Repo: ownerRepo, Base: base}
+	}
+	return metrics.Labels{Owner: owner, Repo: repo, Base: base}
 }

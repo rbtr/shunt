@@ -3,11 +3,13 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
+	"github.com/rbtr/shunt/internal/metrics"
 )
 
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
@@ -589,5 +591,53 @@ func assertNoLand(t *testing.T, m *mock) {
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Errorf("merged = %s, want []", got)
+	}
+}
+
+func TestMetricsTrackQueueActivity(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	c := metrics.New()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Metrics: c}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start reconcile: %v", err)
+	}
+	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 2`)
+	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 1`)
+	assertMetric(t, c, `shunt_batches_started_total{owner="o",repo="r",base="main"} 1`)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land reconcile: %v", err)
+	}
+	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 0`)
+	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 0`)
+	assertMetric(t, c, `shunt_pr_merges_total{owner="o",repo="r",base="main"} 2`)
+	assertMetric(t, c, `shunt_gate_outcomes_total{owner="o",repo="r",base="main",outcome="success"} 1`)
+}
+
+func TestMetricsTrackStagingConflictAndBounce(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.conflictPR = 1
+	m.conflictFirst = true
+	c := metrics.New()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Metrics: c}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !m.bounced[1] {
+		t.Fatal("conflicting PR should be bounced")
+	}
+	assertMetric(t, c, `shunt_staging_conflicts_total{owner="o",repo="r",base="main"} 1`)
+	assertMetric(t, c, `shunt_bounces_total{owner="o",repo="r",base="main"} 1`)
+	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 1`)
+}
+
+func assertMetric(t *testing.T, c *metrics.Collector, want string) {
+	t.Helper()
+	var out strings.Builder
+	c.WritePrometheus(&out)
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("metrics output missing %q in:\n%s", want, out.String())
 	}
 }

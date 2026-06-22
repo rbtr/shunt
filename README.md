@@ -102,7 +102,24 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). Process-wide until per-repo config lands. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
-| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` endpoint |
+| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` and `/metrics` endpoints |
+
+## Observability
+
+`GET /metrics` on `SHUNT_LISTEN` exposes dependency-free Prometheus text metrics
+for each managed `(owner, repo, base)` queue:
+
+- `shunt_queue_depth` — PRs currently known in the in-memory queue, including an
+  active batch and queued bisection candidates.
+- `shunt_active_batch` — `1` while a queue has a staging batch under gate test.
+- `shunt_batches_started_total`, `shunt_pr_merges_total`,
+  `shunt_bounces_total`, `shunt_staging_conflicts_total`, and
+  `shunt_reconcile_errors_total`.
+- `shunt_gate_outcomes_total{outcome="success|failure|cancelled|error"}` for
+  terminal gate results.
+
+Metrics are process-local and intentionally minimal in v0.1: they do not persist
+across restarts and do not yet include time-in-queue histograms or a queue UI.
 
 ## Deploy
 

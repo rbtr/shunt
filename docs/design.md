@@ -153,6 +153,15 @@ against the unchanged current base, so `2` can still pass.
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.
 
+## Observability
+
+The same HTTP listener that serves `/healthz` also serves `/metrics` in
+Prometheus text format. Metrics are intentionally dependency-free and
+process-local: they cover queue depth, active batch presence, batches started, PR
+merges, bounces, staging conflicts, reconcile errors, and terminal gate outcomes.
+They reset on restart and do not yet include time-in-queue histograms or a queue
+status UI; those remain roadmap items.
+
 ## Running against a real instance (safely)
 
 1. Create a disposable repo and a bot account with a token.
