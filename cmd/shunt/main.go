@@ -4,8 +4,12 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -64,7 +68,11 @@ func main() {
 	}
 
 	metricsCollector := metrics.New()
-	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector)
+	wake := make(chan struct{}, 1)
+	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector, webhookConfig{
+		Secret: os.Getenv("SHUNT_WEBHOOK_SECRET"),
+		Wake:   wakeReconcile(wake),
+	})
 
 	fc := forge.New(instance, token)
 
@@ -75,13 +83,12 @@ func main() {
 			Metrics: metricsCollector,
 		})
 		log.Printf("shunt: multi-repo mode, topic=%q every %s", topic, interval)
-		for {
+		runReconcileLoop(interval, wake, func() {
 			if err := mgr.Refresh(); err != nil {
 				log.Printf("discovery error: %v", err)
 			}
 			mgr.Tick()
-			time.Sleep(interval)
-		}
+		})
 	}
 
 	// Single-repo mode.
@@ -114,23 +121,21 @@ func main() {
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
-
 	log.Printf("shunt: watching %s/%s base=%s every %s", owner, repo, base, interval)
-	for {
+	runReconcileLoop(interval, wake, func() {
 		if err := eng.Reconcile(); err != nil {
 			log.Printf("reconcile error: %v", err)
 		}
-		time.Sleep(interval)
-	}
+	})
 }
 
-func serveHealth(addr string, metricsCollector *metrics.Collector) {
-	if err := http.ListenAndServe(addr, newHTTPMux(metricsCollector)); err != nil {
+func serveHealth(addr string, metricsCollector *metrics.Collector, webhook webhookConfig) {
+	if err := http.ListenAndServe(addr, newHTTPMux(metricsCollector, webhook)); err != nil {
 		log.Printf("health server: %v", err)
 	}
 }
 
-func newHTTPMux(metricsCollector *metrics.Collector) *http.ServeMux {
+func newHTTPMux(metricsCollector *metrics.Collector, webhook webhookConfig) *http.ServeMux {
 	if metricsCollector == nil {
 		metricsCollector = metrics.New()
 	}
@@ -139,7 +144,129 @@ func newHTTPMux(metricsCollector *metrics.Collector) *http.ServeMux {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("/metrics", metricsCollector.Handler())
+	mux.HandleFunc("/webhook", webhook.handler)
 	return mux
+}
+
+type webhookConfig struct {
+	Secret string
+	Wake   func()
+}
+
+func (c webhookConfig) handler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if c.Secret != "" && !validWebhookSignature(c.Secret, body, r.Header) {
+		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		return
+	}
+
+	event := webhookEvent(r.Header)
+	if event == "" {
+		http.Error(w, "missing webhook event header", http.StatusBadRequest)
+		return
+	}
+	if !webhookWakes(event) {
+		log.Print("webhook: ignored event")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("ignored\n"))
+		return
+	}
+	if c.Wake == nil {
+		http.Error(w, "webhook wake unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	c.Wake()
+	log.Print("webhook: wake requested")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("wake\n"))
+}
+
+func webhookEvent(h http.Header) string {
+	for _, name := range []string{"X-Forgejo-Event", "X-Gitea-Event"} {
+		if v := strings.TrimSpace(h.Get(name)); v != "" {
+			return strings.ToLower(v)
+		}
+	}
+	return ""
+}
+
+func webhookWakes(event string) bool {
+	switch strings.ToLower(strings.TrimSpace(event)) {
+	case "auto_merge_pull_request", "pull_request", "pull_request_sync", "push", "status":
+		return true
+	case "pull_request_review_approved", "pull_request_review_rejected", "pull_request_review_comment":
+		return true
+	default:
+		return false
+	}
+}
+
+func validWebhookSignature(secret string, body []byte, h http.Header) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	want := mac.Sum(nil)
+	for _, header := range []string{"X-Forgejo-Signature", "X-Gitea-Signature", "X-Hub-Signature-256"} {
+		got := strings.TrimSpace(h.Get(header))
+		got = strings.TrimPrefix(got, "sha256=")
+		if got == "" {
+			continue
+		}
+		decoded, err := hex.DecodeString(got)
+		if err != nil {
+			continue
+		}
+		if hmac.Equal(decoded, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func wakeReconcile(wake chan<- struct{}) func() {
+	return func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func runReconcileLoop(interval time.Duration, wake <-chan struct{}, reconcile func()) {
+	for {
+		reconcile()
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			drainWake(wake)
+		}
+	}
+}
+
+func drainWake(wake <-chan struct{}) {
+	for {
+		select {
+		case <-wake:
+		default:
+			return
+		}
+	}
 }
 
 func normalizeMergeStyle(style string) (string, error) {
