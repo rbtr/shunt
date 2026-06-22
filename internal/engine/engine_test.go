@@ -12,22 +12,24 @@ import (
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
 // contains badPR; merges/bounces are recorded.
 type mock struct {
-	prs       map[int]*forge.PullRequest
-	automerge map[int]bool
-	batchOf   map[string][]int // staging sha -> PR numbers
-	badPR     int
-	failMerge int
-	statuses  []string
-	merged    []int
-	bounced   map[int]bool
-	comments  map[int][]string
+	prs         map[int]*forge.PullRequest
+	automerge   map[int]bool
+	batchOf     map[string][]int // staging sha -> PR numbers
+	badPR       int
+	failMerge   int
+	statuses    []string
+	merged      []int
+	bounced     map[int]bool
+	comments    map[int][]string
+	mergeHeads  map[int][]string
+	beforeMerge func(int)
 }
 
 func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
 		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
-		comments: map[int][]string{},
+		comments: map[int][]string{}, mergeHeads: map[int][]string{},
 	}
 	for _, n := range prNums {
 		pr := &forge.PullRequest{Number: n, State: "open"}
@@ -69,7 +71,14 @@ func (m *mock) RunStatus(_, _, sha, _ string) (string, error) {
 	return "success", nil
 }
 
-func (m *mock) MergePR(_, _ string, n int, _ string) error {
+func (m *mock) MergePR(_, _ string, n int, _, headSHA string) error {
+	m.mergeHeads[n] = append(m.mergeHeads[n], headSHA)
+	if m.beforeMerge != nil {
+		m.beforeMerge(n)
+	}
+	if m.prs[n].Head.Sha != headSHA {
+		return fmt.Errorf("head changed: expected %s got %s", headSHA, m.prs[n].Head.Sha)
+	}
 	if n == m.failMerge {
 		return fmt.Errorf("merge failed")
 	}
@@ -168,6 +177,9 @@ func TestLandRevalidatesHappyPath(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[1]" {
 		t.Errorf("merged = %s, want [1]", got)
 	}
+	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
+		t.Errorf("merge head SHA = %s, want [head-1]", got)
+	}
 }
 
 func TestLandSkipsChangedHead(t *testing.T) {
@@ -233,6 +245,38 @@ func TestLandSkipsClosedOrMergedPR(t *testing.T) {
 				t.Errorf("comments = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
+	m := newMock(-1, 1)
+	changed := false
+	m.beforeMerge = func(n int) {
+		if n == 1 && !changed {
+			m.prs[1].Head.Sha = "head-1-new"
+			changed = true
+		}
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land batch: %v", err)
+	}
+
+	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
+		t.Errorf("merge head SHA = %s, want [head-1]", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error]" {
+		t.Errorf("statuses = %s, want success then error on tested head", got)
+	}
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Errorf("merged = %s, want []", got)
+	}
+	if got := fmt.Sprint(m.comments[1]); got != "[Skipped by the merge queue: head changed from head-1 to head-1-new.]" {
+		t.Errorf("comments = %s, want changed-head skip comment", got)
 	}
 }
 
