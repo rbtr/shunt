@@ -12,17 +12,21 @@ import (
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
 // contains badPR; merges/bounces are recorded.
 type mock struct {
-	prs         map[int]*forge.PullRequest
-	automerge   map[int]bool
-	batchOf     map[string][]int // staging sha -> PR numbers
-	badPR       int
-	failMerge   int
-	statuses    []string
-	merged      []int
-	bounced     map[int]bool
-	comments    map[int][]string
-	mergeHeads  map[int][]string
-	beforeMerge func(int)
+	prs            map[int]*forge.PullRequest
+	automerge      map[int]bool
+	batchOf        map[string][]int // staging sha -> PR numbers
+	badPR          int
+	failMerge      int
+	conflictPR     int
+	conflictBasePR int
+	conflictFirst  bool
+	statuses       []string
+	staged         [][]int
+	merged         []int
+	bounced        map[int]bool
+	comments       map[int][]string
+	mergeHeads     map[int][]string
+	beforeMerge    func(int)
 }
 
 func newMock(badPR int, prNums ...int) *mock {
@@ -100,7 +104,11 @@ func (m *mock) BuildStaging(_, _ string, refs []gitops.MergedRef) (string, int, 
 	for _, r := range refs {
 		nums = append(nums, r.PR)
 	}
-	sort.Ints(nums)
+	m.staged = append(m.staged, append([]int(nil), nums...))
+	baseMerged := m.conflictBasePR > 0 && m.prs[m.conflictBasePR].Merged
+	if idx := indexOfNum(nums, m.conflictPR); idx > 0 || (idx == 0 && (m.conflictFirst || baseMerged)) {
+		return "", m.conflictPR, fmt.Errorf("staging conflict")
+	}
 	sha := fmt.Sprintf("stage-%v", nums)
 	m.batchOf[sha] = nums
 	return sha, 0, nil
@@ -277,6 +285,165 @@ func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
 	}
 	if got := fmt.Sprint(m.comments[1]); got != "[Skipped by the merge queue: head changed from head-1 to head-1-new.]" {
 		t.Errorf("comments = %s, want changed-head skip comment", got)
+	}
+}
+
+func TestStagingConflictOnSecondPRQueuesPrefixBeforeSuffix(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	m.conflictPR = 2
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3]]" {
+		t.Fatalf("staged = %s, want [[1 2 3]]", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1] [2 3]]" {
+		t.Fatalf("pending after conflict = %s, want [[1] [2 3]]", got)
+	}
+	if m.bounced[2] {
+		t.Fatal("conflicting PR should not bounce before earlier prefix is tested")
+	}
+}
+
+func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	m.conflictPR = 2
+	m.conflictBasePR = 1
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(m.merged); got != "[1]" {
+		t.Fatalf("merged after prefix = %s, want [1]", got)
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.bounced[2] {
+		t.Fatal("conflicter should bounce after it still conflicts on the base that includes the prefix")
+	}
+	if got := fmt.Sprint(e.pending); got != "[[3]]" {
+		t.Fatalf("pending after conflicter bounce = %s, want [[3]]", got)
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 3]" {
+		t.Errorf("merged = %s, want [1 3]", got)
+	}
+	if m.bounced[1] || m.bounced[3] {
+		t.Fatalf("only PR 2 should bounce, bounced = %v", m.bounced)
+	}
+}
+
+func TestStagingConflictAfterPrefixFailsCanLandConflicter(t *testing.T) {
+	m := newMock(1, 1, 2, 3)
+	m.conflictPR = 2
+	m.conflictBasePR = 1
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.bounced[1] {
+		t.Fatal("failing prefix should bounce")
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if m.bounced[2] {
+		t.Fatal("conflicter should not bounce when prefix did not land")
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[2 3]" {
+		t.Errorf("merged = %s, want [2 3]", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3] [1] [2 3]]" {
+		t.Errorf("staged = %s, want [[1 2 3] [1] [2 3]]", got)
+	}
+}
+
+func TestStagingConflictKeepsChangedPrefixBeforeSuffix(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.conflictPR = 2
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	m.prs[1].Head.Sha = "head-1-new"
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1] [2]]" {
+		t.Fatalf("pending after changed prefix = %s, want [[1] [2]]", got)
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [1] [1]]" {
+		t.Errorf("staged = %s, want changed prefix retried before suffix", got)
+	}
+}
+
+func TestStagingConflictOnFirstPRBouncesAndRequeuesRest(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	m.conflictPR = 1
+	m.conflictFirst = true
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.bounced[1] {
+		t.Fatal("first PR conflict should bounce")
+	}
+	if got := fmt.Sprint(e.pending); got != "[[2 3]]" {
+		t.Fatalf("pending after first conflict = %s, want [[2 3]]", got)
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[2 3]" {
+		t.Errorf("merged = %s, want [2 3]", got)
+	}
+	if m.bounced[2] || m.bounced[3] {
+		t.Fatalf("rest of suffix should not bounce, bounced = %v", m.bounced)
 	}
 }
 

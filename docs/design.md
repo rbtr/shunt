@@ -67,7 +67,13 @@ else:
     cand = pending.pop_front()
     prs  = resolve(cand)                 # drop closed / no-longer-auto-merge
     sha, conflictPR = BuildStaging(base, "mq/<base>/staging", prs)
-    if conflictPR: bounce(conflictPR); requeue(rest); return
+    if conflictPR and conflictPR is first:
+        bounce(conflictPR); requeue(items after conflictPR); return
+    if conflictPR:
+        prefix = items before conflictPR
+        suffix = conflictPR and following items
+        requeue(prefix, suffix)           # prefix keeps its queue position
+        return
     active = { prs, staging_sha: sha }
 ```
 
@@ -99,6 +105,17 @@ test [4]        -> pass  -> merge 4
 `1, 2, 4` land; `3` is bounced with a comment. Five CI runs instead of four
 per-PR runs, but the common all-green case is a single run.
 
+For staging conflicts, the split point is the PR that failed to apply:
+
+```
+stage [1 2 3] conflicts applying 2 -> queue [1] then [2 3]
+test [1] passes and lands          -> [2 3] is re-staged on the new base
+stage [2 3] still conflicts at 2   -> bounce 2, queue [3]
+```
+
+If `[1]` fails or is skipped and does not land, `[2 3]` is instead retried
+against the unchanged current base, so `2` can still pass.
+
 ## Correctness
 
 - **Nothing lands un-tested.** Branch protection blocks merges without the
@@ -109,6 +126,13 @@ per-PR runs, but the common all-green case is a single run.
 - **Interaction failures** (A and B each pass alone but fail together) are
   attributed to whichever is tested second on top of the other — equivalent to
   bors, and acceptable in practice.
+- **Staging conflicts preserve queue order.** If PR `B` conflicts after earlier
+  PR `A` in the same candidate, shunt tests `A` first and retries `B` only after
+  the real base reflects whether `A` landed. If `A` does not land, `B` can still
+  pass on the unchanged base; if `A` lands and `B` is now first and still
+  conflicts, `B` is bounced. A conflict on the first PR in a candidate means
+  that PR conflicts with the current base, so it is bounced and the remaining
+  suffix is re-queued.
 - **Crash safety (today).** State is in-memory; a restart re-derives the queue
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.

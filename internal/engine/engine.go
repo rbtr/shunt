@@ -2,7 +2,8 @@
 // bisection. It keeps a work queue of candidate batches (lists of PR numbers).
 // Each cycle it tests one candidate on a fresh staging branch; on success the
 // whole batch lands, on failure a multi-PR batch is split in half (bisection)
-// to isolate the culprit while letting the good PRs through.
+// to isolate the culprit while letting the good PRs through. Staging conflicts
+// split at the conflict point so earlier PRs keep their place in the queue.
 package engine
 
 import (
@@ -145,12 +146,7 @@ func (e *Engine) startNext() error {
 	sha, conflictPR, err := e.st.BuildStaging(e.cfg.Base, e.cfg.StagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
-			e.bounce(conflictPR, "merge conflict while staging the batch")
-			rest := removeNum(numbersOf(prs), conflictPR)
-			if len(rest) > 0 {
-				e.pending = append([][]int{rest}, e.pending...)
-			}
-			return nil
+			return e.handleStagingConflict(numbersOf(prs), conflictPR)
 		}
 		return err
 	}
@@ -179,6 +175,7 @@ func (e *Engine) checkActive() error {
 // order. Sequential merges reproduce the tested staging tree.
 func (e *Engine) land() error {
 	a := e.active
+	requeueFrom := -1
 	for i, pr := range a.prs {
 		ok, reason, current, err := e.readyToLand(pr)
 		if err != nil {
@@ -186,6 +183,7 @@ func (e *Engine) land() error {
 		}
 		if !ok {
 			e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
+			requeueFrom = i
 			break
 		}
 		if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "success", "merge queue: batch passed", e.commitURL(a.stagingSHA)); err != nil {
@@ -210,6 +208,7 @@ func (e *Engine) land() error {
 				}
 				e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
 				drifted = true
+				requeueFrom = i
 				break
 			}
 			time.Sleep(2 * time.Second)
@@ -222,13 +221,46 @@ func (e *Engine) land() error {
 				return fmt.Errorf("merge #%d failed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 			}
 			log.Printf("queue: merge #%d failed: %v (remaining PRs re-queued next cycle)", pr.Number, mErr)
+			requeueFrom = i
 			break
 		}
 		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, pr.Number, "Landed via merge queue.")
 		log.Printf("queue: merged #%d", pr.Number)
 	}
+	if requeueFrom >= 0 {
+		e.requeueActiveRemainder(a.prs[requeueFrom:])
+	}
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
 	e.active = nil
+	return nil
+}
+
+func (e *Engine) requeueActiveRemainder(prs []forge.PullRequest) {
+	nums := numbersOf(prs)
+	if len(nums) > 0 {
+		e.pending = append([][]int{nums}, e.pending...)
+	}
+}
+
+func (e *Engine) handleStagingConflict(nums []int, conflictPR int) error {
+	idx := indexOfNum(nums, conflictPR)
+	if idx < 0 {
+		return fmt.Errorf("stager reported conflict on PR #%d outside candidate %v", conflictPR, nums)
+	}
+	if idx == 0 {
+		e.bounce(conflictPR, "merge conflict while staging the PR")
+		if len(nums) > 1 {
+			rest := append([]int(nil), nums[1:]...)
+			e.pending = append([][]int{rest}, e.pending...)
+			log.Printf("queue: batch %v conflicts on first PR #%d -> re-queued %v", nums, conflictPR, rest)
+		}
+		return nil
+	}
+
+	prefix := append([]int(nil), nums[:idx]...)
+	suffix := append([]int(nil), nums[idx:]...)
+	e.pending = append([][]int{prefix, suffix}, e.pending...)
+	log.Printf("queue: batch %v conflicts on #%d -> testing prefix %v before suffix %v", nums, conflictPR, prefix, suffix)
 	return nil
 }
 
@@ -318,6 +350,15 @@ func removeNum(nums []int, n int) []int {
 		}
 	}
 	return out
+}
+
+func indexOfNum(nums []int, n int) int {
+	for i, x := range nums {
+		if x == n {
+			return i
+		}
+	}
+	return -1
 }
 
 func short(s string) string {

@@ -4,6 +4,15 @@ shunt v0.1 works, but it is young and deliberately minimal. This page tracks wha
 it does **not** yet do and the order we intend to fix it. Issues and PRs are
 welcome.
 
+## Recently completed
+
+- **Order-preserving conflict handling.** A staging conflict splits the candidate
+  at the conflict point: earlier PRs are tested first, then the conflicting
+  suffix is retried on the current base. If the conflict is already first in a
+  candidate, that PR is bounced and the remaining suffix is re-queued. This
+  replaces the former coarse conflict handling that could bounce a PR which only
+  conflicted with a batch-mate that ultimately did not land.
+
 ## Current limitations
 
 - **In-memory state.** The queue and the bisection frontier live in memory. A
@@ -27,8 +36,6 @@ welcome.
   idle and any PR is ready, so under low or bursty traffic batching is incidental
   (it only happens because earlier batches were still testing) rather than an
   intentional, tunable wait.
-- **Coarse conflict handling.** A PR that conflicts only with a *batch-mate*
-  (not the base) is bounced, even though it would merge fine on its own.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
 - **Limited observability.** Structured logs only — no metrics, no queue UI
@@ -67,7 +74,6 @@ welcome.
   form-immediately behavior.
 
 ### v0.4 — Correctness & safety
-- Retry a conflicting PR on its own before bouncing it.
 - ~~Re-validate a PR's head SHA immediately before the gated merge (close the
   mid-test-update race).~~ Completed: the engine refetches each PR and verifies
   it is still open, unmerged, auto-merge scheduled, and still at the tested head
