@@ -14,23 +14,25 @@ import (
 const FileName = ".shunt.yml"
 
 type Settings struct {
-	Base         string
-	StatusCtx    string
-	MergeStyle   string
-	MaxBatch     int
-	BatchLinger  time.Duration
-	BatchTarget  int
-	BisectFanout int
+	Base               string
+	StatusCtx          string
+	MergeStyle         string
+	MaxBatch           int
+	BatchLinger        time.Duration
+	BatchTarget        int
+	InitialBatchFanout int
+	BisectFanout       int
 }
 
 type fileConfig struct {
-	Base         *string `yaml:"base"`
-	StatusCtx    *string `yaml:"status_context"`
-	MergeStyle   *string `yaml:"merge_style"`
-	MaxBatch     *int    `yaml:"max_batch"`
-	BatchLinger  *string `yaml:"batch_linger"`
-	BatchTarget  *int    `yaml:"batch_target"`
-	BisectFanout *int    `yaml:"bisect_fanout"`
+	Base               *string `yaml:"base"`
+	StatusCtx          *string `yaml:"status_context"`
+	MergeStyle         *string `yaml:"merge_style"`
+	MaxBatch           *int    `yaml:"max_batch"`
+	BatchLinger        *string `yaml:"batch_linger"`
+	BatchTarget        *int    `yaml:"batch_target"`
+	InitialBatchFanout *int    `yaml:"initial_batch_fanout"`
+	BisectFanout       *int    `yaml:"bisect_fanout"`
 }
 
 func Apply(data []byte, defaults Settings) (Settings, error) {
@@ -88,6 +90,12 @@ func Apply(data []byte, defaults Settings) (Settings, error) {
 			return Settings{}, fmt.Errorf("batch_target must be a non-negative integer")
 		}
 		out.BatchTarget = *cfg.BatchTarget
+	}
+	if cfg.InitialBatchFanout != nil {
+		if *cfg.InitialBatchFanout < 1 {
+			return Settings{}, fmt.Errorf("initial_batch_fanout must be a positive integer")
+		}
+		out.InitialBatchFanout = *cfg.InitialBatchFanout
 	}
 	if cfg.BisectFanout != nil {
 		if *cfg.BisectFanout < 1 {

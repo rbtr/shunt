@@ -16,22 +16,23 @@ import (
 )
 
 type Config struct {
-	Topic         string
-	StatusCtx     string
-	MergeStyle    string
-	MaxBatch      int
-	BatchLinger   time.Duration
-	BatchTarget   int
-	BisectFanout  int
-	QueueComments bool
-	WebhookURL    string
-	WebhookSecret string
-	InstanceURL   string
-	PublicURL     string
-	Token         string
-	BotUser       string
-	BotEmail      string
-	Metrics       *metrics.Collector
+	Topic              string
+	StatusCtx          string
+	MergeStyle         string
+	MaxBatch           int
+	BatchLinger        time.Duration
+	BatchTarget        int
+	InitialBatchFanout int
+	BisectFanout       int
+	QueueComments      bool
+	WebhookURL         string
+	WebhookSecret      string
+	InstanceURL        string
+	PublicURL          string
+	Token              string
+	BotUser            string
+	BotEmail           string
+	Metrics            *metrics.Collector
 }
 
 type Manager struct {
@@ -118,13 +119,14 @@ func (m *Manager) repoSettings(r forge.RepoRef) (repoconfig.Settings, error) {
 		base = "main"
 	}
 	defaults := repoconfig.Settings{
-		Base:         base,
-		StatusCtx:    m.cfg.StatusCtx,
-		MergeStyle:   m.cfg.MergeStyle,
-		MaxBatch:     m.cfg.MaxBatch,
-		BatchLinger:  m.cfg.BatchLinger,
-		BatchTarget:  m.cfg.BatchTarget,
-		BisectFanout: m.cfg.BisectFanout,
+		Base:               base,
+		StatusCtx:          m.cfg.StatusCtx,
+		MergeStyle:         m.cfg.MergeStyle,
+		MaxBatch:           m.cfg.MaxBatch,
+		BatchLinger:        m.cfg.BatchLinger,
+		BatchTarget:        m.cfg.BatchTarget,
+		InitialBatchFanout: m.cfg.InitialBatchFanout,
+		BisectFanout:       m.cfg.BisectFanout,
 	}
 	data, err := m.fc.ReadFile(r.Owner, r.Name, base, repoconfig.FileName)
 	if errors.Is(err, forge.ErrNotFound) {
@@ -138,21 +140,22 @@ func (m *Manager) repoSettings(r forge.RepoRef) (repoconfig.Settings, error) {
 
 func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) engine.Config {
 	return engine.Config{
-		Owner:         r.Owner,
-		Repo:          r.Name,
-		Base:          settings.Base,
-		StatusCtx:     settings.StatusCtx,
-		MergeStyle:    settings.MergeStyle,
-		StagingBranch: "mq/" + settings.Base + "/staging",
-		InstanceURL:   m.cfg.InstanceURL,
-		PublicURL:     m.cfg.PublicURL,
-		MaxBatch:      settings.MaxBatch,
-		BatchLinger:   settings.BatchLinger,
-		BatchTarget:   settings.BatchTarget,
-		BisectFanout:  settings.BisectFanout,
-		QueueComments: m.cfg.QueueComments,
-		BotUser:       m.cfg.BotUser,
-		Metrics:       m.cfg.Metrics,
+		Owner:              r.Owner,
+		Repo:               r.Name,
+		Base:               settings.Base,
+		StatusCtx:          settings.StatusCtx,
+		MergeStyle:         settings.MergeStyle,
+		StagingBranch:      "mq/" + settings.Base + "/staging",
+		InstanceURL:        m.cfg.InstanceURL,
+		PublicURL:          m.cfg.PublicURL,
+		MaxBatch:           settings.MaxBatch,
+		BatchLinger:        settings.BatchLinger,
+		BatchTarget:        settings.BatchTarget,
+		InitialBatchFanout: settings.InitialBatchFanout,
+		BisectFanout:       settings.BisectFanout,
+		QueueComments:      m.cfg.QueueComments,
+		BotUser:            m.cfg.BotUser,
+		Metrics:            m.cfg.Metrics,
 	}
 }
 

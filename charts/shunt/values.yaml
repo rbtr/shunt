@@ -22,6 +22,7 @@ config:
   maxBatch: "0"
   batchLinger: "0"
   batchTarget: "0"
+  initialBatchFanout: "1"
   bisectFanout: "1"
   queueComments: "false"
   pollInterval: "10s"

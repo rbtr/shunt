@@ -59,6 +59,8 @@ spec:
               value: {{ .Values.config.batchLinger | quote }}
             - name: SHUNT_BATCH_TARGET
               value: {{ .Values.config.batchTarget | quote }}
+            - name: SHUNT_INITIAL_BATCH_FANOUT
+              value: {{ .Values.config.initialBatchFanout | quote }}
             - name: SHUNT_BISECT_FANOUT
               value: {{ .Values.config.bisectFanout | quote }}
             - name: SHUNT_QUEUE_COMMENTS

@@ -58,9 +58,10 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
 
 State, per `(repo, base)`:
 
-- `pending [][]int` — a work queue of **candidate batches** (each a list of PR
-  numbers, in order).
-- `active` — candidates currently being tested (PRs + staging branch + SHA).
+- `pending` — a work queue of **candidate batches** (each a list of PR numbers,
+  in order, plus whether it came from fresh initial queue seeding).
+- `active` — candidates currently being tested (PRs + staging branch + SHA,
+  base generation, and fresh/bisection source).
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
@@ -75,16 +76,20 @@ for active candidate whose earlier candidates are resolved:
     failure            -> bisectOrBounce(active)
     running/unknown    -> wait
 
-while active count < bisection fan-out:
+while active count < max(initial-batch fan-out, bisection fan-out):
     if pending empty:
         ready = ready auto-merge PRs
+        drop PRs already pending or active
         if ready empty: clear linger; return
         if batch_linger > 0 and (batch_target == 0 or ready below batch_target)
            and window not expired:
             remember first-ready time; return
-        pending = [[ ready ]]              # re-seed
+        pending = chunk(ready, max_batch) up to initial-batch fan-out
         clear linger
-    cand = pending.pop_front()
+    cand = pending.front()
+    if cand is fresh and fresh active count is at initial-batch fan-out: wait
+    if cand is bisection and bisection active count is at bisection fan-out: wait
+    pending.pop_front()
     prs  = resolve(cand)                 # drop closed / no-longer-auto-merge
     sha, conflictPR = BuildStaging(base, "mq/<base>/staging", prs)
     if conflictPR and conflictPR is first:
@@ -97,17 +102,28 @@ while active count < bisection fan-out:
     active += { prs, staging_branch, staging_sha, base_generation }
 ```
 
-`SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` only apply when seeding the first
-candidate batch from the ready queue. Bisection candidates already in `pending`
-start immediately. A linger duration of `0` preserves form-immediately behavior;
-with a non-zero duration, shunt waits until either the target count is reached or
-the window expires. These knobs are process-wide today; per-repository overrides
-remain future work.
+`SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` apply when seeding candidate
+batches from the ready queue. Bisection candidates already in `pending` start
+immediately. A linger duration of `0` preserves form-immediately behavior; with a
+non-zero duration, shunt waits until either the target count is reached or the
+window expires. They are process defaults that `.shunt.yml` can override per
+repository.
+
+`SHUNT_INITIAL_BATCH_FANOUT` caps concurrent fresh rollup staging runs per queue.
+A value of `1` preserves the historical serial initial-batch behavior. Higher
+values split ready PRs into up to that many fresh candidates, each capped by
+`SHUNT_MAX_BATCH` when set. Later fresh candidates are speculative: ordered
+resolution prevents them from landing before earlier candidates, and if an
+earlier candidate advances the base, any later active candidate from the old base
+generation is deleted, re-queued, and re-staged before it can land. It is also a
+process default that `.shunt.yml` can override per repository.
 
 `SHUNT_BISECT_FANOUT` caps concurrent bisection staging runs per queue. A value
 of `1` preserves serial bisection. Higher values use sibling staging branches
 such as `mq/main/staging-1`, `mq/main/staging-2`, so the gate workflow must keep
-matching `mq/**`.
+matching `mq/**`. Initial-batch fan-out does not raise the bisection fan-out; the
+two limits are tracked separately while sharing the same ordered active set. It
+can also be overridden per repository.
 
 `land` sets the source-head status and merges each PR in order. Terminal queue
 outcomes are also written back to source PRs:
@@ -132,7 +148,7 @@ else:               mid = len/2
 ```
 
 Because candidates are just lists of PR numbers and staging is always rebuilt
-from the *current* base tip, a successful sub-batch that advances the base is
+from the *current* base tip, a successful candidate that advances the base is
 handled safely: any later speculative staging run from the old base generation is
 deleted and re-queued, then re-staged before it can land.
 

@@ -8,13 +8,14 @@ import (
 
 func TestApplyUsesDefaultsForEmptyConfig(t *testing.T) {
 	def := Settings{
-		Base:         "main",
-		StatusCtx:    "merge-queue",
-		MergeStyle:   "merge",
-		MaxBatch:     0,
-		BatchLinger:  time.Second,
-		BatchTarget:  2,
-		BisectFanout: 1,
+		Base:               "main",
+		StatusCtx:          "merge-queue",
+		MergeStyle:         "merge",
+		MaxBatch:           0,
+		BatchLinger:        time.Second,
+		BatchTarget:        2,
+		InitialBatchFanout: 1,
+		BisectFanout:       1,
 	}
 	got, err := Apply(nil, def)
 	if err != nil {
@@ -27,13 +28,14 @@ func TestApplyUsesDefaultsForEmptyConfig(t *testing.T) {
 
 func TestApplyOverridesAllSupportedFields(t *testing.T) {
 	def := Settings{
-		Base:         "main",
-		StatusCtx:    "merge-queue",
-		MergeStyle:   "merge",
-		MaxBatch:     0,
-		BatchLinger:  0,
-		BatchTarget:  0,
-		BisectFanout: 1,
+		Base:               "main",
+		StatusCtx:          "merge-queue",
+		MergeStyle:         "merge",
+		MaxBatch:           0,
+		BatchLinger:        0,
+		BatchTarget:        0,
+		InitialBatchFanout: 1,
+		BisectFanout:       1,
 	}
 	got, err := Apply([]byte(`
 base: trunk
@@ -42,19 +44,21 @@ merge_style: squash
 max_batch: 4
 batch_linger: 30s
 batch_target: 3
+initial_batch_fanout: 4
 bisect_fanout: 2
 `), def)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	want := Settings{
-		Base:         "trunk",
-		StatusCtx:    "shunt",
-		MergeStyle:   "squash",
-		MaxBatch:     4,
-		BatchLinger:  30 * time.Second,
-		BatchTarget:  3,
-		BisectFanout: 2,
+		Base:               "trunk",
+		StatusCtx:          "shunt",
+		MergeStyle:         "squash",
+		MaxBatch:           4,
+		BatchLinger:        30 * time.Second,
+		BatchTarget:        3,
+		InitialBatchFanout: 4,
+		BisectFanout:       2,
 	}
 	if got != want {
 		t.Fatalf("Apply = %+v, want %+v", got, want)
@@ -62,7 +66,7 @@ bisect_fanout: 2
 }
 
 func TestApplyRejectsInvalidConfigWithoutPartialSettings(t *testing.T) {
-	def := Settings{Base: "main", StatusCtx: "merge-queue", MergeStyle: "merge", BisectFanout: 1}
+	def := Settings{Base: "main", StatusCtx: "merge-queue", MergeStyle: "merge", InitialBatchFanout: 1, BisectFanout: 1}
 	for _, tc := range []struct {
 		name string
 		body string
@@ -71,6 +75,7 @@ func TestApplyRejectsInvalidConfigWithoutPartialSettings(t *testing.T) {
 		{name: "unknown field", body: "unknown: true\n", want: "field unknown not found"},
 		{name: "bad duration", body: "batch_linger: soon\n", want: "batch_linger"},
 		{name: "negative batch", body: "max_batch: -1\n", want: "max_batch"},
+		{name: "bad initial fanout", body: "initial_batch_fanout: 0\n", want: "initial_batch_fanout"},
 		{name: "bad fanout", body: "bisect_fanout: 0\n", want: "bisect_fanout"},
 		{name: "bad merge", body: "merge_style: fast-forward\n", want: "merge_style"},
 	} {

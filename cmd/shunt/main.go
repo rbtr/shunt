@@ -69,6 +69,10 @@ func main() {
 	if err != nil || batchTarget < 0 {
 		log.Fatalf("bad SHUNT_BATCH_TARGET: must be a non-negative integer")
 	}
+	initialBatchFanout, err := strconv.Atoi(env("SHUNT_INITIAL_BATCH_FANOUT", "1"))
+	if err != nil || initialBatchFanout < 1 {
+		log.Fatalf("bad SHUNT_INITIAL_BATCH_FANOUT: must be a positive integer")
+	}
 	bisectFanout, err := strconv.Atoi(env("SHUNT_BISECT_FANOUT", "1"))
 	if err != nil || bisectFanout < 1 {
 		log.Fatalf("bad SHUNT_BISECT_FANOUT: must be a positive integer")
@@ -99,7 +103,7 @@ func main() {
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
-			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout, QueueComments: queueComments,
+			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, InitialBatchFanout: initialBatchFanout, BisectFanout: bisectFanout, QueueComments: queueComments,
 			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector,
@@ -121,7 +125,7 @@ func main() {
 	owner, repo := parts[0], parts[1]
 	base := env("SHUNT_BASE", "main")
 	settings := repoconfig.Settings{
-		Base: base, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
+		Base: base, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, InitialBatchFanout: initialBatchFanout, BisectFanout: bisectFanout,
 	}
 	if data, err := fc.ReadFile(owner, repo, base, repoconfig.FileName); errors.Is(err, forge.ErrNotFound) {
 		// No per-repo config; keep global defaults.
@@ -144,7 +148,7 @@ func main() {
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
-		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
+		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, InitialBatchFanout: settings.InitialBatchFanout, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))

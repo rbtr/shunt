@@ -30,6 +30,7 @@ merge_style: squash
 max_batch: 4
 batch_linger: 20s
 batch_target: 3
+initial_batch_fanout: 4
 bisect_fanout: 2
 `))
 		case "/api/v1/repos/o/r/branch_protections/trunk":
@@ -59,19 +60,20 @@ bisect_fanout: 2
 	defer srv.Close()
 
 	m := New(forge.New(srv.URL, "token"), Config{
-		Topic:        "merge-queue",
-		StatusCtx:    "merge-queue",
-		MergeStyle:   "merge",
-		MaxBatch:     0,
-		BatchLinger:  time.Second,
-		BatchTarget:  0,
-		BisectFanout: 1,
-		InstanceURL:  srv.URL,
-		PublicURL:    srv.URL,
-		Token:        "token",
-		BotUser:      "bot",
-		BotEmail:     "bot@example.invalid",
-		Metrics:      metrics.New(),
+		Topic:              "merge-queue",
+		StatusCtx:          "merge-queue",
+		MergeStyle:         "merge",
+		MaxBatch:           0,
+		BatchLinger:        time.Second,
+		BatchTarget:        0,
+		InitialBatchFanout: 1,
+		BisectFanout:       1,
+		InstanceURL:        srv.URL,
+		PublicURL:          srv.URL,
+		Token:              "token",
+		BotUser:            "bot",
+		BotEmail:           "bot@example.invalid",
+		Metrics:            metrics.New(),
 	})
 	if err := m.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -87,7 +89,7 @@ bisect_fanout: 2
 		t.Fatalf("missing engine for overridden base; got keys %#v", m.engines)
 	}
 	if got.cfg.StatusCtx != "shunt" || got.cfg.MergeStyle != "squash" || got.cfg.MaxBatch != 4 ||
-		got.cfg.BatchLinger != 20*time.Second || got.cfg.BatchTarget != 3 || got.cfg.BisectFanout != 2 {
+		got.cfg.BatchLinger != 20*time.Second || got.cfg.BatchTarget != 3 || got.cfg.InitialBatchFanout != 4 || got.cfg.BisectFanout != 2 {
 		t.Fatalf("engine config = %+v", got.cfg)
 	}
 }
@@ -126,16 +128,17 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 	defer srv.Close()
 
 	m := New(forge.New(srv.URL, "token"), Config{
-		Topic:        "merge-queue",
-		StatusCtx:    "merge-queue",
-		MergeStyle:   "merge",
-		BisectFanout: 1,
-		InstanceURL:  srv.URL,
-		PublicURL:    srv.URL,
-		Token:        "token",
-		BotUser:      "bot",
-		BotEmail:     "bot@example.invalid",
-		Metrics:      metrics.New(),
+		Topic:              "merge-queue",
+		StatusCtx:          "merge-queue",
+		MergeStyle:         "merge",
+		InitialBatchFanout: 1,
+		BisectFanout:       1,
+		InstanceURL:        srv.URL,
+		PublicURL:          srv.URL,
+		Token:              "token",
+		BotUser:            "bot",
+		BotEmail:           "bot@example.invalid",
+		Metrics:            metrics.New(),
 	})
 	if err := m.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -144,7 +147,7 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing engine for default base; got keys %#v", m.engines)
 	}
-	if got.cfg.StatusCtx != "merge-queue" || got.cfg.MergeStyle != "merge" || got.cfg.BisectFanout != 1 {
+	if got.cfg.StatusCtx != "merge-queue" || got.cfg.MergeStyle != "merge" || got.cfg.InitialBatchFanout != 1 || got.cfg.BisectFanout != 1 {
 		t.Fatalf("engine config = %+v", got.cfg)
 	}
 }
@@ -233,16 +236,17 @@ func TestRefreshRejectsInvalidRepoConfig(t *testing.T) {
 	defer srv.Close()
 
 	m := New(forge.New(srv.URL, "token"), Config{
-		Topic:        "merge-queue",
-		StatusCtx:    "merge-queue",
-		MergeStyle:   "merge",
-		BisectFanout: 1,
-		InstanceURL:  srv.URL,
-		PublicURL:    srv.URL,
-		Token:        "token",
-		BotUser:      "bot",
-		BotEmail:     "bot@example.invalid",
-		Metrics:      metrics.New(),
+		Topic:              "merge-queue",
+		StatusCtx:          "merge-queue",
+		MergeStyle:         "merge",
+		InitialBatchFanout: 1,
+		BisectFanout:       1,
+		InstanceURL:        srv.URL,
+		PublicURL:          srv.URL,
+		Token:              "token",
+		BotUser:            "bot",
+		BotEmail:           "bot@example.invalid",
+		Metrics:            metrics.New(),
 	})
 	if err := m.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)

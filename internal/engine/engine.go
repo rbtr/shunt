@@ -19,21 +19,31 @@ import (
 )
 
 type Config struct {
-	Owner         string
-	Repo          string
-	Base          string
-	StatusCtx     string // required commit-status context, e.g. "merge-queue"
-	MergeStyle    string // merge|rebase|squash
-	StagingBranch string // e.g. "mq/main/staging"
-	InstanceURL   string // used for API/git (may be an in-cluster URL)
-	PublicURL     string // used for user-facing links (defaults to InstanceURL)
-	MaxBatch      int    // cap the initial rollup size (0 = unlimited)
-	BatchLinger   time.Duration
-	BatchTarget   int
-	BisectFanout  int // max concurrent bisection staging runs (0 = 1)
-	QueueComments bool
-	BotUser       string
-	Metrics       *metrics.Collector
+	Owner              string
+	Repo               string
+	Base               string
+	StatusCtx          string // required commit-status context, e.g. "merge-queue"
+	MergeStyle         string // merge|rebase|squash
+	StagingBranch      string // e.g. "mq/main/staging"
+	InstanceURL        string // used for API/git (may be an in-cluster URL)
+	PublicURL          string // used for user-facing links (defaults to InstanceURL)
+	MaxBatch           int    // cap the initial rollup size (0 = unlimited)
+	BatchLinger        time.Duration
+	BatchTarget        int
+	InitialBatchFanout int // max concurrent initial staging runs (0 = 1)
+	BisectFanout       int // max concurrent bisection staging runs (0 = 1)
+	QueueComments      bool
+	BotUser            string
+	Metrics            *metrics.Collector
+}
+
+type candidate struct {
+	nums  []int
+	fresh bool
+}
+
+func (c candidate) String() string {
+	return fmt.Sprint(c.nums)
 }
 
 type activeBatch struct {
@@ -43,6 +53,7 @@ type activeBatch struct {
 	debugURL      string
 	baseGen       int
 	outcome       string
+	fresh         bool
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -70,7 +81,7 @@ type Engine struct {
 	cfg     Config
 	fc      ForgeAPI
 	st      Stager
-	pending [][]int // work queue of candidate batches (PR numbers, in order)
+	pending []candidate // work queue of candidate batches (PR numbers, in order)
 	active  []*activeBatch
 	now     func() time.Time
 
@@ -110,7 +121,7 @@ func (e *Engine) Reconcile() error {
 }
 
 // readyNumbers lists open PRs targeting base that currently have auto-merge
-// scheduled, ordered FIFO, capped to MaxBatch.
+// scheduled, ordered FIFO.
 func (e *Engine) readyNumbers() ([]int, error) {
 	prs, err := e.fc.ListOpenPRs(e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
 	if err != nil {
@@ -127,9 +138,6 @@ func (e *Engine) readyNumbers() ([]int, error) {
 		}
 	}
 	sort.Ints(nums)
-	if e.cfg.MaxBatch > 0 && len(nums) > e.cfg.MaxBatch {
-		nums = nums[:e.cfg.MaxBatch]
-	}
 	return nums, nil
 }
 
@@ -158,7 +166,10 @@ func (e *Engine) resolve(nums []int) ([]forge.PullRequest, error) {
 
 func (e *Engine) startNext() (bool, error) {
 	if len(e.pending) == 0 {
-		if len(e.active) > 0 {
+		if e.initialBatchFanout() <= 1 && len(e.active) > 0 {
+			return false, nil
+		}
+		if e.activeFreshCount() >= e.initialBatchFanout() {
 			return false, nil
 		}
 		ready, err := e.readyNumbers()
@@ -166,16 +177,27 @@ func (e *Engine) startNext() (bool, error) {
 			e.lingerSince = time.Time{}
 			return false, err
 		}
-		if e.linger(ready) {
+		ready = e.filterKnown(ready)
+		if len(ready) == 0 {
+			e.lingerSince = time.Time{}
 			return false, nil
 		}
-		e.enqueue(ready)
+		if e.linger(e.seedableInitialReady(ready)) {
+			return false, nil
+		}
+		e.enqueueInitial(e.initialCandidates(ready)...)
 		e.lingerSince = time.Time{}
 	}
+	if len(e.pending) == 0 {
+		return false, nil
+	}
 	cand := e.pending[0]
+	if !e.canStart(cand) {
+		return false, nil
+	}
 	e.pending = e.pending[1:]
 
-	prs, err := e.resolve(cand)
+	prs, err := e.resolve(cand.nums)
 	if err != nil {
 		return false, err
 	}
@@ -196,7 +218,7 @@ func (e *Engine) startNext() (bool, error) {
 		}
 		return false, err
 	}
-	a := &activeBatch{prs: prs, stagingBranch: stagingBranch, stagingSHA: sha, baseGen: e.baseGen}
+	a := &activeBatch{prs: prs, stagingBranch: stagingBranch, stagingSHA: sha, baseGen: e.baseGen, fresh: cand.fresh}
 	e.active = append(e.active, a)
 	e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
 	log.Printf("queue: testing batch %v on %s sha=%s", numbersOf(prs), a.stagingBranch, short(sha))
@@ -439,10 +461,56 @@ func (e *Engine) bounce(num int, reason, statusState, debugURL string) {
 }
 
 func (e *Engine) activeLimit() int {
+	bisect := e.bisectFanout()
+	initial := e.initialBatchFanout()
+	if initial > bisect {
+		return initial
+	}
+	return bisect
+}
+
+func (e *Engine) bisectFanout() int {
 	if e.cfg.BisectFanout > 0 {
 		return e.cfg.BisectFanout
 	}
 	return 1
+}
+
+func (e *Engine) initialBatchFanout() int {
+	if e.cfg.InitialBatchFanout > 0 {
+		return e.cfg.InitialBatchFanout
+	}
+	return 1
+}
+
+func (e *Engine) canStart(c candidate) bool {
+	if len(e.active) >= e.activeLimit() {
+		return false
+	}
+	if c.fresh {
+		return e.activeFreshCount() < e.initialBatchFanout()
+	}
+	return e.activeBisectionCount() < e.bisectFanout()
+}
+
+func (e *Engine) activeFreshCount() int {
+	n := 0
+	for _, a := range e.active {
+		if a.fresh {
+			n++
+		}
+	}
+	return n
+}
+
+func (e *Engine) activeBisectionCount() int {
+	n := 0
+	for _, a := range e.active {
+		if !a.fresh {
+			n++
+		}
+	}
+	return n
 }
 
 func (e *Engine) stagingBranch() string {
@@ -454,21 +522,82 @@ func (e *Engine) stagingBranch() string {
 }
 
 func (e *Engine) enqueue(cands ...[]int) {
+	e.enqueueCandidates(false, cands...)
+}
+
+func (e *Engine) enqueueInitial(cands ...[]int) {
+	e.enqueueCandidates(true, cands...)
+}
+
+func (e *Engine) enqueueCandidates(fresh bool, cands ...[]int) {
 	for _, cand := range cands {
 		if len(cand) == 0 {
 			continue
 		}
-		e.pending = append(e.pending, append([]int(nil), cand...))
+		e.pending = append(e.pending, candidate{nums: append([]int(nil), cand...), fresh: fresh})
 	}
 	sort.SliceStable(e.pending, func(i, j int) bool {
-		return e.pending[i][0] < e.pending[j][0]
+		return e.pending[i].nums[0] < e.pending[j].nums[0]
 	})
+}
+
+func (e *Engine) initialCandidates(ready []int) [][]int {
+	limit := e.initialBatchFanout() - e.activeFreshCount()
+	if limit <= 0 {
+		return nil
+	}
+	batchSize := len(ready)
+	if e.cfg.MaxBatch > 0 && e.cfg.MaxBatch < batchSize {
+		batchSize = e.cfg.MaxBatch
+	}
+	var out [][]int
+	for len(ready) > 0 && len(out) < limit {
+		n := batchSize
+		if n > len(ready) {
+			n = len(ready)
+		}
+		out = append(out, append([]int(nil), ready[:n]...))
+		ready = ready[n:]
+	}
+	return out
+}
+
+func (e *Engine) seedableInitialReady(ready []int) []int {
+	if e.cfg.MaxBatch <= 0 {
+		return ready
+	}
+	limit := e.cfg.MaxBatch * (e.initialBatchFanout() - e.activeFreshCount())
+	if limit > 0 && len(ready) > limit {
+		return ready[:limit]
+	}
+	return ready
+}
+
+func (e *Engine) filterKnown(nums []int) []int {
+	known := map[int]bool{}
+	for _, cand := range e.pending {
+		for _, n := range cand.nums {
+			known[n] = true
+		}
+	}
+	for _, a := range e.active {
+		for _, n := range numbersOf(a.prs) {
+			known[n] = true
+		}
+	}
+	out := nums[:0]
+	for _, n := range nums {
+		if !known[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func (e *Engine) readyToResolve(a *activeBatch) bool {
 	first := firstPR(a.prs)
 	for _, cand := range e.pending {
-		if len(cand) > 0 && cand[0] < first {
+		if len(cand.nums) > 0 && cand.nums[0] < first {
 			return false
 		}
 	}
@@ -484,7 +613,7 @@ func (e *Engine) freeSlotForEarlierPending() {
 	if len(e.pending) == 0 || len(e.active) < e.activeLimit() {
 		return
 	}
-	earliestPending := e.pending[0][0]
+	earliestPending := e.pending[0].nums[0]
 	idx := -1
 	latest := -1
 	for i, a := range e.active {
@@ -499,14 +628,14 @@ func (e *Engine) freeSlotForEarlierPending() {
 	a := e.active[idx]
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
 	e.active = append(e.active[:idx], e.active[idx+1:]...)
-	e.enqueue(numbersOf(a.prs))
+	e.enqueueCandidates(a.fresh, numbersOf(a.prs))
 	log.Printf("queue: re-queued speculative batch %v to test earlier candidate %v", numbersOf(a.prs), e.pending[0])
 }
 
 func (e *Engine) requeueStaleActive(a *activeBatch) {
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
 	e.removeActive(a)
-	e.enqueue(numbersOf(a.prs))
+	e.enqueueCandidates(a.fresh, numbersOf(a.prs))
 	log.Printf("queue: re-queued stale speculative batch %v after base advanced", numbersOf(a.prs))
 }
 
@@ -537,7 +666,7 @@ func firstPR(prs []forge.PullRequest) int {
 func (e *Engine) observeQueue() {
 	depth := 0
 	for _, cand := range e.pending {
-		depth += len(cand)
+		depth += len(cand.nums)
 	}
 	for _, a := range e.active {
 		depth += len(a.prs)
@@ -607,7 +736,7 @@ func (e *Engine) syncQueueComments() error {
 func (e *Engine) queueCommentStatuses() ([]queueCommentStatus, error) {
 	states := map[int]string{}
 	for _, cand := range e.pending {
-		for _, num := range cand {
+		for _, num := range cand.nums {
 			states[num] = "queued"
 		}
 	}

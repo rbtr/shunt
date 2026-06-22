@@ -412,6 +412,92 @@ func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
 	}
 }
 
+func TestParallelInitialBatchesStartTogether(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", MaxBatch: 2, InitialBatchFanout: 2}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start initial batches: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [3 4]]" {
+		t.Fatalf("staged = %s, want two initial batches", got)
+	}
+	if got := len(e.active); got != 2 {
+		t.Fatalf("active batches = %d, want 2", got)
+	}
+}
+
+func TestInitialBatchFanoutDefaultSeedsOneMaxBatch(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", MaxBatch: 2}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start initial batch: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2]]" {
+		t.Fatalf("staged = %s, want one max-sized batch by default", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want no speculative fresh candidate by default", got)
+	}
+}
+
+func TestParallelInitialBatchesRestageAfterEarlierLanding(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", MaxBatch: 2, InitialBatchFanout: 2}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start initial batches: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land earlier batch: %v", err)
+	}
+
+	if got := fmt.Sprint(m.merged); got != "[1 2]" {
+		t.Fatalf("merged after first landing = %s, want [1 2]", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[3 4]]" {
+		t.Fatalf("pending after base advance = %s, want stale later batch requeued", got)
+	}
+	if got := len(e.active); got != 0 {
+		t.Fatalf("active batches after restage scheduling = %d, want 0", got)
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("restage later batch: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [3 4] [3 4]]" {
+		t.Fatalf("staged = %s, want later batch restaged after base advance", got)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land restaged later batch: %v", err)
+	}
+	if got := fmt.Sprint(m.merged); got != "[1 2 3 4]" {
+		t.Fatalf("merged = %s, want ordered landing with no duplicates", got)
+	}
+}
+
+func TestInitialFanoutDoesNotRaiseBisectionFanout(t *testing.T) {
+	m := newMock(1, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", MaxBatch: 2, InitialBatchFanout: 2, BisectFanout: 1}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start initial batches: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("split failed first batch: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start first bisection candidate: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [3 4] [1]]" {
+		t.Fatalf("staged = %s, want only one bisection candidate after initial fanout", got)
+	}
+}
+
 // An all-green batch lands in a single CI run (the efficiency property).
 func TestAllGreenBatchLandsInOneRun(t *testing.T) {
 	m := newMock(-1, 1, 2, 3)

@@ -16,7 +16,7 @@ welcome.
   Actions run statuses.
 - **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
   queue tunables such as status context, merge style, batch sizing/linger,
-  bisection fan-out, and managed base branch on top of process defaults.
+  initial/bisection fan-out, and managed base branch on top of process defaults.
 - **Sticky PR queue-status comments.** Operators can opt in with
   `SHUNT_QUEUE_COMMENTS=true` to keep one updated status comment on each queued
   PR with base, position, state, and active batch details when known.
@@ -43,6 +43,10 @@ welcome.
   aggregate status for staging branches before falling back to task aggregation,
   so multi-job gates are not considered green while dependent jobs are still
   being materialized.
+- **Bounded parallel initial batches.** `SHUNT_INITIAL_BATCH_FANOUT` can stage
+  more than one fresh rollup candidate per `(repo, base)` concurrently. A value
+  of `1` preserves historical serial behavior; later candidates remain ordered
+  and are re-staged before landing if an earlier candidate advances the base.
 
 ## Current limitations
 
@@ -55,9 +59,6 @@ welcome.
   tolerate missed webhooks, so there is some steady API traffic even when webhook
   wakeups are configured.
 - **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
-- **Serial initial batches.** One rollup batch is seeded at a time per
-  `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
-  parallel batches from fresh queue entries.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
 - **Basic observability only.** Prometheus text metrics cover process-local queue
@@ -81,7 +82,7 @@ welcome.
   of the global defaults (the natural carrier is a small config file in the
   repo, e.g. `.shunt.yml`, discovered alongside the existing topic opt-in).~~
   Completed: `.shunt.yml` supports status context, merge style, max batch,
-  batch linger/target, bisection fan-out, and base-branch overrides.
+  batch linger/target, initial/bisection fan-out, and base-branch overrides.
 - ~~**Parallelizable bisection.** When a batch fails and splits, test independent
   subtrees concurrently instead of strictly depth-first, bounded by a configurable
   fan-out limit.~~ Completed: `SHUNT_BISECT_FANOUT` controls process-wide
@@ -95,6 +96,12 @@ welcome.
   Completed: `SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` provide a process-wide
   default; a linger duration of `0` preserves form-immediately behavior.
   Per-repository overrides are available via `.shunt.yml`.
+- ~~**Parallel initial rollup batches.** Let fresh queue entries form more than
+  one speculative rollup batch per `(repo, base)`, while preserving ordered
+  landing and base revalidation.~~ Completed: `SHUNT_INITIAL_BATCH_FANOUT`
+  controls fresh-batch concurrency; later candidates are re-staged if an earlier
+  candidate advances the base. `.shunt.yml` can override the process default per
+  repository.
 
 ### v0.5 — Correctness & safety
 - ~~Re-validate a PR's head SHA immediately before the gated merge (close the
