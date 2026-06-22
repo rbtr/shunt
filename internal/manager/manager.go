@@ -32,6 +32,7 @@ type Config struct {
 	BotUser       string
 	BotEmail      string
 	Metrics       *metrics.Collector
+	Checkpoint    engine.CheckpointStore
 }
 
 type Manager struct {
@@ -153,6 +154,7 @@ func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) en
 		QueueComments: m.cfg.QueueComments,
 		BotUser:       m.cfg.BotUser,
 		Metrics:       m.cfg.Metrics,
+		Checkpoint:    m.cfg.Checkpoint,
 	}
 }
 

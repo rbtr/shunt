@@ -186,3 +186,28 @@ func TestEnvBool(t *testing.T) {
 		t.Fatal("envBool should reject invalid values")
 	}
 }
+
+func TestOpenCheckpointStoreDisabledByDefault(t *testing.T) {
+	t.Setenv("SHUNT_STATE_PATH", "")
+	store, err := openCheckpointStore()
+	if err != nil {
+		t.Fatalf("open checkpoint store: %v", err)
+	}
+	if store != nil {
+		t.Fatal("store = non-nil, want nil when SHUNT_STATE_PATH is unset")
+	}
+}
+
+func TestOpenCheckpointStoreUsesStatePath(t *testing.T) {
+	t.Setenv("SHUNT_STATE_PATH", t.TempDir()+"/shunt.db")
+	store, err := openCheckpointStore()
+	if err != nil {
+		t.Fatalf("open checkpoint store: %v", err)
+	}
+	if store == nil {
+		t.Fatal("store = nil, want bbolt store")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+}

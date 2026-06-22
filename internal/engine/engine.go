@@ -34,6 +34,7 @@ type Config struct {
 	QueueComments bool
 	BotUser       string
 	Metrics       *metrics.Collector
+	Checkpoint    CheckpointStore
 }
 
 type activeBatch struct {
@@ -80,6 +81,8 @@ type Engine struct {
 
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
+	checkpointLoaded      bool
+	checkpointExists      bool
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
@@ -88,6 +91,11 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile() error {
+	if err := e.loadCheckpoint(); err != nil {
+		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		e.observeQueue()
+		return err
+	}
 	resolved, err := e.checkActive()
 	if err == nil && !resolved {
 		e.freeSlotForEarlierPending()
@@ -97,6 +105,13 @@ func (e *Engine) Reconcile() error {
 			if err != nil || !started {
 				break
 			}
+		}
+	}
+	if checkpointErr := e.saveCheckpoint(); checkpointErr != nil {
+		if err != nil {
+			err = fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
+		} else {
+			err = checkpointErr
 		}
 	}
 	if err != nil {

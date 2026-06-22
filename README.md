@@ -107,6 +107,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). |
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
+| `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, and `/webhook` endpoints |
@@ -126,6 +127,14 @@ multi-repo mode, shunt reads it from the discovered default branch before
 choosing the managed base; in single-repo mode, it reads from `SHUNT_BASE`.
 Missing files keep the global defaults. Invalid files are logged/rejected without
 applying partial settings.
+
+Set `SHUNT_STATE_PATH` to persist queue checkpoints in a local bbolt database.
+This is the default built-in durable store. It keeps shunt's static, CGO-free
+binary while preserving pending candidates, active batch metadata, linger state,
+and bisection counters across restarts. Active batches are re-staged after
+restore rather than landed from pre-restart CI results. In Kubernetes, mount the
+path on a persistent volume; an `emptyDir` path only survives container restarts
+within the same pod lifetime.
 
 ```yaml
 base: trunk
@@ -218,8 +227,8 @@ If `/webhook` is exposed beyond a trusted private network, set
 
 ## Status & roadmap
 
-v0.3 is functional but young. Known limitations (in-memory state, polling as a
-webhook backstop, single replica) and the plan to address them are tracked in
+v0.3 is functional but young. Known limitations (opt-in durable state, polling
+as a webhook backstop, single replica) and the plan to address them are tracked in
 [`ROADMAP.md`](ROADMAP.md).
 
 ## License
