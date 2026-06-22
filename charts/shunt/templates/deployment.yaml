@@ -55,6 +55,10 @@ spec:
               value: {{ .Values.config.mergeStyle | quote }}
             - name: SHUNT_MAX_BATCH
               value: {{ .Values.config.maxBatch | quote }}
+            - name: SHUNT_BATCH_LINGER
+              value: {{ .Values.config.batchLinger | quote }}
+            - name: SHUNT_BATCH_TARGET
+              value: {{ .Values.config.batchTarget | quote }}
             - name: SHUNT_POLL_INTERVAL
               value: {{ .Values.config.pollInterval | quote }}
             {{- if .Values.config.publicUrl }}

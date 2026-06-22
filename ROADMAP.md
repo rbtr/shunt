@@ -31,11 +31,8 @@ welcome.
   so time-to-merge grows with the number of broken PRs. No speculative parallel
   batches, so throughput is bounded by gate-CI latency.
 - **Global-only configuration.** Every knob is a process-wide environment
-  variable; there are no per-repository overrides yet.
-- **No batch-accumulation window.** A batch is formed the moment the engine is
-  idle and any PR is ready, so under low or bursty traffic batching is incidental
-  (it only happens because earlier batches were still testing) rather than an
-  intentional, tunable wait.
+  variable; there are no per-repository overrides yet. Batch accumulation can be
+  tuned globally, but not per repo.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
 - **Limited observability.** Structured logs only — no metrics, no queue UI
@@ -63,15 +60,17 @@ welcome.
   N>1 broken PRs costs closer to the depth of the tree than the sum of its nodes.
   Bounded by a configurable fan-out limit (global default + per-repo override),
   since each parallel branch consumes a runner and a staging branch. Must
-  preserve the two invariants in `docs/design.md`: the ascending merge-order
-  guarantee, and "every batch is validated against the real base it lands on"
+  preserve the invariants in `docs/design.md`: ascending merge order, and
+  "every batch is validated against the real base it lands on"
   (parallel subtrees are staged speculatively on the pre-merge base, so a winning
   subtree is re-validated or ordered before it lands rather than fast-tracked).
-- **Configurable batch-linger window.** Before forming the first batch, optionally
-  wait up to a duration *or* until a target number of PRs are ready
-  (whichever comes first), so bursty and low-traffic repos batch intentionally.
-  Global default with per-repo override; `0` preserves today's
-  form-immediately behavior.
+- ~~**Configurable batch-linger window.** Before forming the first batch,
+  optionally wait up to a duration *or* until a target number of PRs are ready
+  (whichever comes first), so bursty and low-traffic repos batch intentionally.~~
+  Completed: `SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` provide a process-wide
+  default; a linger duration of `0` preserves form-immediately behavior.
+  Per-repository overrides remain covered by the pending per-repository
+  configuration item above.
 
 ### v0.4 — Correctness & safety
 - ~~Re-validate a PR's head SHA immediately before the gated merge (close the

@@ -42,9 +42,17 @@ func main() {
 		log.Fatalf("unsupported SHUNT_MERGE_STYLE %q: v0.1 supports only %q", mergeStyle, "merge")
 	}
 	maxBatch, _ := strconv.Atoi(env("SHUNT_MAX_BATCH", "0"))
+	batchTarget, err := strconv.Atoi(env("SHUNT_BATCH_TARGET", "0"))
+	if err != nil || batchTarget < 0 {
+		log.Fatalf("bad SHUNT_BATCH_TARGET: must be a non-negative integer")
+	}
 	interval, err := time.ParseDuration(env("SHUNT_POLL_INTERVAL", "10s"))
 	if err != nil {
 		log.Fatalf("bad SHUNT_POLL_INTERVAL: %v", err)
+	}
+	batchLinger, err := time.ParseDuration(env("SHUNT_BATCH_LINGER", "0"))
+	if err != nil || batchLinger < 0 {
+		log.Fatalf("bad SHUNT_BATCH_LINGER: must be a non-negative duration")
 	}
 
 	go serveHealth(env("SHUNT_LISTEN", ":8080"))
@@ -53,7 +61,7 @@ func main() {
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
-			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch,
+			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 		})
 		log.Printf("shunt: multi-repo mode, topic=%q every %s", topic, interval)
@@ -76,7 +84,7 @@ func main() {
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
-		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch,
+		StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
 

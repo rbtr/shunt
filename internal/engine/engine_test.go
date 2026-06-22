@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
@@ -36,13 +37,17 @@ func newMock(badPR int, prNums ...int) *mock {
 		comments: map[int][]string{}, mergeHeads: map[int][]string{},
 	}
 	for _, n := range prNums {
-		pr := &forge.PullRequest{Number: n, State: "open"}
-		pr.Head.Sha = fmt.Sprintf("head-%d", n)
-		pr.Base.Ref = "main"
-		m.prs[n] = pr
-		m.automerge[n] = true
+		m.addPR(n)
 	}
 	return m
+}
+
+func (m *mock) addPR(n int) {
+	pr := &forge.PullRequest{Number: n, State: "open"}
+	pr.Head.Sha = fmt.Sprintf("head-%d", n)
+	pr.Base.Ref = "main"
+	m.prs[n] = pr
+	m.automerge[n] = true
 }
 
 func (m *mock) ListOpenPRs(_, _, _ string) ([]forge.PullRequest, error) {
@@ -117,6 +122,130 @@ func (m *mock) BuildStaging(_, _ string, refs []gitops.MergedRef) (string, int, 
 func drive(e *Engine, n int) {
 	for i := 0; i < n; i++ {
 		_ = e.Reconcile()
+	}
+}
+
+func TestBatchLingerDisabledByDefaultStartsImmediately(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if e.active == nil {
+		t.Fatal("default config should start a batch immediately")
+	}
+	if got := len(m.batchOf); got != 1 {
+		t.Errorf("staging runs = %d, want 1", got)
+	}
+}
+
+func TestBatchLingerWaitsWhileUnderTargetAndWindow(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 3}, m, m)
+	now := time.Unix(100, 0)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start linger: %v", err)
+	}
+	now = now.Add(9 * time.Second)
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("continue linger: %v", err)
+	}
+
+	if e.active != nil {
+		t.Fatal("batch should not start before target or linger window")
+	}
+	if got := len(m.batchOf); got != 0 {
+		t.Errorf("staging runs = %d, want 0", got)
+	}
+}
+
+func TestBatchLingerStartsWhenTargetReached(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 3}, m, m)
+	now := time.Unix(100, 0)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start linger: %v", err)
+	}
+	m.addPR(3)
+	now = now.Add(time.Second)
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("target reached: %v", err)
+	}
+
+	if e.active == nil {
+		t.Fatal("batch should start once target is reached")
+	}
+	if got := fmt.Sprint(m.batchOf[e.active.stagingSHA]); got != "[1 2 3]" {
+		t.Errorf("staged batch = %s, want [1 2 3]", got)
+	}
+	if !e.lingerSince.IsZero() {
+		t.Fatal("linger state should reset after batch starts")
+	}
+}
+
+func TestBatchLingerStartsWhenWindowExpires(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 3}, m, m)
+	now := time.Unix(100, 0)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start linger: %v", err)
+	}
+	now = now.Add(10 * time.Second)
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("window expired: %v", err)
+	}
+
+	if e.active == nil {
+		t.Fatal("batch should start once linger window expires")
+	}
+	if got := fmt.Sprint(m.batchOf[e.active.stagingSHA]); got != "[1 2]" {
+		t.Errorf("staged batch = %s, want [1 2]", got)
+	}
+}
+
+func TestBatchLingerResetsAfterBatchStarts(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 2}, m, m)
+	now := time.Unix(100, 0)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start first linger: %v", err)
+	}
+	m.addPR(2)
+	now = now.Add(time.Second)
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start first batch: %v", err)
+	}
+	if !e.lingerSince.IsZero() {
+		t.Fatal("linger state should reset when first batch starts")
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land first batch: %v", err)
+	}
+
+	m.addPR(3)
+	now = now.Add(10 * time.Second)
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start second linger: %v", err)
+	}
+
+	if e.active != nil {
+		t.Fatal("new ready PR should get a fresh linger window after prior batch")
+	}
+	if got := len(m.batchOf); got != 1 {
+		t.Errorf("staging runs = %d, want still 1", got)
+	}
+	if e.lingerSince.IsZero() || !e.lingerSince.Equal(now) {
+		t.Fatalf("second linger started at %v, want %v", e.lingerSince, now)
 	}
 }
 

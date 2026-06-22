@@ -98,6 +98,8 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_STATUS_CONTEXT` | `merge-queue` | Required commit-status context |
 | `SHUNT_MERGE_STYLE` | `merge` | Merge strategy. v0.1 supports only `merge`. |
 | `SHUNT_MAX_BATCH` | `0` | Cap the initial rollup size (0 = unlimited) |
+| `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
+| `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). Process-wide until per-repo config lands. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` endpoint |
