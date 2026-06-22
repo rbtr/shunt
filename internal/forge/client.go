@@ -49,6 +49,16 @@ type Branch struct {
 	Name string `json:"name"`
 }
 
+type IssueComment struct {
+	ID   int64  `json:"id"`
+	Body string `json:"body"`
+	User struct {
+		UserName  string `json:"username"`
+		Login     string `json:"login"`
+		LoginName string `json:"login_name"`
+	} `json:"user"`
+}
+
 type timelineComment struct {
 	Type string `json:"type"`
 }
@@ -314,6 +324,26 @@ func (c *Client) PruneStagingBranches(owner, repo, base string) ([]string, error
 	return deleted, nil
 }
 
+func (c *Client) UpsertComment(owner, repo string, index int, marker, botUser, body string) error {
+	var comments []IssueComment
+	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?limit=50", repoPath(owner, repo), index), nil, &comments); err != nil {
+		return err
+	}
+	for _, comment := range comments {
+		if !strings.Contains(comment.Body, marker) {
+			continue
+		}
+		if botUser != "" && !commentByUser(comment, botUser) {
+			continue
+		}
+		if comment.Body == body {
+			return nil
+		}
+		return c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), comment.ID), map[string]string{"body": body}, nil)
+	}
+	return c.Comment(owner, repo, index, body)
+}
+
 func (c *Client) DeleteBranch(owner, repo, branch string) error {
 	err := c.do(http.MethodDelete, fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil, nil)
 	if err != nil && strings.Contains(err.Error(), "http 404") {
@@ -341,4 +371,8 @@ func isShuntStagingBranch(base, branch string) bool {
 
 func repoPath(owner, repo string) string {
 	return url.PathEscape(owner) + "/" + url.PathEscape(repo)
+}
+
+func commentByUser(comment IssueComment, botUser string) bool {
+	return comment.User.UserName == botUser || comment.User.Login == botUser || comment.User.LoginName == botUser
 }

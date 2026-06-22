@@ -147,6 +147,94 @@ func TestReadFileReturnsErrNotFound(t *testing.T) {
 	}
 }
 
+func TestUpsertCommentCreatesWhenMarkerIsMissing(t *testing.T) {
+	var posted map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues/7/comments":
+			if got := r.URL.Query().Get("limit"); got != "50" {
+				t.Errorf("limit = %q, want 50", got)
+			}
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/o/r/issues/7/comments":
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker -->\nbody"); err != nil {
+		t.Fatalf("UpsertComment: %v", err)
+	}
+	if got := posted["body"]; got != "<!-- marker -->\nbody" {
+		t.Fatalf("posted body = %q", got)
+	}
+}
+
+func TestUpsertCommentEditsExistingBotComment(t *testing.T) {
+	var patched map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues/7/comments":
+			_, _ = w.Write([]byte(`[{"id":42,"body":"<!-- marker --> old","user":{"username":"mq-bot"}}]`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/repos/o/r/issues/comments/42":
+			if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
+		t.Fatalf("UpsertComment: %v", err)
+	}
+	if got := patched["body"]; got != "<!-- marker --> new" {
+		t.Fatalf("patched body = %q", got)
+	}
+}
+
+func TestUpsertCommentDoesNotEditAnotherUsersMarker(t *testing.T) {
+	var sawPatch bool
+	var posted map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues/7/comments":
+			_, _ = w.Write([]byte(`[{"id":42,"body":"<!-- marker --> old","user":{"username":"someone-else"}}]`))
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/issues/comments/42"):
+			sawPatch = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/o/r/issues/7/comments":
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
+		t.Fatalf("UpsertComment: %v", err)
+	}
+	if sawPatch {
+		t.Fatal("UpsertComment patched another user's marker comment")
+	}
+	if got := posted["body"]; got != "<!-- marker --> new" {
+		t.Fatalf("posted body = %q", got)
+	}
+}
+
 func TestRunStatusAggregatesNewestMatchingTaskRun(t *testing.T) {
 	payload := tasksResponse{WorkflowRuns: []workflowTask{
 		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "running"},

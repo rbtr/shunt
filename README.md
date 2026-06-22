@@ -105,6 +105,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). |
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
+| `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` and `/metrics` endpoints |
@@ -141,6 +142,13 @@ for each managed `(owner, repo, base)` queue:
 
 Metrics are process-local and intentionally minimal in v0.1: they do not persist
 across restarts and do not yet include time-in-queue histograms or a queue UI.
+
+Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
+keeps one sticky comment per queued PR, identified by a stable hidden marker, and
+edits it only when the displayed queue state changes. The comment shows the repo,
+base branch, queue position, current state, and active batch when known. This is
+off by default because it adds issue-comment API reads/writes on repositories that
+opt in.
 
 ## Deploy
 

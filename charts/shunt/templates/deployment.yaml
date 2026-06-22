@@ -61,6 +61,8 @@ spec:
               value: {{ .Values.config.batchTarget | quote }}
             - name: SHUNT_BISECT_FANOUT
               value: {{ .Values.config.bisectFanout | quote }}
+            - name: SHUNT_QUEUE_COMMENTS
+              value: {{ .Values.config.queueComments | quote }}
             - name: SHUNT_POLL_INTERVAL
               value: {{ .Values.config.pollInterval | quote }}
             {{- if .Values.config.publicUrl }}

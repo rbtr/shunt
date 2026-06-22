@@ -28,6 +28,21 @@ func env(k, def string) string {
 	return def
 }
 
+func envBool(k string, def bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def, nil
+	}
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true, nil
+	case "0", "f", "false", "n", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("bad %s: must be true or false", k)
+	}
+}
+
 func main() {
 	instance := os.Getenv("SHUNT_INSTANCE")
 	if instance == "" {
@@ -54,6 +69,10 @@ func main() {
 	if err != nil || bisectFanout < 1 {
 		log.Fatalf("bad SHUNT_BISECT_FANOUT: must be a positive integer")
 	}
+	queueComments, err := envBool("SHUNT_QUEUE_COMMENTS", false)
+	if err != nil {
+		log.Fatal(err)
+	}
 	interval, err := time.ParseDuration(env("SHUNT_POLL_INTERVAL", "10s"))
 	if err != nil {
 		log.Fatalf("bad SHUNT_POLL_INTERVAL: %v", err)
@@ -70,7 +89,7 @@ func main() {
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
-			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
+			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout, QueueComments: queueComments,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector,
 		})
@@ -110,7 +129,7 @@ func main() {
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
-		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout,
+		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))

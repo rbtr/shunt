@@ -23,6 +23,7 @@ config:
   batchLinger: "0"
   batchTarget: "0"
   bisectFanout: "1"
+  queueComments: "false"
   pollInterval: "10s"
   listen: ":8080"
 
