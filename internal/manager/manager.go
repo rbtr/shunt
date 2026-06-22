@@ -14,18 +14,19 @@ import (
 )
 
 type Config struct {
-	Topic       string
-	StatusCtx   string
-	MergeStyle  string
-	MaxBatch    int
-	BatchLinger time.Duration
-	BatchTarget int
-	InstanceURL string
-	PublicURL   string
-	Token       string
-	BotUser     string
-	BotEmail    string
-	Metrics     *metrics.Collector
+	Topic        string
+	StatusCtx    string
+	MergeStyle   string
+	MaxBatch     int
+	BatchLinger  time.Duration
+	BatchTarget  int
+	BisectFanout int
+	InstanceURL  string
+	PublicURL    string
+	Token        string
+	BotUser      string
+	BotEmail     string
+	Metrics      *metrics.Collector
 }
 
 type Manager struct {
@@ -77,6 +78,7 @@ func (m *Manager) Refresh() error {
 			MaxBatch:      m.cfg.MaxBatch,
 			BatchLinger:   m.cfg.BatchLinger,
 			BatchTarget:   m.cfg.BatchTarget,
+			BisectFanout:  m.cfg.BisectFanout,
 			Metrics:       m.cfg.Metrics,
 		}, m.fc, st)
 		log.Printf("manager: managing %s", k)

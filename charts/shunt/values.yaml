@@ -22,6 +22,7 @@ config:
   maxBatch: "0"
   batchLinger: "0"
   batchTarget: "0"
+  bisectFanout: "1"
   pollInterval: "10s"
   listen: ":8080"
 

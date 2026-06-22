@@ -29,6 +29,7 @@ type Config struct {
 	MaxBatch      int    // cap the initial rollup size (0 = unlimited)
 	BatchLinger   time.Duration
 	BatchTarget   int
+	BisectFanout  int // max concurrent bisection staging runs (0 = 1)
 	Metrics       *metrics.Collector
 }
 
@@ -36,7 +37,8 @@ type activeBatch struct {
 	prs           []forge.PullRequest
 	stagingBranch string
 	stagingSHA    string
-	gateOutcome   string
+	baseGen       int
+	outcome       string
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -63,10 +65,12 @@ type Engine struct {
 	fc      ForgeAPI
 	st      Stager
 	pending [][]int // work queue of candidate batches (PR numbers, in order)
-	active  *activeBatch
+	active  []*activeBatch
 	now     func() time.Time
 
 	lingerSince time.Time
+	baseGen     int
+	stagingSeq  int
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
@@ -75,11 +79,16 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile() error {
-	var err error
-	if e.active != nil {
-		err = e.checkActive()
-	} else {
-		err = e.startNext()
+	resolved, err := e.checkActive()
+	if err == nil && !resolved {
+		e.freeSlotForEarlierPending()
+		for len(e.active) < e.activeLimit() {
+			var started bool
+			started, err = e.startNext()
+			if err != nil || !started {
+				break
+			}
+		}
 	}
 	if err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
@@ -135,17 +144,20 @@ func (e *Engine) resolve(nums []int) ([]forge.PullRequest, error) {
 	return out, nil
 }
 
-func (e *Engine) startNext() error {
+func (e *Engine) startNext() (bool, error) {
 	if len(e.pending) == 0 {
+		if len(e.active) > 0 {
+			return false, nil
+		}
 		ready, err := e.readyNumbers()
 		if err != nil || len(ready) == 0 {
 			e.lingerSince = time.Time{}
-			return err
+			return false, err
 		}
 		if e.linger(ready) {
-			return nil
+			return false, nil
 		}
-		e.pending = [][]int{ready}
+		e.enqueue(ready)
 		e.lingerSince = time.Time{}
 	}
 	cand := e.pending[0]
@@ -153,28 +165,30 @@ func (e *Engine) startNext() error {
 
 	prs, err := e.resolve(cand)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(prs) == 0 {
-		return nil
+		return false, nil
 	}
 
 	refs := make([]gitops.MergedRef, len(prs))
 	for i, p := range prs {
 		refs[i] = gitops.MergedRef{PR: p.Number, Ref: fmt.Sprintf("refs/pull/%d/head", p.Number)}
 	}
-	sha, conflictPR, err := e.st.BuildStaging(e.cfg.Base, e.cfg.StagingBranch, refs)
+	stagingBranch := e.stagingBranch()
+	sha, conflictPR, err := e.st.BuildStaging(e.cfg.Base, stagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
 			e.cfg.Metrics.IncStagingConflict(e.metricLabels())
-			return e.handleStagingConflict(numbersOf(prs), conflictPR)
+			return false, e.handleStagingConflict(numbersOf(prs), conflictPR)
 		}
-		return err
+		return false, err
 	}
-	e.active = &activeBatch{prs: prs, stagingBranch: e.cfg.StagingBranch, stagingSHA: sha}
+	a := &activeBatch{prs: prs, stagingBranch: stagingBranch, stagingSHA: sha, baseGen: e.baseGen}
+	e.active = append(e.active, a)
 	e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
-	log.Printf("queue: testing batch %v on staging sha=%s", numbersOf(prs), short(sha))
-	return nil
+	log.Printf("queue: testing batch %v on %s sha=%s", numbersOf(prs), a.stagingBranch, short(sha))
+	return true, nil
 }
 
 func (e *Engine) linger(ready []int) bool {
@@ -193,33 +207,57 @@ func (e *Engine) linger(ready []int) bool {
 	return now.Sub(e.lingerSince) < e.cfg.BatchLinger
 }
 
-func (e *Engine) checkActive() error {
-	a := e.active
-	status, err := e.fc.RunStatus(e.cfg.Owner, e.cfg.Repo, a.stagingSHA, a.stagingBranch)
-	if err != nil {
-		return err
+func (e *Engine) checkActive() (bool, error) {
+	for _, a := range e.active {
+		if a.outcome == "" {
+			status, err := e.fc.RunStatus(e.cfg.Owner, e.cfg.Repo, a.stagingSHA, a.stagingBranch)
+			if err != nil {
+				return false, err
+			}
+			switch status {
+			case "success", "failure", "cancelled", "error":
+				a.outcome = status
+				e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
+			default: // "", running, waiting, blocked -> keep waiting
+				continue
+			}
+		}
+		if !e.readyToResolve(a) {
+			continue
+		}
+		if a.baseGen != e.baseGen {
+			e.requeueStaleActive(a)
+			return true, nil
+		}
+		switch a.outcome {
+		case "success":
+			baseChanged, err := e.land(a)
+			if err != nil {
+				return false, err
+			}
+			if baseChanged {
+				e.baseGen++
+				e.requeueStaleActives()
+			}
+		case "failure", "cancelled", "error":
+			if err := e.bisectOrBounce(a, a.outcome); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
 	}
-	switch status {
-	case "success":
-		e.recordGateOutcome(status)
-		return e.land()
-	case "failure", "cancelled", "error":
-		e.recordGateOutcome(status)
-		return e.bisectOrBounce(status)
-	default: // "", running, waiting, blocked -> keep waiting
-		return nil
-	}
+	return false, nil
 }
 
 // land merges every PR in the passing batch via Forgejo (status-gated), in
 // order. Sequential merges reproduce the tested staging tree.
-func (e *Engine) land() error {
-	a := e.active
+func (e *Engine) land(a *activeBatch) (bool, error) {
 	requeueFrom := -1
+	merged := 0
 	for i, pr := range a.prs {
 		ok, reason, current, err := e.readyToLand(pr)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !ok {
 			e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
@@ -227,7 +265,7 @@ func (e *Engine) land() error {
 			break
 		}
 		if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "success", "merge queue: batch passed", e.commitURL(a.stagingSHA)); err != nil {
-			return err
+			return false, err
 		}
 		// Forgejo can return a transient 405 ("Please try again later") while it
 		// is still finishing the previous merge; retry briefly before giving up
@@ -240,11 +278,11 @@ func (e *Engine) land() error {
 			}
 			ok, reason, current, err := e.readyToLand(pr)
 			if err != nil {
-				return fmt.Errorf("merge #%d failed: %v; also failed to revalidate after merge error: %w", pr.Number, mErr, err)
+				return false, fmt.Errorf("merge #%d failed: %v; also failed to revalidate after merge error: %w", pr.Number, mErr, err)
 			}
 			if !ok {
 				if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", e.commitURL(a.stagingSHA)); err != nil {
-					return fmt.Errorf("merge #%d failed after PR changed: %v; also failed to reset status: %w", pr.Number, mErr, err)
+					return false, fmt.Errorf("merge #%d failed after PR changed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 				}
 				e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
 				drifted = true
@@ -258,7 +296,7 @@ func (e *Engine) land() error {
 		}
 		if mErr != nil {
 			if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: merge did not complete; re-queued", e.commitURL(a.stagingSHA)); err != nil {
-				return fmt.Errorf("merge #%d failed: %v; also failed to reset status: %w", pr.Number, mErr, err)
+				return false, fmt.Errorf("merge #%d failed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 			}
 			log.Printf("queue: merge #%d failed: %v (remaining PRs re-queued next cycle)", pr.Number, mErr)
 			requeueFrom = i
@@ -267,19 +305,20 @@ func (e *Engine) land() error {
 		e.cfg.Metrics.IncPRMerge(e.metricLabels())
 		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, pr.Number, "Landed via merge queue.")
 		log.Printf("queue: merged #%d", pr.Number)
+		merged++
 	}
 	if requeueFrom >= 0 {
 		e.requeueActiveRemainder(a.prs[requeueFrom:])
 	}
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
-	e.active = nil
-	return nil
+	e.removeActive(a)
+	return merged > 0, nil
 }
 
 func (e *Engine) requeueActiveRemainder(prs []forge.PullRequest) {
 	nums := numbersOf(prs)
 	if len(nums) > 0 {
-		e.pending = append([][]int{nums}, e.pending...)
+		e.enqueue(nums)
 	}
 }
 
@@ -292,7 +331,7 @@ func (e *Engine) handleStagingConflict(nums []int, conflictPR int) error {
 		e.bounce(conflictPR, "merge conflict while staging the PR")
 		if len(nums) > 1 {
 			rest := append([]int(nil), nums[1:]...)
-			e.pending = append([][]int{rest}, e.pending...)
+			e.enqueue(rest)
 			log.Printf("queue: batch %v conflicts on first PR #%d -> re-queued %v", nums, conflictPR, rest)
 		}
 		return nil
@@ -300,7 +339,7 @@ func (e *Engine) handleStagingConflict(nums []int, conflictPR int) error {
 
 	prefix := append([]int(nil), nums[:idx]...)
 	suffix := append([]int(nil), nums[idx:]...)
-	e.pending = append([][]int{prefix, suffix}, e.pending...)
+	e.enqueue(prefix, suffix)
 	log.Printf("queue: batch %v conflicts on #%d -> testing prefix %v before suffix %v", nums, conflictPR, prefix, suffix)
 	return nil
 }
@@ -343,11 +382,10 @@ func (e *Engine) skipLand(num int, pr forge.PullRequest, reason string, hasRemai
 // bisectOrBounce: a size-1 failing batch bounces the culprit; a larger batch is
 // split in half, with the first half tested next (the good half lands, the
 // recursion isolates the bad PR(s)).
-func (e *Engine) bisectOrBounce(status string) error {
-	a := e.active
+func (e *Engine) bisectOrBounce(a *activeBatch, status string) error {
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
 	nums := numbersOf(a.prs)
-	e.active = nil
+	e.removeActive(a)
 
 	if len(nums) == 1 {
 		e.bounce(nums[0], fmt.Sprintf("merge-queue gate **%s**; see the [staging run](%s)", status, e.commitURL(a.stagingSHA)))
@@ -356,7 +394,7 @@ func (e *Engine) bisectOrBounce(status string) error {
 	mid := len(nums) / 2
 	first := append([]int(nil), nums[:mid]...)
 	second := append([]int(nil), nums[mid:]...)
-	e.pending = append([][]int{first, second}, e.pending...)
+	e.enqueue(first, second)
 	log.Printf("queue: batch %v failed (%s) -> bisecting into %v then %v", nums, status, first, second)
 	return nil
 }
@@ -368,11 +406,100 @@ func (e *Engine) bounce(num int, reason string) {
 	log.Printf("queue: bounced #%d: %s", num, reason)
 }
 
-func (e *Engine) recordGateOutcome(status string) {
-	if e.active != nil && e.active.gateOutcome == "" {
-		e.active.gateOutcome = status
-		e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
+func (e *Engine) activeLimit() int {
+	if e.cfg.BisectFanout > 0 {
+		return e.cfg.BisectFanout
 	}
+	return 1
+}
+
+func (e *Engine) stagingBranch() string {
+	if e.activeLimit() <= 1 {
+		return e.cfg.StagingBranch
+	}
+	e.stagingSeq++
+	return fmt.Sprintf("%s-%d", e.cfg.StagingBranch, e.stagingSeq)
+}
+
+func (e *Engine) enqueue(cands ...[]int) {
+	for _, cand := range cands {
+		if len(cand) == 0 {
+			continue
+		}
+		e.pending = append(e.pending, append([]int(nil), cand...))
+	}
+	sort.SliceStable(e.pending, func(i, j int) bool {
+		return e.pending[i][0] < e.pending[j][0]
+	})
+}
+
+func (e *Engine) readyToResolve(a *activeBatch) bool {
+	first := firstPR(a.prs)
+	for _, cand := range e.pending {
+		if len(cand) > 0 && cand[0] < first {
+			return false
+		}
+	}
+	for _, other := range e.active {
+		if other != a && firstPR(other.prs) < first {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) freeSlotForEarlierPending() {
+	if len(e.pending) == 0 || len(e.active) < e.activeLimit() {
+		return
+	}
+	earliestPending := e.pending[0][0]
+	idx := -1
+	latest := -1
+	for i, a := range e.active {
+		if first := firstPR(a.prs); first > earliestPending && first > latest {
+			idx = i
+			latest = first
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	a := e.active[idx]
+	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
+	e.active = append(e.active[:idx], e.active[idx+1:]...)
+	e.enqueue(numbersOf(a.prs))
+	log.Printf("queue: re-queued speculative batch %v to test earlier candidate %v", numbersOf(a.prs), e.pending[0])
+}
+
+func (e *Engine) requeueStaleActive(a *activeBatch) {
+	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
+	e.removeActive(a)
+	e.enqueue(numbersOf(a.prs))
+	log.Printf("queue: re-queued stale speculative batch %v after base advanced", numbersOf(a.prs))
+}
+
+func (e *Engine) requeueStaleActives() {
+	for _, a := range append([]*activeBatch(nil), e.active...) {
+		if a.baseGen != e.baseGen {
+			e.requeueStaleActive(a)
+		}
+	}
+}
+
+func (e *Engine) removeActive(a *activeBatch) {
+	for i, candidate := range e.active {
+		if candidate == a {
+			e.active = append(e.active[:i], e.active[i+1:]...)
+			return
+		}
+	}
+}
+
+func firstPR(prs []forge.PullRequest) int {
+	if len(prs) == 0 {
+		return 0
+	}
+	return prs[0].Number
 }
 
 func (e *Engine) observeQueue() {
@@ -380,11 +507,10 @@ func (e *Engine) observeQueue() {
 	for _, cand := range e.pending {
 		depth += len(cand)
 	}
-	active := e.active != nil
-	if active {
-		depth += len(e.active.prs)
+	for _, a := range e.active {
+		depth += len(a.prs)
 	}
-	e.cfg.Metrics.ObserveQueue(e.metricLabels(), depth, active)
+	e.cfg.Metrics.ObserveQueue(e.metricLabels(), depth, len(e.active) > 0)
 }
 
 func (e *Engine) metricLabels() metrics.Labels {

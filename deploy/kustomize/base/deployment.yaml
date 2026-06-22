@@ -29,6 +29,8 @@ spec:
               value: "https://forge.example.com"
             - name: SHUNT_TOPIC
               value: "merge-queue"
+            - name: SHUNT_BISECT_FANOUT
+              value: "1"
             - name: HOME
               value: "/tmp"
             - name: SHUNT_TOKEN
