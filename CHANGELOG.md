@@ -18,6 +18,8 @@ Initial release.
   then merges via the API); bisection isolates the bad PR(s) on gate failure.
 - Multi-repo discovery by topic, with automatic branch-protection setup.
 - Single static binary + container image; `/healthz` endpoint.
+- Release packaging for downloadable binaries/checksums, multi-arch GHCR
+  images, an OCI Helm chart, and Helm/Kustomize install manifests.
 - Mock-driven unit tests for the bisection state machine.
 
 ### Security
