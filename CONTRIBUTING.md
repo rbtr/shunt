@@ -48,4 +48,6 @@ for non-trivial code changes.
 ## Testing against a real instance
 
 `docs/design.md` describes the validated Forgejo mechanics and a safe way to
-exercise shunt end to end against a throwaway repo on a test instance.
+exercise shunt end to end against a throwaway repo on a test instance. The
+env-gated forge client harness is documented in
+[`docs/forge-integration-tests.md`](docs/forge-integration-tests.md).

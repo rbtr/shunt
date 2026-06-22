@@ -43,6 +43,10 @@ welcome.
   aggregate status for staging branches before falling back to task aggregation,
   so multi-job gates are not considered green while dependent jobs are still
   being materialized.
+- **Env-gated forge integration harness.** Live Forgejo/Gitea client checks can
+  now exercise PR listing, timeline auto-merge detection, status posting,
+  workflow-run lookup, and optional branch-protection updates without requiring
+  credentials in default CI.
 
 ## Current limitations
 
@@ -58,8 +62,9 @@ welcome.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
   parallel batches from fresh queue entries.
-- **No automated forge-integration tests.** The bisection state machine is unit
-  tested with a mock; live API coverage is still manual.
+- **No automated end-to-end burn-in.** The forge client now has an env-gated live
+  integration harness, but disposable-repo and busy-repo queue burn-in are still
+  manual.
 - **Basic observability only.** Prometheus text metrics cover process-local queue
   depth and key counters, and operators can enable sticky PR queue-status
   comments. There is still no persisted metrics history, no time-in-queue
