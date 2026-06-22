@@ -179,7 +179,15 @@ func (e *Engine) checkActive() error {
 // order. Sequential merges reproduce the tested staging tree.
 func (e *Engine) land() error {
 	a := e.active
-	for _, pr := range a.prs {
+	for i, pr := range a.prs {
+		ok, reason, current, err := e.readyToLand(pr)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
+			break
+		}
 		if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "success", "merge queue: batch passed", e.commitURL(a.stagingSHA)); err != nil {
 			return err
 		}
@@ -206,6 +214,41 @@ func (e *Engine) land() error {
 	_ = e.fc.DeleteBranch(e.cfg.Owner, e.cfg.Repo, a.stagingBranch)
 	e.active = nil
 	return nil
+}
+
+func (e *Engine) readyToLand(staged forge.PullRequest) (bool, string, forge.PullRequest, error) {
+	current, err := e.fc.GetPR(e.cfg.Owner, e.cfg.Repo, staged.Number)
+	if err != nil {
+		return false, "", current, err
+	}
+	if current.Merged {
+		return false, "already merged", current, nil
+	}
+	if current.State != "open" {
+		return false, fmt.Sprintf("state changed to %q", current.State), current, nil
+	}
+	ok, err := e.fc.AutomergeScheduled(e.cfg.Owner, e.cfg.Repo, staged.Number)
+	if err != nil {
+		return false, "", current, err
+	}
+	if !ok {
+		return false, "auto-merge is no longer scheduled", current, nil
+	}
+	if current.Head.Sha != staged.Head.Sha {
+		return false, fmt.Sprintf("head changed from %s to %s", short(staged.Head.Sha), short(current.Head.Sha)), current, nil
+	}
+	return true, "", current, nil
+}
+
+func (e *Engine) skipLand(num int, pr forge.PullRequest, reason string, hasRemainder bool) {
+	suffix := ""
+	if hasRemainder {
+		suffix = " (remaining PRs re-queued next cycle)"
+	}
+	log.Printf("queue: skipped #%d before merge: %s%s", num, reason, suffix)
+	if pr.State == "open" && !pr.Merged {
+		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, num, "Skipped by the merge queue: "+reason+".")
+	}
 }
 
 // bisectOrBounce: a size-1 failing batch bounces the culprit; a larger batch is

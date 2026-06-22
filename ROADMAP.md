@@ -68,8 +68,10 @@ welcome.
 
 ### v0.4 — Correctness & safety
 - Retry a conflicting PR on its own before bouncing it.
-- Re-validate a PR's head SHA immediately before the gated merge (close the
-  mid-test-update race).
+- ~~Re-validate a PR's head SHA immediately before the gated merge (close the
+  mid-test-update race).~~ Completed: the engine refetches each PR and verifies
+  it is still open, unmerged, auto-merge scheduled, and still at the tested head
+  SHA immediately before marking it successful and merging.
 - Verify `rebase`/`squash` merge styles and `block_on_outdated_branch`
   interactions; document supported combinations.
 - Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
