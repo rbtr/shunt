@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -38,9 +39,9 @@ func main() {
 	botUser := env("SHUNT_BOT_USER", "mq-bot")
 	botEmail := env("SHUNT_BOT_EMAIL", botUser+"@noreply.invalid")
 	statusCtx := env("SHUNT_STATUS_CONTEXT", "merge-queue")
-	mergeStyle := strings.ToLower(env("SHUNT_MERGE_STYLE", "merge"))
-	if mergeStyle != "merge" {
-		log.Fatalf("unsupported SHUNT_MERGE_STYLE %q: v0.1 supports only %q", mergeStyle, "merge")
+	mergeStyle, err := normalizeMergeStyle(env("SHUNT_MERGE_STYLE", "merge"))
+	if err != nil {
+		log.Fatal(err)
 	}
 	maxBatch, _ := strconv.Atoi(env("SHUNT_MAX_BATCH", "0"))
 	batchTarget, err := strconv.Atoi(env("SHUNT_BATCH_TARGET", "0"))
@@ -121,4 +122,17 @@ func newHTTPMux(metricsCollector *metrics.Collector) *http.ServeMux {
 	})
 	mux.Handle("/metrics", metricsCollector.Handler())
 	return mux
+}
+
+func normalizeMergeStyle(style string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case "", "merge", "merge-commit", "merge_commit":
+		return "merge", nil
+	case "squash":
+		return "squash", nil
+	case "rebase":
+		return "rebase", nil
+	default:
+		return "", fmt.Errorf("unsupported SHUNT_MERGE_STYLE %q: use merge, squash, or rebase", style)
+	}
 }
