@@ -1,11 +1,15 @@
 # Roadmap
 
-shunt v0.1 works, but it is young and deliberately minimal. This page tracks what
-it does **not** yet do and the order we intend to fix it. Issues and PRs are
+shunt v0.2 is usable, but still intentionally small. This page tracks what it
+does **not** yet do and the order we intend to fix it. Issues and PRs are
 welcome.
 
 ## Recently completed
 
+- **v0.2 release train.** The first post-launch hardening pass added pre-merge
+  head revalidation, order-preserving staging-conflict handling, Prometheus
+  metrics, configurable batch linger, configurable bisection fan-out, and
+  `merge`/`squash`/`rebase` landing support.
 - **Order-preserving conflict handling.** A staging conflict splits the candidate
   at the conflict point: earlier PRs are tested first, then the conflicting
   suffix is retried on the current base. If the conflict is already first in a
@@ -36,24 +40,20 @@ welcome.
   depth and key counters, but there is no persisted metrics history, no
   time-in-queue histogram, and no queue UI (Forgejo has no plugin surface for a
   native one).
-- **Merge commits only.** `rebase` and `squash` merge styles are intentionally
-  disabled until their branch-protection and tested-tree semantics are verified.
 
 ## Milestones
 
-### v0.2 — Durability
+### v0.3 — Durability
 - Postgres-backed state: persist the per-`(repo, base)` work queue, the active
   batch (staging branch/SHA, members), and the bisection frontier; resume
   cleanly across restarts.
 - Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
   immediately, keeping the poll as a backstop.
 
-### v0.3 — Throughput & configurability
+### v0.4 — Per-repo configurability
 - **Per-repository configuration.** A mechanism for per-repo overrides on top of
   the global defaults (the natural carrier is a small config file in the repo,
-  e.g. `.shunt.yml`, discovered alongside the existing topic opt-in). This is a
-  prerequisite for the two items below, which both need to be tunable globally
-  **and** per repo.
+  e.g. `.shunt.yml`, discovered alongside the existing topic opt-in).
 - ~~**Parallelizable bisection.** When a batch fails and splits, test independent
   subtrees concurrently instead of strictly depth-first, bounded by a configurable
   fan-out limit.~~ Completed: `SHUNT_BISECT_FANOUT` controls process-wide
@@ -69,7 +69,7 @@ welcome.
   Per-repository overrides remain covered by the pending per-repository
   configuration item above.
 
-### v0.4 — Correctness & safety
+### v0.5 — Correctness & safety
 - ~~Re-validate a PR's head SHA immediately before the gated merge (close the
   mid-test-update race).~~ Completed: the engine refetches each PR and verifies
   it is still open, unmerged, auto-merge scheduled, and still at the tested head
@@ -81,7 +81,7 @@ welcome.
   disabled so queue validation remains authoritative.
 - Least-privilege bot tokens (scope down from broad tokens; per-repo tokens).
 
-### v0.5 — Observability & ops
+### v0.6 — Observability & ops
 - ~~Prometheus metrics (batches, runs, bounces, queue depth).~~ Completed:
   `/metrics` exposes process-local Prometheus text metrics for queue depth,
   active batch presence, batches started, PR merges, bounces, staging conflicts,

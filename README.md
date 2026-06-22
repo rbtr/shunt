@@ -166,7 +166,7 @@ Docker secrets, or Kubernetes Secrets.
 
 ## Status & roadmap
 
-v0.1 is functional but young. Known limitations (in-memory state, polling instead
+v0.2 is functional but young. Known limitations (in-memory state, polling instead
 of webhooks, single replica) and the plan to address them are tracked in
 [`ROADMAP.md`](ROADMAP.md).
 
