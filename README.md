@@ -110,13 +110,15 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, and `/webhook` endpoints |
+| `SHUNT_WEBHOOK_URL` | — | Public URL Forgejo/Gitea should call, usually `https://shunt.example.com/webhook`. When set, shunt creates/updates a repository webhook for each managed repo. |
 | `SHUNT_WEBHOOK_SECRET` | — | Optional shared secret for Forgejo/Gitea HMAC-SHA256 webhook signature validation |
 
-Configure a Forgejo/Gitea repository or organization webhook to POST to the
-externally reachable shunt listener path, usually `https://shunt.example.com/webhook`.
-Enable at least push and pull-request events; if your forge exposes
-`auto_merge_pull_request`, include it too. shunt wakes immediately for
-auto-merge, pull-request, review, status, and push events, but still polls on
+If `SHUNT_WEBHOOK_URL` is set, shunt uses the same admin token it already needs
+for branch protection to create or update a repository webhook for each managed
+repo. It leaves unrelated hooks alone and only manages a hook whose URL matches
+`SHUNT_WEBHOOK_URL`. Without that setting, configure a repository or
+organization webhook yourself. shunt wakes immediately for auto-merge,
+pull-request, review, status, and push events, but still polls on
 `SHUNT_POLL_INTERVAL` so missed webhooks only add latency.
 
 Repos can override safe queue tunables with `.shunt.yml` in the repo root. In
@@ -197,13 +199,14 @@ a merge queue.
 ## Security posture
 
 shunt needs a bot token with repository admin access to the repositories it
-manages so it can reconcile branch protection, set commit statuses, push staging
-branches, and merge PRs. Keep that token in your runtime secret store, not in the
-repository. The examples use placeholders only; real tokens should be supplied
-through environment variables, Docker secrets, or Kubernetes Secrets.
+manages so it can reconcile branch protection, optionally configure webhooks, set
+commit statuses, push staging branches, and merge PRs. Keep that token in your
+runtime secret store, not in the repository. The examples use placeholders only;
+real tokens should be supplied through environment variables, Docker secrets, or
+Kubernetes Secrets.
 
-If `/webhook` is exposed beyond a trusted private network, configure the forge
-webhook with a shared secret and set the same value in `SHUNT_WEBHOOK_SECRET`.
+If `/webhook` is exposed beyond a trusted private network, set
+`SHUNT_WEBHOOK_SECRET`; managed repository hooks use the same secret.
 
 ## Status & roadmap
 

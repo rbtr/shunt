@@ -26,10 +26,15 @@ config:
   queueComments: "false"
   pollInterval: "10s"
   listen: ":8080"
+  webhookUrl: ""
 
 token:
   existingSecret: shunt-bot
   key: token
+
+webhookSecret:
+  existingSecret: ""
+  key: webhook-secret
 
 podAnnotations: {}
 

@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- Optional managed repository webhook setup via `SHUNT_WEBHOOK_URL`, reusing the
+  existing admin token to create or update shunt-owned hooks.
+
 ## [0.3.0] - 2026-06-23
 
 v0.3.0 adds the first operational hardening layer on top of the v0.2 queue:

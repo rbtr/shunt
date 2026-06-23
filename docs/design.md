@@ -190,6 +190,11 @@ auto-merge, pull-request, review, status, and push activity. A buffered wake
 channel coalesces bursts so several webhook deliveries schedule one prompt
 reconcile; the polling timer remains the correctness backstop.
 
+When `SHUNT_WEBHOOK_URL` is set, shunt uses the same repository-admin token it
+already needs for branch protection to create or update a matching repository
+webhook for each managed repo. Hooks with different URLs are left alone; shunt
+only manages the hook whose URL matches the configured listener URL.
+
 Metrics are Prometheus text format, intentionally dependency-free and
 process-local: they cover queue depth, active batch presence, batches started, PR
 merges, bounces, staging conflicts, reconcile errors, and terminal gate outcomes.
@@ -202,8 +207,10 @@ status UI; those remain roadmap items.
    admin permission.
 2. Protect the base branch: require the `merge-queue` status, restrict pushes to
    the bot, and turn **off** "block on outdated branch".
-3. Add `examples/mq-gate.yml` as `.forgejo/workflows/mq-gate.yml`.
-4. Open a PR, enable "Merge when checks succeed", and run shunt with
+3. Optionally set `SHUNT_WEBHOOK_URL` so shunt configures the repository webhook
+   itself.
+4. Add `examples/mq-gate.yml` as `.forgejo/workflows/mq-gate.yml`.
+5. Open a PR, enable "Merge when checks succeed", and run shunt with
    `SHUNT_REPO=owner/disposable-repo`. Watch it stage, gate, and land. Introduce a
    failing PR to watch a batch bisect.
 

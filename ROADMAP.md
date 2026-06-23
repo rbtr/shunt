@@ -33,6 +33,9 @@ welcome.
 - **Webhook wakeups.** Forgejo/Gitea webhooks now wake reconciliation promptly for
   auto-merge, pull-request, review, status, and push activity. The poll loop
   remains as a backstop for missed webhook deliveries.
+- **Managed repository webhooks.** When `SHUNT_WEBHOOK_URL` is set, shunt uses
+  its existing admin token to create or update matching repository webhooks,
+  mirroring the branch-protection setup it already performs.
 
 ## Current limitations
 
