@@ -1,6 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,7 +15,7 @@ import (
 func TestHTTPMuxServesHealthAndMetrics(t *testing.T) {
 	c := metrics.New()
 	c.ObserveQueue(metrics.Labels{Owner: "o", Repo: "r", Base: "main"}, 1, true)
-	mux := newHTTPMux(c)
+	mux := newHTTPMux(c, webhookConfig{})
 
 	health := httptest.NewRecorder()
 	mux.ServeHTTP(health, httptest.NewRequest("GET", "/healthz", nil))
@@ -27,6 +31,94 @@ func TestHTTPMuxServesHealthAndMetrics(t *testing.T) {
 	if body := metricsResp.Body.String(); !strings.Contains(body, `shunt_queue_depth{owner="o",repo="r",base="main"} 1`) {
 		t.Fatalf("/metrics missing queue depth in:\n%s", body)
 	}
+}
+
+func TestWebhookWakesForRelevantEvents(t *testing.T) {
+	wakes := 0
+	mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() { wakes++ }})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/webhook", strings.NewReader(`{"ref":"refs/heads/main"}`))
+	req.Header.Set("X-Gitea-Event", "push")
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != 202 {
+		t.Fatalf("/webhook status = %d, want 202", resp.Code)
+	}
+	if wakes != 1 {
+		t.Fatalf("wakes = %d, want 1", wakes)
+	}
+}
+
+func TestWebhookIgnoresIrrelevantEvents(t *testing.T) {
+	wakes := 0
+	mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() { wakes++ }})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/webhook", strings.NewReader(`{}`))
+	req.Header.Set("X-Forgejo-Event", "issues")
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != 202 {
+		t.Fatalf("/webhook status = %d, want 202", resp.Code)
+	}
+	if body := resp.Body.String(); body != "ignored\n" {
+		t.Fatalf("/webhook body = %q, want ignored", body)
+	}
+	if wakes != 0 {
+		t.Fatalf("wakes = %d, want 0", wakes)
+	}
+}
+
+func TestWebhookRequiresValidSignatureWhenSecretConfigured(t *testing.T) {
+	const secret = "shared-secret"
+	const body = `{"action":"auto_merge"}`
+	wakes := 0
+	mux := newHTTPMux(metrics.New(), webhookConfig{Secret: secret, Wake: func() { wakes++ }})
+
+	bad := httptest.NewRecorder()
+	badReq := httptest.NewRequest("POST", "/webhook", strings.NewReader(body))
+	badReq.Header.Set("X-Gitea-Event", "auto_merge_pull_request")
+	mux.ServeHTTP(bad, badReq)
+	if bad.Code != 401 {
+		t.Fatalf("unsigned /webhook status = %d, want 401", bad.Code)
+	}
+
+	good := httptest.NewRecorder()
+	goodReq := httptest.NewRequest("POST", "/webhook", strings.NewReader(body))
+	goodReq.Header.Set("X-Gitea-Event", "auto_merge_pull_request")
+	goodReq.Header.Set("X-Gitea-Signature", webhookSignature(secret, body))
+	mux.ServeHTTP(good, goodReq)
+	if good.Code != 202 {
+		t.Fatalf("signed /webhook status = %d, want 202: %s", good.Code, good.Body.String())
+	}
+	if wakes != 1 {
+		t.Fatalf("wakes = %d, want 1", wakes)
+	}
+}
+
+func TestWebhookRejectsMissingEvent(t *testing.T) {
+	mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() {}})
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, httptest.NewRequest("POST", "/webhook", strings.NewReader(`{}`)))
+	if resp.Code != 400 {
+		t.Fatalf("/webhook status = %d, want 400", resp.Code)
+	}
+}
+
+func TestWebhookRejectsNonPost(t *testing.T) {
+	mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() {}})
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, httptest.NewRequest("GET", "/webhook", nil))
+	if resp.Code != 405 {
+		t.Fatalf("/webhook status = %d, want 405", resp.Code)
+	}
+}
+
+func webhookSignature(secret, body string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = io.WriteString(mac, body)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func TestNormalizeMergeStyle(t *testing.T) {

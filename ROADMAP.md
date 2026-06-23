@@ -26,6 +26,9 @@ welcome.
   shunt deletes stale shunt-owned staging branches (`mq/<base>/staging` and
   `mq/<base>/staging-N`) left behind by earlier processes before it starts
   reconciling that `(repo, base)`.
+- **Webhook wakeups.** Forgejo/Gitea webhooks now wake reconciliation promptly for
+  auto-merge, pull-request, review, status, and push activity. The poll loop
+  remains as a backstop for missed webhook deliveries.
 
 ## Current limitations
 
@@ -34,9 +37,9 @@ welcome.
   open auto-merge PRs), but it forgets an in-flight bisection and re-runs that
   CI. A crash mid-landing merges part of a batch and re-queues the rest next
   cycle.
-- **Polling, not webhooks.** shunt reconciles on a timer (default 10s), so there
-  is up-to-one-interval latency and steady API traffic. The
-  `auto_merge_pull_request` webhook is not wired yet.
+- **Polling backstop.** shunt still reconciles on a timer (default 10s) to
+  tolerate missed webhooks, so there is some steady API traffic even when webhook
+  wakeups are configured.
 - **Single replica.** One queue manager, no HA. If it's down, PRs simply wait.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
@@ -54,8 +57,10 @@ welcome.
 - Postgres-backed state: persist the per-`(repo, base)` work queue, the active
   batch (staging branch/SHA, members), and the bisection frontier; resume
   cleanly across restarts.
-- Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
-  immediately, keeping the poll as a backstop.
+- ~~Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
+  immediately, keeping the poll as a backstop.~~ Completed: `/webhook` wakes the
+  reconcile loop for auto-merge, pull-request, review, status, and push events
+  while retaining `SHUNT_POLL_INTERVAL` as a backstop.
 
 ### v0.4 — Per-repo configurability
 - ~~**Per-repository configuration.** A mechanism for per-repo overrides on top

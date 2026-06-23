@@ -36,7 +36,8 @@ end-to-end / visual tests) from *every PR* to *once per batch*.
 
 ## How it works
 
-Per `(repo, base-branch)`, on a fixed interval:
+Per `(repo, base-branch)`, whenever a relevant webhook arrives (with the poll
+interval as a backstop):
 
 1. **Find the queue** — open PRs with auto-merge enabled (detected from the PR
    timeline; Forgejo doesn't expose this on the PR object).
@@ -108,7 +109,15 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
-| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz` and `/metrics` endpoints |
+| `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, and `/webhook` endpoints |
+| `SHUNT_WEBHOOK_SECRET` | — | Optional shared secret for Forgejo/Gitea HMAC-SHA256 webhook signature validation |
+
+Configure a Forgejo/Gitea repository or organization webhook to POST to the
+externally reachable shunt listener path, usually `https://shunt.example.com/webhook`.
+Enable at least push and pull-request events; if your forge exposes
+`auto_merge_pull_request`, include it too. shunt wakes immediately for
+auto-merge, pull-request, review, status, and push events, but still polls on
+`SHUNT_POLL_INTERVAL` so missed webhooks only add latency.
 
 Repos can override safe queue tunables with `.shunt.yml` in the repo root. In
 multi-repo mode, shunt reads it from the discovered default branch before
@@ -129,7 +138,8 @@ bisect_fanout: 2
 ## Observability
 
 `GET /metrics` on `SHUNT_LISTEN` exposes dependency-free Prometheus text metrics
-for each managed `(owner, repo, base)` queue:
+for each managed `(owner, repo, base)` queue. `POST /webhook` accepts
+Forgejo/Gitea events and wakes reconciliation promptly.
 
 - `shunt_queue_depth` — PRs currently known in the in-memory queue, including an
   active batch and queued bisection candidates.
@@ -192,10 +202,13 @@ branches, and merge PRs. Keep that token in your runtime secret store, not in th
 repository. The examples use placeholders only; real tokens should be supplied
 through environment variables, Docker secrets, or Kubernetes Secrets.
 
+If `/webhook` is exposed beyond a trusted private network, configure the forge
+webhook with a shared secret and set the same value in `SHUNT_WEBHOOK_SECRET`.
+
 ## Status & roadmap
 
 v0.2 is functional but young. Known limitations (in-memory state, polling instead
-of webhooks, single replica) and the plan to address them are tracked in
+as a webhook backstop, single replica) and the plan to address them are tracked in
 [`ROADMAP.md`](ROADMAP.md).
 
 ## License

@@ -64,7 +64,9 @@ State, per `(repo, base)`:
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
-Each `Reconcile()` tick advances one step:
+Each `Reconcile()` tick advances one step. Ticks are driven by relevant
+Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the
+backstop so a missed webhook only delays progress:
 
 ```
 for active candidate whose earlier candidates are resolved:
@@ -182,8 +184,13 @@ against the unchanged current base, so `2` can still pass.
 
 ## Observability
 
-The same HTTP listener that serves `/healthz` also serves `/metrics` in
-Prometheus text format. Metrics are intentionally dependency-free and
+The same HTTP listener serves `/healthz`, `/metrics`, and `/webhook`.
+`/webhook` accepts Forgejo/Gitea events and wakes reconciliation for
+auto-merge, pull-request, review, status, and push activity. A buffered wake
+channel coalesces bursts so several webhook deliveries schedule one prompt
+reconcile; the polling timer remains the correctness backstop.
+
+Metrics are Prometheus text format, intentionally dependency-free and
 process-local: they cover queue depth, active batch presence, batches started, PR
 merges, bounces, staging conflicts, reconcile errors, and terminal gate outcomes.
 They reset on restart and do not yet include time-in-queue histograms or a queue
