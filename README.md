@@ -207,8 +207,8 @@ webhook with a shared secret and set the same value in `SHUNT_WEBHOOK_SECRET`.
 
 ## Status & roadmap
 
-v0.2 is functional but young. Known limitations (in-memory state, polling instead
-as a webhook backstop, single replica) and the plan to address them are tracked in
+v0.3 is functional but young. Known limitations (in-memory state, polling as a
+webhook backstop, single replica) and the plan to address them are tracked in
 [`ROADMAP.md`](ROADMAP.md).
 
 ## License

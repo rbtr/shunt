@@ -1,6 +1,6 @@
 # Roadmap
 
-shunt v0.2 is usable, but still intentionally small. This page tracks what it
+shunt v0.3 is usable, but still intentionally small. This page tracks what it
 does **not** yet do and the order we intend to fix it. Issues and PRs are
 welcome.
 
@@ -10,6 +10,10 @@ welcome.
   head revalidation, order-preserving staging-conflict handling, Prometheus
   metrics, configurable batch linger, configurable bisection fan-out, and
   `merge`/`squash`/`rebase` landing support.
+- **v0.3 release train.** The next hardening pass added webhook wakeups,
+  per-repository configuration, startup staging-branch cleanup, opt-in sticky
+  queue-status comments, operator gotchas, and correct aggregation of Forgejo
+  action task statuses.
 - **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
   queue tunables such as status context, merge style, batch sizing/linger,
   bisection fan-out, and managed base branch on top of process defaults.
