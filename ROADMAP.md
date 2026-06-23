@@ -13,6 +13,9 @@ welcome.
 - **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
   queue tunables such as status context, merge style, batch sizing/linger,
   bisection fan-out, and managed base branch on top of process defaults.
+- **Sticky PR queue-status comments.** Operators can opt in with
+  `SHUNT_QUEUE_COMMENTS=true` to keep one updated status comment on each queued
+  PR with base, position, state, and active batch details when known.
 - **Order-preserving conflict handling.** A staging conflict splits the candidate
   at the conflict point: earlier PRs are tested first, then the conflicting
   suffix is retried on the current base. If the conflict is already first in a
@@ -41,9 +44,9 @@ welcome.
 - **No automated forge-integration tests.** The bisection state machine is unit
   tested with a mock; live API coverage is still manual.
 - **Basic observability only.** Prometheus text metrics cover process-local queue
-  depth and key counters, but there is no persisted metrics history, no
-  time-in-queue histogram, and no queue UI (Forgejo has no plugin surface for a
-  native one).
+  depth and key counters, and operators can enable sticky PR queue-status
+  comments. There is still no persisted metrics history, no time-in-queue
+  histogram, and no queue UI (Forgejo has no plugin surface for a native one).
 
 ## Milestones
 
@@ -94,8 +97,10 @@ welcome.
   reconcile errors, and terminal gate outcomes.
 - Deeper observability: time-in-queue histograms, a status surface, and any
   persistence needed to preserve operational history across restarts.
-- A queue status surface (a sticky per-repo PR comment and/or a small status
-  page) since the forge can't host a native one.
+- ~~A sticky per-repo PR queue-status comment.~~ Completed as an opt-in
+  (`SHUNT_QUEUE_COMMENTS=true`) so write traffic remains an operator choice.
+  A small status page remains a possible follow-up since the forge can't host a
+  native queue UI.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.

@@ -40,6 +40,8 @@ spec:
               value: "https://forge.example.com"
             - name: SHUNT_TOPIC
               value: "merge-queue"
+            - name: SHUNT_QUEUE_COMMENTS
+              value: "false"
             - name: HOME # git writes config/temp here
               value: "/tmp"
             - name: SHUNT_TOKEN

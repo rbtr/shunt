@@ -24,10 +24,12 @@ type mock struct {
 	conflictBasePR int
 	conflictFirst  bool
 	statuses       []string
+	runStatus      string
 	staged         [][]int
 	merged         []int
 	bounced        map[int]bool
 	comments       map[int][]string
+	queueComments  map[int][]string
 	mergeHeads     map[int][]string
 	beforeMerge    func(int)
 }
@@ -36,7 +38,7 @@ func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
 		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
-		comments: map[int][]string{}, mergeHeads: map[int][]string{},
+		comments: map[int][]string{}, queueComments: map[int][]string{}, mergeHeads: map[int][]string{},
 	}
 	for _, n := range prNums {
 		m.addPR(n)
@@ -71,9 +73,16 @@ func (m *mock) Comment(_, _ string, n int, body string) error {
 	m.comments[n] = append(m.comments[n], body)
 	return nil
 }
+func (m *mock) UpsertComment(_, _ string, n int, _, _, body string) error {
+	m.queueComments[n] = append(m.queueComments[n], body)
+	return nil
+}
 func (m *mock) DeleteBranch(_, _, _ string) error { return nil }
 
 func (m *mock) RunStatus(_, _, sha, _ string) (string, error) {
+	if m.runStatus != "" {
+		return m.runStatus, nil
+	}
 	for _, n := range m.batchOf[sha] {
 		if n == m.badPR {
 			return "failure", nil
@@ -140,6 +149,75 @@ func TestBatchLingerDisabledByDefaultStartsImmediately(t *testing.T) {
 	}
 	if got := len(m.batchOf); got != 1 {
 		t.Errorf("staging runs = %d, want 1", got)
+	}
+}
+
+func TestQueueStatusCommentsDisabledByDefault(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if got := len(m.queueComments); got != 0 {
+		t.Fatalf("queue comments = %d, want 0", got)
+	}
+}
+
+func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true, BotUser: "mq-bot"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("PR 1 queue comment updates = %d, want 1", got)
+	}
+	body := m.queueComments[1][0]
+	for _, want := range []string{
+		queueCommentMarker,
+		"Repository: `o/r`",
+		"Base: `main`",
+		"Position: 1/2",
+		"State: testing in active batch",
+		"Active batch: #1, #2 on `mq/main/staging`",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("queue comment missing %q in:\n%s", want, body)
+		}
+	}
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("unchanged running batch: %v", err)
+	}
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("unchanged queue comment updates = %d, want 1", got)
+	}
+}
+
+func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.runStatus = "success"
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land batch: %v", err)
+	}
+
+	if got := len(m.queueComments[1]); got != 2 {
+		t.Fatalf("PR 1 queue comment updates = %d, want 2", got)
+	}
+	if body := m.queueComments[1][1]; !strings.Contains(body, "State: not currently queued") {
+		t.Fatalf("final queue comment did not mark PR as not queued:\n%s", body)
 	}
 }
 

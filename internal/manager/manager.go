@@ -16,19 +16,20 @@ import (
 )
 
 type Config struct {
-	Topic        string
-	StatusCtx    string
-	MergeStyle   string
-	MaxBatch     int
-	BatchLinger  time.Duration
-	BatchTarget  int
-	BisectFanout int
-	InstanceURL  string
-	PublicURL    string
-	Token        string
-	BotUser      string
-	BotEmail     string
-	Metrics      *metrics.Collector
+	Topic         string
+	StatusCtx     string
+	MergeStyle    string
+	MaxBatch      int
+	BatchLinger   time.Duration
+	BatchTarget   int
+	BisectFanout  int
+	QueueComments bool
+	InstanceURL   string
+	PublicURL     string
+	Token         string
+	BotUser       string
+	BotEmail      string
+	Metrics       *metrics.Collector
 }
 
 type Manager struct {
@@ -141,6 +142,8 @@ func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) en
 		BatchLinger:   settings.BatchLinger,
 		BatchTarget:   settings.BatchTarget,
 		BisectFanout:  settings.BisectFanout,
+		QueueComments: m.cfg.QueueComments,
+		BotUser:       m.cfg.BotUser,
 		Metrics:       m.cfg.Metrics,
 	}
 }

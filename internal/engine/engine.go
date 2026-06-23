@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/rbtr/shunt/internal/forge"
@@ -30,6 +31,8 @@ type Config struct {
 	BatchLinger   time.Duration
 	BatchTarget   int
 	BisectFanout  int // max concurrent bisection staging runs (0 = 1)
+	QueueComments bool
+	BotUser       string
 	Metrics       *metrics.Collector
 }
 
@@ -52,6 +55,7 @@ type ForgeAPI interface {
 	MergePR(owner, repo string, index int, style, headSHA string) error
 	CancelAutomerge(owner, repo string, index int) error
 	Comment(owner, repo string, index int, body string) error
+	UpsertComment(owner, repo string, index int, marker, botUser, body string) error
 	DeleteBranch(owner, repo, branch string) error
 }
 
@@ -71,10 +75,12 @@ type Engine struct {
 	lingerSince time.Time
 	baseGen     int
 	stagingSeq  int
+
+	queueComments map[int]string
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
-	return &Engine{cfg: cfg, fc: fc, st: st, now: time.Now}
+	return &Engine{cfg: cfg, fc: fc, st: st, now: time.Now, queueComments: map[int]string{}}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
@@ -92,6 +98,9 @@ func (e *Engine) Reconcile() error {
 	}
 	if err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+	}
+	if commentErr := e.syncQueueComments(); commentErr != nil {
+		log.Printf("queue: status comment sync failed: %v", commentErr)
 	}
 	e.observeQueue()
 	return err
@@ -513,6 +522,158 @@ func (e *Engine) observeQueue() {
 	e.cfg.Metrics.ObserveQueue(e.metricLabels(), depth, len(e.active) > 0)
 }
 
+const queueCommentMarker = "<!-- shunt:queue-status -->"
+
+type queueCommentStatus struct {
+	number        int
+	position      int
+	total         int
+	state         string
+	activeSummary string
+}
+
+func (e *Engine) syncQueueComments() error {
+	if !e.cfg.QueueComments {
+		return nil
+	}
+	statuses, err := e.queueCommentStatuses()
+	if err != nil {
+		return err
+	}
+	want := make(map[int]string, len(statuses))
+	for _, status := range statuses {
+		want[status.number] = e.queueCommentBody(status)
+	}
+
+	var firstErr error
+	for num, body := range want {
+		if e.queueComments[num] == body {
+			continue
+		}
+		if err := e.fc.UpsertComment(e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, body); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("PR #%d: %w", num, err)
+			}
+			continue
+		}
+		e.queueComments[num] = body
+	}
+	for num := range e.queueComments {
+		if _, ok := want[num]; ok {
+			continue
+		}
+		body := e.queueCommentNotQueuedBody()
+		if e.queueComments[num] != body {
+			if err := e.fc.UpsertComment(e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, body); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("PR #%d: %w", num, err)
+				}
+				continue
+			}
+		}
+		delete(e.queueComments, num)
+	}
+	return firstErr
+}
+
+func (e *Engine) queueCommentStatuses() ([]queueCommentStatus, error) {
+	states := map[int]string{}
+	for _, cand := range e.pending {
+		for _, num := range cand {
+			states[num] = "queued"
+		}
+	}
+	activeSummary := e.activeSummary()
+	for _, a := range e.active {
+		state := "testing in active batch"
+		if a.outcome != "" {
+			state = "gate " + a.outcome + "; resolving"
+			if !e.readyToResolve(a) {
+				state = "gate " + a.outcome + "; waiting for earlier queue entry"
+			}
+		}
+		for _, pr := range a.prs {
+			states[pr.Number] = state
+		}
+	}
+	if len(states) == 0 {
+		ready, err := e.readyNumbers()
+		if err != nil {
+			return nil, err
+		}
+		for _, num := range ready {
+			state := "queued"
+			if e.cfg.BatchLinger > 0 && !e.lingerSince.IsZero() {
+				state = "queued; waiting for batch linger window"
+			}
+			states[num] = state
+		}
+	}
+	nums := make([]int, 0, len(states))
+	for num := range states {
+		nums = append(nums, num)
+	}
+	sort.Ints(nums)
+	out := make([]queueCommentStatus, 0, len(nums))
+	for i, num := range nums {
+		out = append(out, queueCommentStatus{
+			number:        num,
+			position:      i + 1,
+			total:         len(nums),
+			state:         states[num],
+			activeSummary: activeSummary,
+		})
+	}
+	return out, nil
+}
+
+func (e *Engine) queueCommentBody(status queueCommentStatus) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, queueCommentMarker)
+	fmt.Fprintln(&b, "**Merge queue status**")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "- Repository: `%s/%s`\n", e.cfg.Owner, e.cfg.Repo)
+	fmt.Fprintf(&b, "- Base: `%s`\n", e.cfg.Base)
+	fmt.Fprintf(&b, "- Position: %d/%d\n", status.position, status.total)
+	fmt.Fprintf(&b, "- State: %s\n", status.state)
+	if status.activeSummary != "" {
+		fmt.Fprintf(&b, "- Active batch: %s\n", status.activeSummary)
+	} else {
+		fmt.Fprintln(&b, "- Active batch: none")
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (e *Engine) queueCommentNotQueuedBody() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, queueCommentMarker)
+	fmt.Fprintln(&b, "**Merge queue status**")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "- Repository: `%s/%s`\n", e.cfg.Owner, e.cfg.Repo)
+	fmt.Fprintf(&b, "- Base: `%s`\n", e.cfg.Base)
+	fmt.Fprintln(&b, "- State: not currently queued")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (e *Engine) activeSummary() string {
+	if len(e.active) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(e.active))
+	for _, a := range e.active {
+		state := "running"
+		if a.outcome != "" {
+			state = a.outcome
+		}
+		parts = append(parts, fmt.Sprintf("%s on `%s` (`%s`, %s)", formatPRNums(numbersOf(a.prs)), a.stagingBranch, short(a.stagingSHA), state))
+	}
+	return strings.Join(parts, "; ")
+}
+
 func (e *Engine) metricLabels() metrics.Labels {
 	return metrics.Labels{Owner: e.cfg.Owner, Repo: e.cfg.Repo, Base: e.cfg.Base}
 }
@@ -541,6 +702,14 @@ func removeNum(nums []int, n int) []int {
 		}
 	}
 	return out
+}
+
+func formatPRNums(nums []int) string {
+	parts := make([]string, len(nums))
+	for i, n := range nums {
+		parts[i] = fmt.Sprintf("#%d", n)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func indexOfNum(nums []int, n int) int {

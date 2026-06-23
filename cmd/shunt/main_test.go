@@ -57,3 +57,40 @@ func TestNormalizeMergeStyleRejectsUnknown(t *testing.T) {
 		t.Fatal("normalizeMergeStyle should reject unsupported styles")
 	}
 }
+
+func TestEnvBool(t *testing.T) {
+	t.Setenv("SHUNT_TEST_BOOL", "")
+	got, err := envBool("SHUNT_TEST_BOOL", true)
+	if err != nil {
+		t.Fatalf("default envBool: %v", err)
+	}
+	if !got {
+		t.Fatal("empty env should return default true")
+	}
+
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "YES", want: true},
+		{value: "0", want: false},
+		{value: "off", want: false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("SHUNT_TEST_BOOL", tc.value)
+			got, err := envBool("SHUNT_TEST_BOOL", !tc.want)
+			if err != nil {
+				t.Fatalf("envBool(%q): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Fatalf("envBool(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+
+	t.Setenv("SHUNT_TEST_BOOL", "sometimes")
+	if _, err := envBool("SHUNT_TEST_BOOL", false); err == nil {
+		t.Fatal("envBool should reject invalid values")
+	}
+}

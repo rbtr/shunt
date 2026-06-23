@@ -31,6 +31,8 @@ spec:
               value: "merge-queue"
             - name: SHUNT_BISECT_FANOUT
               value: "1"
+            - name: SHUNT_QUEUE_COMMENTS
+              value: "false"
             - name: HOME
               value: "/tmp"
             - name: SHUNT_TOKEN
