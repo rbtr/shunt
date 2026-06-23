@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-23
+
+v0.3.0 adds the first operational hardening layer on top of the v0.2 queue:
+webhook-driven wakeups, per-repository configuration, safer staging cleanup,
+and clearer queue visibility. It also fixes Forgejo task-status aggregation so
+multi-job checks are interpreted correctly.
+
+### Added
+- `/webhook` endpoint support for auto-merge, pull-request, review, status, and
+  push events. Webhooks wake reconciliation promptly while the poll loop remains
+  as a backstop.
+- Per-repository `.shunt.yml` overrides for status context, merge style, max
+  batch size, batch linger/target, bisection fan-out, and managed base branch.
+- Opt-in sticky queue-status PR comments via `SHUNT_QUEUE_COMMENTS=true`,
+  updating one bot-owned comment per queued PR instead of spamming new comments.
+- Startup cleanup for stale shunt-owned staging branches left behind by prior
+  processes.
+- Operator guidance for Forgejo/Gitea behaviors that commonly affect queue
+  correctness.
+
+### Fixed
+- Forgejo action-task aggregation now treats a commit as successful only when
+  all relevant task statuses have succeeded, avoiding false positives from
+  mixed job results.
+
 ## [0.2.0] - 2026-06-22
 
 v0.2.0 is the first post-launch hardening release. It focuses on queue
@@ -53,6 +78,7 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rbtr/shunt/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rbtr/shunt/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rbtr/shunt/releases/tag/v0.1.0
