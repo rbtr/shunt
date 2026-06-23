@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +40,72 @@ func TestMergePRSendsStyleAndHeadCommitID(t *testing.T) {
 				t.Errorf("head_commit_id = %q, want abc123", got["head_commit_id"])
 			}
 		})
+	}
+}
+
+func TestPruneStagingBranchesDeletesOnlyShuntStagingBranches(t *testing.T) {
+	branches := []Branch{
+		{Name: "main"},
+		{Name: "mq/main/staging"},
+		{Name: "mq/main/staging-1"},
+		{Name: "mq/main/staging-27"},
+		{Name: "mq/main/staging-old"},
+		{Name: "mq/main/other"},
+		{Name: "mq/release/staging"},
+		{Name: "feature/mq/main/staging"},
+	}
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/branches":
+			if r.URL.Query().Get("page") == "1" {
+				_ = json.NewEncoder(w).Encode(branches)
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]Branch{})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.EscapedPath(), "/api/v1/repos/o/r/branches/"):
+			name, err := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/api/v1/repos/o/r/branches/"))
+			if err != nil {
+				t.Errorf("unescape branch path: %v", err)
+			}
+			deleted = append(deleted, name)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	got, err := c.PruneStagingBranches("o", "r", "main")
+	if err != nil {
+		t.Fatalf("PruneStagingBranches: %v", err)
+	}
+
+	sort.Strings(got)
+	sort.Strings(deleted)
+	want := []string{"mq/main/staging", "mq/main/staging-1", "mq/main/staging-27"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("pruned = %v, want %v", got, want)
+	}
+	if strings.Join(deleted, ",") != strings.Join(want, ",") {
+		t.Fatalf("deleted = %v, want %v", deleted, want)
+	}
+}
+
+func TestIsShuntStagingBranchSupportsSlashedBases(t *testing.T) {
+	for _, tc := range []struct {
+		branch string
+		want   bool
+	}{
+		{branch: "mq/release/v1/staging", want: true},
+		{branch: "mq/release/v1/staging-2", want: true},
+		{branch: "mq/release/v1/staging-old", want: false},
+		{branch: "mq/release/staging", want: false},
+	} {
+		if got := isShuntStagingBranch("release/v1", tc.branch); got != tc.want {
+			t.Errorf("isShuntStagingBranch(%q) = %v, want %v", tc.branch, got, tc.want)
+		}
 	}
 }

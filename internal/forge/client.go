@@ -42,6 +42,10 @@ type PullRequest struct {
 	} `json:"base"`
 }
 
+type Branch struct {
+	Name string `json:"name"`
+}
+
 type timelineComment struct {
 	Type string `json:"type"`
 }
@@ -56,6 +60,8 @@ type workflowRun struct {
 type tasksResponse struct {
 	WorkflowRuns []workflowRun `json:"workflow_runs"`
 }
+
+const branchPageLimit = 50
 
 func (c *Client) do(method, path string, body, out any) error {
 	var rdr io.Reader
@@ -176,12 +182,62 @@ func (c *Client) Comment(owner, repo string, index int, body string) error {
 	return c.do(http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repoPath(owner, repo), index), map[string]string{"body": body}, nil)
 }
 
+func (c *Client) ListBranches(owner, repo string) ([]Branch, error) {
+	var out []Branch
+	for page := 1; ; page++ {
+		var branches []Branch
+		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/branches?limit=%d&page=%d", repoPath(owner, repo), branchPageLimit, page), nil, &branches); err != nil {
+			return nil, err
+		}
+		out = append(out, branches...)
+		if len(branches) < branchPageLimit {
+			return out, nil
+		}
+	}
+}
+
+// PruneStagingBranches deletes stale shunt-owned staging branches for base.
+func (c *Client) PruneStagingBranches(owner, repo, base string) ([]string, error) {
+	branches, err := c.ListBranches(owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	var deleted []string
+	for _, branch := range branches {
+		if !isShuntStagingBranch(base, branch.Name) {
+			continue
+		}
+		if err := c.DeleteBranch(owner, repo, branch.Name); err != nil {
+			return deleted, fmt.Errorf("delete branch %q: %w", branch.Name, err)
+		}
+		deleted = append(deleted, branch.Name)
+	}
+	return deleted, nil
+}
+
 func (c *Client) DeleteBranch(owner, repo, branch string) error {
 	err := c.do(http.MethodDelete, fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil, nil)
 	if err != nil && strings.Contains(err.Error(), "http 404") {
 		return nil
 	}
 	return err
+}
+
+func isShuntStagingBranch(base, branch string) bool {
+	staging := "mq/" + base + "/staging"
+	if branch == staging {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(branch, staging+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func repoPath(owner, repo string) string {
