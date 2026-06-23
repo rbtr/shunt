@@ -146,3 +146,112 @@ func TestReadFileReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("ReadFile error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestRunStatusAggregatesNewestMatchingTaskRun(t *testing.T) {
+	payload := tasksResponse{WorkflowRuns: []workflowTask{
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "running"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 7, WorkflowID: "ci.yaml", Status: "success"},
+	}}
+	c := newRunStatusTestClient(t, payload)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("RunStatus = %q, want running", status)
+	}
+}
+
+func TestRunStatusFailsIfAnyNewestMatchingTaskFails(t *testing.T) {
+	payload := tasksResponse{WorkflowRuns: []workflowTask{
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "running"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "failure"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 7, WorkflowID: "ci.yaml", Status: "success"},
+	}}
+	c := newRunStatusTestClient(t, payload)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "failure" {
+		t.Fatalf("RunStatus = %q, want failure", status)
+	}
+}
+
+func TestRunStatusSucceedsWhenNewestMatchingTasksAreTerminalGreen(t *testing.T) {
+	payload := tasksResponse{WorkflowRuns: []workflowTask{
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "skipped"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		{HeadSHA: "other", HeadBranch: "mq/main/staging", RunNumber: 9, WorkflowID: "ci.yaml", Status: "running"},
+	}}
+	c := newRunStatusTestClient(t, payload)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "success" {
+		t.Fatalf("RunStatus = %q, want success", status)
+	}
+}
+
+func TestRunStatusReadsPaginatedTasks(t *testing.T) {
+	firstPage := make([]workflowTask, taskPageLimit)
+	for i := range firstPage {
+		firstPage[i] = workflowTask{HeadSHA: "other", HeadBranch: "mq/main/staging", RunNumber: 9, WorkflowID: "ci.yaml", Status: "success"}
+	}
+	c := newRunStatusPagedTestClient(t,
+		tasksResponse{WorkflowRuns: firstPage},
+		tasksResponse{WorkflowRuns: []workflowTask{
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+	)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "success" {
+		t.Fatalf("RunStatus = %q, want success", status)
+	}
+}
+
+func newRunStatusTestClient(t *testing.T, payload tasksResponse) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/repos/o/r/actions/tasks" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "token")
+}
+
+func newRunStatusPagedTestClient(t *testing.T, pages ...tasksResponse) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/repos/o/r/actions/tasks" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		page := r.URL.Query().Get("page")
+		index := 0
+		if page == "2" {
+			index = 1
+		}
+		if index >= len(pages) {
+			t.Fatalf("unexpected page %s", page)
+		}
+		if err := json.NewEncoder(w).Encode(pages[index]); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "token")
+}
