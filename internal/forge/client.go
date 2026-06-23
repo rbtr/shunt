@@ -53,18 +53,21 @@ type timelineComment struct {
 	Type string `json:"type"`
 }
 
-type workflowRun struct {
+type workflowTask struct {
 	HeadSHA    string `json:"head_sha"`
 	HeadBranch string `json:"head_branch"`
+	RunNumber  int    `json:"run_number"`
+	WorkflowID string `json:"workflow_id"`
 	Status     string `json:"status"`
 	Event      string `json:"event"`
 }
 
 type tasksResponse struct {
-	WorkflowRuns []workflowRun `json:"workflow_runs"`
+	WorkflowRuns []workflowTask `json:"workflow_runs"`
 }
 
 const branchPageLimit = 50
+const taskPageLimit = 100
 
 func (c *Client) do(method, path string, body, out any) error {
 	var rdr io.Reader
@@ -187,20 +190,70 @@ func (c *Client) AutomergeScheduled(owner, repo string, index int) (bool, error)
 	return false, nil
 }
 
-// RunStatus returns the gate workflow run status for (sha, branch), or "" if no
-// run exists yet. Forgejo populates `status` (success/failure/running/...); the
-// `conclusion` field is unused in this version.
+// RunStatus returns the aggregate gate workflow status for (sha, branch), or ""
+// if no run exists yet. Forgejo's actions/tasks API is job-shaped despite the
+// workflow_runs field name, so aggregate all tasks from the newest matching run.
 func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
-	var tr tasksResponse
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/actions/tasks?limit=50", repoPath(owner, repo)), nil, &tr); err != nil {
+	tasks, err := c.listActionTasks(owner, repo)
+	if err != nil {
 		return "", err
 	}
-	for _, r := range tr.WorkflowRuns {
-		if r.HeadSHA == sha && (branch == "" || r.HeadBranch == branch) {
-			return r.Status, nil
+
+	var runNumber int
+	var workflowID string
+	for _, task := range tasks {
+		if task.HeadSHA == sha && (branch == "" || task.HeadBranch == branch) {
+			if task.RunNumber > runNumber {
+				runNumber = task.RunNumber
+				workflowID = task.WorkflowID
+			}
 		}
 	}
+	if runNumber == 0 {
+		return "", nil
+	}
+
+	sawTerminal := false
+	pendingStatus := ""
+	for _, task := range tasks {
+		if task.HeadSHA != sha || (branch != "" && task.HeadBranch != branch) {
+			continue
+		}
+		if task.RunNumber != runNumber || task.WorkflowID != workflowID {
+			continue
+		}
+		switch task.Status {
+		case "failure", "cancelled", "error":
+			return task.Status, nil
+		case "success", "skipped":
+			sawTerminal = true
+		default:
+			if pendingStatus == "" {
+				pendingStatus = task.Status
+			}
+		}
+	}
+	if pendingStatus != "" {
+		return pendingStatus, nil
+	}
+	if sawTerminal {
+		return "success", nil
+	}
 	return "", nil
+}
+
+func (c *Client) listActionTasks(owner, repo string) ([]workflowTask, error) {
+	var out []workflowTask
+	for page := 1; ; page++ {
+		var tr tasksResponse
+		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/actions/tasks?limit=%d&page=%d", repoPath(owner, repo), taskPageLimit, page), nil, &tr); err != nil {
+			return nil, err
+		}
+		out = append(out, tr.WorkflowRuns...)
+		if len(tr.WorkflowRuns) < taskPageLimit {
+			return out, nil
+		}
+	}
 }
 
 func (c *Client) SetCommitStatus(owner, repo, sha, context, state, desc, targetURL string) error {
