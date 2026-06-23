@@ -38,14 +38,21 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
    the `merge-queue` status and restricting pushes to the bot, a PR merge is
    rejected (`405 "Not all required status checks successful"`) until shunt sets
    that status — which it only does after a batch passes. Nothing lands
-   un-vetted, and humans can't bypass the queue.
+   un-vetted, and humans can't bypass the queue. The bot must have repository
+   admin permission, not only write permission, because Forgejo/Gitea require
+   admin access for the branch-protection API shunt uses to read and reconcile
+   this rule.
 
 4. **CI result is the Actions run `status`.** Forgejo Actions don't publish a
    pollable commit *status*; shunt reads the workflow run's `status`
    (`success` / `failure` / `running` / …) from
    `GET /repos/{o}/{r}/actions/tasks`, matched on `(head_sha, head_branch)`.
    Scope your gate workflow to `push: [mq/**]` so per-PR merges to the base
-   don't re-trigger it.
+   don't re-trigger it. In current Forgejo responses this endpoint is task-shaped
+   rather than run-shaped, so keep the mq gate simple: a single gate job is best.
+   If you use multiple jobs, mq-only non-applicable jobs should exit successfully
+   as no-ops instead of being skipped, because a skipped newest task can leave
+   shunt waiting for a terminal success/failure it never observes.
 
 ## The algorithm
 
@@ -165,8 +172,10 @@ against the unchanged current base, so `2` can still pass.
 - **Merge method is an API landing choice, not a staging shortcut.** shunt always
   tests the integration tree on a staging branch first, then asks the forge to
   land each PR with the configured `merge`, `squash`, or `rebase` method while
-  pinning the expected PR head SHA. Keep "block on outdated branch" disabled so
-  the queue, not per-PR freshness checks, decides when a tested PR can land.
+  pinning the expected PR head SHA. The configured method must be allowed by the
+  repository; squash-only repositories need `SHUNT_MERGE_STYLE=squash`. Keep
+  "block on outdated branch" disabled so the queue, not per-PR freshness checks,
+  decides when a tested PR can land.
 - **Crash safety (today).** State is in-memory; a restart re-derives the queue
   from open auto-merge PRs. It may repeat a staging run, but never double-merges
   and never loses a PR. Durable state is a roadmap item.
@@ -182,7 +191,8 @@ status UI; those remain roadmap items.
 
 ## Running against a real instance (safely)
 
-1. Create a disposable repo and a bot account with a token.
+1. Create a disposable repo and a bot account with a token that has repository
+   admin permission.
 2. Protect the base branch: require the `merge-queue` status, restrict pushes to
    the bot, and turn **off** "block on outdated branch".
 3. Add `examples/mq-gate.yml` as `.forgejo/workflows/mq-gate.yml`.

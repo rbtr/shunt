@@ -59,8 +59,11 @@ detail and the validated Forgejo mechanics are in
 
 ## Quickstart
 
-shunt needs a **bot account** with a token, write access to the managed repos,
-and a slot in each protected branch's push allow-list.
+shunt needs a **bot account** with a token, repository admin access to the
+managed repos, and a slot in each protected branch's push allow-list. Repository
+admin is required because Forgejo/Gitea branch-protection APIs reject even read
+requests from normal write collaborators; shunt must read and reconcile those
+rules to keep the required `merge-queue` gate in place.
 
 ```sh
 go build -o shunt ./cmd/shunt
@@ -97,7 +100,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BOT_USER` | `mq-bot` | Bot username (for git auth + push allow-list) |
 | `SHUNT_BOT_EMAIL` | `<bot>@noreply.invalid` | Author email for staging commits |
 | `SHUNT_STATUS_CONTEXT` | `merge-queue` | Required commit-status context |
-| `SHUNT_MERGE_STYLE` | `merge` | Merge method passed to the forge: `merge`, `squash`, or `rebase`. |
+| `SHUNT_MERGE_STYLE` | `merge` | Merge method passed to the forge: `merge`, `squash`, or `rebase`. Must be enabled in the repository settings; for squash-only repos, set this to `squash`. |
 | `SHUNT_MAX_BATCH` | `0` | Cap the initial rollup size (0 = unlimited) |
 | `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). Process-wide until per-repo config lands. |
@@ -159,10 +162,11 @@ a merge queue.
 
 ## Security posture
 
-shunt needs a bot token with write access to the repositories it manages. Keep
-that token in your runtime secret store, not in the repository. The examples use
-placeholders only; real tokens should be supplied through environment variables,
-Docker secrets, or Kubernetes Secrets.
+shunt needs a bot token with repository admin access to the repositories it
+manages so it can reconcile branch protection, set commit statuses, push staging
+branches, and merge PRs. Keep that token in your runtime secret store, not in the
+repository. The examples use placeholders only; real tokens should be supplied
+through environment variables, Docker secrets, or Kubernetes Secrets.
 
 ## Status & roadmap
 
