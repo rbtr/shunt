@@ -44,15 +44,15 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
    this rule.
 
 4. **CI result is the Actions run `status`.** Forgejo Actions don't publish a
-   pollable commit *status*; shunt reads the workflow run's `status`
-   (`success` / `failure` / `running` / …) from
-   `GET /repos/{o}/{r}/actions/tasks`, matched on `(head_sha, head_branch)`.
-   Scope your gate workflow to `push: [mq/**]` so per-PR merges to the base
-   don't re-trigger it. In current Forgejo responses this endpoint is task-shaped
-   rather than run-shaped, so keep the mq gate simple: a single gate job is best.
-   If you use multiple jobs, mq-only non-applicable jobs should exit successfully
-   as no-ops instead of being skipped, because a skipped newest task can leave
-   shunt waiting for a terminal success/failure it never observes.
+   pollable commit *status*; shunt reads the newest matching workflow run from
+   `GET /repos/{o}/{r}/actions/runs`, matched on `(commit_sha, prettyref)`, and
+   uses that run's aggregate `status` (`success` / `failure` / `running` / …).
+   This is intentionally run-level instead of task-level: Forgejo creates
+   dependent job rows lazily, so a multi-job workflow can briefly show every
+   materialized task as green while later jobs are not even present yet. shunt
+   falls back to `GET /repos/{o}/{r}/actions/tasks` only when the run endpoint is
+   unavailable on older compatible forges. Scope your gate workflow to
+   `push: [mq/**]` so per-PR merges to the base don't re-trigger it.
 
 ## The algorithm
 

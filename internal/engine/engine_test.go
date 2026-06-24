@@ -442,6 +442,25 @@ func TestFailedMergeClearsSuccessStatus(t *testing.T) {
 	}
 }
 
+func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	m.failMerge = 1
+	m.beforeMerge = func(n int) {
+		m.prs[n].State = "closed"
+		m.prs[n].Merged = true
+		m.automerge[n] = false
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	drive(e, 2)
+
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
+		t.Errorf("statuses = %s, want only success", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
+		t.Errorf("comments missing landed outcome:\n%s", got)
+	}
+}
+
 func TestLandRevalidatesHappyPath(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
