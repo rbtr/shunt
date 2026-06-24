@@ -160,6 +160,14 @@ base branch, queue position, current state, and active batch when known. This is
 off by default because it adds issue-comment API reads/writes on repositories that
 opt in.
 
+Terminal outcomes are always reported on the source PR, even when sticky queue
+comments are disabled. Landed PRs receive a durable landed comment. Rejected PRs
+receive a failed or errored source-head status, auto-merge is cancelled, and shunt
+posts a durable comment with the rejection reason and a staging run/commit link
+when one exists. PRs skipped before landing because their head changed, auto-merge
+was cancelled, or the forge merge API did not complete receive an error status
+and a requeue/skipped comment so the PR page explains what happened.
+
 ## Deploy
 
 Download a binary from the GitHub release, run the GHCR image, or deploy with

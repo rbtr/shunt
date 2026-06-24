@@ -70,6 +70,8 @@ type workflowTask struct {
 	WorkflowID string `json:"workflow_id"`
 	Status     string `json:"status"`
 	Event      string `json:"event"`
+	HTMLURL    string `json:"html_url"`
+	TargetURL  string `json:"target_url"`
 }
 
 type tasksResponse struct {
@@ -250,6 +252,49 @@ func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
 		return "success", nil
 	}
 	return "", nil
+}
+
+// RunTargetURL returns a browser/debug URL for the newest matching staging run
+// when Forgejo/Gitea exposes one. Not every version includes this in the task
+// payload, so an empty URL is a valid "not available" result.
+func (c *Client) RunTargetURL(owner, repo, sha, branch string) (string, error) {
+	tasks, err := c.listActionTasks(owner, repo)
+	if err != nil {
+		return "", err
+	}
+	runNumber, workflowID := latestRun(tasks, sha, branch)
+	if runNumber == 0 {
+		return "", nil
+	}
+	for _, task := range tasks {
+		if task.HeadSHA != sha || (branch != "" && task.HeadBranch != branch) {
+			continue
+		}
+		if task.RunNumber != runNumber || task.WorkflowID != workflowID {
+			continue
+		}
+		if task.HTMLURL != "" {
+			return task.HTMLURL, nil
+		}
+		if task.TargetURL != "" {
+			return task.TargetURL, nil
+		}
+	}
+	return "", nil
+}
+
+func latestRun(tasks []workflowTask, sha, branch string) (int, string) {
+	var runNumber int
+	var workflowID string
+	for _, task := range tasks {
+		if task.HeadSHA == sha && (branch == "" || task.HeadBranch == branch) {
+			if task.RunNumber > runNumber {
+				runNumber = task.RunNumber
+				workflowID = task.WorkflowID
+			}
+		}
+	}
+	return runNumber, workflowID
 }
 
 func (c *Client) listActionTasks(owner, repo string) ([]workflowTask, error) {

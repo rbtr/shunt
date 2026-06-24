@@ -40,6 +40,7 @@ type activeBatch struct {
 	prs           []forge.PullRequest
 	stagingBranch string
 	stagingSHA    string
+	debugURL      string
 	baseGen       int
 	outcome       string
 }
@@ -51,6 +52,7 @@ type ForgeAPI interface {
 	GetPR(owner, repo string, index int) (forge.PullRequest, error)
 	AutomergeScheduled(owner, repo string, index int) (bool, error)
 	RunStatus(owner, repo, sha, branch string) (string, error)
+	RunTargetURL(owner, repo, sha, branch string) (string, error)
 	SetCommitStatus(owner, repo, sha, context, state, desc, targetURL string) error
 	MergePR(owner, repo string, index int, style, headSHA string) error
 	CancelAutomerge(owner, repo string, index int) error
@@ -76,11 +78,12 @@ type Engine struct {
 	baseGen     int
 	stagingSeq  int
 
-	queueComments map[int]string
+	queueComments         map[int]string
+	terminalQueueComments map[int]string
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
-	return &Engine{cfg: cfg, fc: fc, st: st, now: time.Now, queueComments: map[int]string{}}
+	return &Engine{cfg: cfg, fc: fc, st: st, now: time.Now, queueComments: map[int]string{}, terminalQueueComments: map[int]string{}}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
@@ -226,6 +229,7 @@ func (e *Engine) checkActive() (bool, error) {
 			switch status {
 			case "success", "failure", "cancelled", "error":
 				a.outcome = status
+				a.debugURL = e.debugURL(a)
 				e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
 			default: // "", running, waiting, blocked -> keep waiting
 				continue
@@ -269,7 +273,7 @@ func (e *Engine) land(a *activeBatch) (bool, error) {
 			return false, err
 		}
 		if !ok {
-			e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
+			e.skipLand(pr, current, reason, i < len(a.prs)-1, a.debugURL)
 			requeueFrom = i
 			break
 		}
@@ -290,10 +294,10 @@ func (e *Engine) land(a *activeBatch) (bool, error) {
 				return false, fmt.Errorf("merge #%d failed: %v; also failed to revalidate after merge error: %w", pr.Number, mErr, err)
 			}
 			if !ok {
-				if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", e.commitURL(a.stagingSHA)); err != nil {
+				if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", a.debugURL); err != nil {
 					return false, fmt.Errorf("merge #%d failed after PR changed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 				}
-				e.skipLand(pr.Number, current, reason, i < len(a.prs)-1)
+				e.skipLand(pr, current, reason, i < len(a.prs)-1, a.debugURL)
 				drifted = true
 				requeueFrom = i
 				break
@@ -304,15 +308,16 @@ func (e *Engine) land(a *activeBatch) (bool, error) {
 			break
 		}
 		if mErr != nil {
-			if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: merge did not complete; re-queued", e.commitURL(a.stagingSHA)); err != nil {
+			if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: merge did not complete; re-queued", a.debugURL); err != nil {
 				return false, fmt.Errorf("merge #%d failed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 			}
+			e.notifyPR(pr.Number, pr.Head.Sha, "error", "Merge did not complete", "shunt re-queued this PR after the forge merge API did not complete.", a.debugURL, true)
 			log.Printf("queue: merge #%d failed: %v (remaining PRs re-queued next cycle)", pr.Number, mErr)
 			requeueFrom = i
 			break
 		}
 		e.cfg.Metrics.IncPRMerge(e.metricLabels())
-		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, pr.Number, "Landed via merge queue.")
+		e.notifyPR(pr.Number, pr.Head.Sha, "", "Landed via merge queue", "shunt tested this PR in a staging batch and merged it after the gate passed.", a.debugURL, true)
 		log.Printf("queue: merged #%d", pr.Number)
 		merged++
 	}
@@ -337,7 +342,7 @@ func (e *Engine) handleStagingConflict(nums []int, conflictPR int) error {
 		return fmt.Errorf("stager reported conflict on PR #%d outside candidate %v", conflictPR, nums)
 	}
 	if idx == 0 {
-		e.bounce(conflictPR, "merge conflict while staging the PR")
+		e.bounce(conflictPR, "merge conflict while staging the PR", "error", "")
 		if len(nums) > 1 {
 			rest := append([]int(nil), nums[1:]...)
 			e.enqueue(rest)
@@ -377,14 +382,19 @@ func (e *Engine) readyToLand(staged forge.PullRequest) (bool, string, forge.Pull
 	return true, "", current, nil
 }
 
-func (e *Engine) skipLand(num int, pr forge.PullRequest, reason string, hasRemainder bool) {
+func (e *Engine) skipLand(staged, current forge.PullRequest, reason string, hasRemainder bool, debugURL string) {
 	suffix := ""
 	if hasRemainder {
 		suffix = " (remaining PRs re-queued next cycle)"
 	}
+	num := staged.Number
 	log.Printf("queue: skipped #%d before merge: %s%s", num, reason, suffix)
-	if pr.State == "open" && !pr.Merged {
-		_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, num, "Skipped by the merge queue: "+reason+".")
+	if current.State == "open" && !current.Merged {
+		sha := current.Head.Sha
+		if sha == "" {
+			sha = staged.Head.Sha
+		}
+		e.notifyPR(num, sha, "error", "Skipped by merge queue", "shunt skipped this PR before landing because "+reason+". It will be re-tested if it remains queued.", debugURL, true)
 	}
 }
 
@@ -397,7 +407,7 @@ func (e *Engine) bisectOrBounce(a *activeBatch, status string) error {
 	e.removeActive(a)
 
 	if len(nums) == 1 {
-		e.bounce(nums[0], fmt.Sprintf("merge-queue gate **%s**; see the [staging run](%s)", status, e.commitURL(a.stagingSHA)))
+		e.bounce(nums[0], fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
 		return nil
 	}
 	mid := len(nums) / 2
@@ -408,10 +418,19 @@ func (e *Engine) bisectOrBounce(a *activeBatch, status string) error {
 	return nil
 }
 
-func (e *Engine) bounce(num int, reason string) {
+func gateOutcomeStatus(status string) string {
+	if status == "failure" {
+		return "failure"
+	}
+	return "error"
+}
+
+func (e *Engine) bounce(num int, reason, statusState, debugURL string) {
 	e.cfg.Metrics.IncBounce(e.metricLabels())
+	if pr, err := e.fc.GetPR(e.cfg.Owner, e.cfg.Repo, num); err == nil && pr.State == "open" && !pr.Merged {
+		e.notifyPR(num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true)
+	}
 	_ = e.fc.CancelAutomerge(e.cfg.Owner, e.cfg.Repo, num)
-	_ = e.fc.Comment(e.cfg.Owner, e.cfg.Repo, num, "Bounced from the merge queue: "+reason)
 	log.Printf("queue: bounced #%d: %s", num, reason)
 }
 
@@ -563,6 +582,9 @@ func (e *Engine) syncQueueComments() error {
 			continue
 		}
 		body := e.queueCommentNotQueuedBody()
+		if terminal, ok := e.terminalQueueComments[num]; ok {
+			body = terminal
+		}
 		if e.queueComments[num] != body {
 			if err := e.fc.UpsertComment(e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, body); err != nil {
 				if firstErr == nil {
@@ -571,7 +593,9 @@ func (e *Engine) syncQueueComments() error {
 				continue
 			}
 		}
-		delete(e.queueComments, num)
+		if _, terminal := e.terminalQueueComments[num]; !terminal {
+			delete(e.queueComments, num)
+		}
 	}
 	return firstErr
 }
@@ -659,6 +683,73 @@ func (e *Engine) queueCommentNotQueuedBody() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (e *Engine) queueCommentTerminalBody(title, detail, debugURL string) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, queueCommentMarker)
+	fmt.Fprintln(&b, "**Merge queue status**")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "- Repository: `%s/%s`\n", e.cfg.Owner, e.cfg.Repo)
+	fmt.Fprintf(&b, "- Base: `%s`\n", e.cfg.Base)
+	fmt.Fprintf(&b, "- State: %s\n", title)
+	if detail != "" {
+		fmt.Fprintf(&b, "- Detail: %s\n", detail)
+	}
+	if debugURL != "" {
+		fmt.Fprintf(&b, "- Debug: [staging run/commit](%s)\n", debugURL)
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (e *Engine) notifyPR(num int, sha, statusState, title, detail, debugURL string, durableComment bool) {
+	if statusState != "" && sha != "" {
+		if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, sha, e.cfg.StatusCtx, statusState, statusDescription(title), debugURL); err != nil {
+			log.Printf("queue: notify #%d: set status: %v", num, err)
+		}
+	}
+	body := terminalCommentBody(title, detail, debugURL)
+	if e.cfg.QueueComments {
+		sticky := e.queueCommentTerminalBody(title, detail, debugURL)
+		if err := e.fc.UpsertComment(e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, sticky); err != nil {
+			log.Printf("queue: notify #%d: update sticky comment: %v", num, err)
+		} else {
+			e.queueComments[num] = sticky
+			e.terminalQueueComments[num] = sticky
+		}
+	}
+	if durableComment {
+		if err := e.fc.Comment(e.cfg.Owner, e.cfg.Repo, num, body); err != nil {
+			log.Printf("queue: notify #%d: comment: %v", num, err)
+		}
+	}
+}
+
+func terminalCommentBody(title, detail, debugURL string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**%s**\n", title)
+	if detail != "" {
+		fmt.Fprintf(&b, "\n%s\n", detail)
+	}
+	if debugURL != "" {
+		fmt.Fprintf(&b, "\nDebug: [staging run/commit](%s)\n", debugURL)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func statusDescription(title string) string {
+	switch title {
+	case "Bounced from merge queue":
+		return "merge queue: PR rejected"
+	case "Skipped by merge queue":
+		return "merge queue: PR skipped; re-queued if still eligible"
+	case "Merge did not complete":
+		return "merge queue: merge did not complete; re-queued"
+	default:
+		return "merge queue: " + strings.ToLower(title)
+	}
+}
+
 func (e *Engine) activeSummary() string {
 	if len(e.active) == 0 {
 		return ""
@@ -684,6 +775,17 @@ func (e *Engine) commitURL(sha string) string {
 		base = e.cfg.InstanceURL
 	}
 	return fmt.Sprintf("%s/%s/%s/commit/%s", base, e.cfg.Owner, e.cfg.Repo, sha)
+}
+
+func (e *Engine) debugURL(a *activeBatch) string {
+	targetURL, err := e.fc.RunTargetURL(e.cfg.Owner, e.cfg.Repo, a.stagingSHA, a.stagingBranch)
+	if err != nil {
+		log.Printf("queue: run target lookup for %s: %v", short(a.stagingSHA), err)
+	}
+	if targetURL != "" {
+		return targetURL
+	}
+	return e.commitURL(a.stagingSHA)
 }
 
 func numbersOf(prs []forge.PullRequest) []int {

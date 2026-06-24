@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- Source PRs now receive explicit terminal queue feedback: landed, rejected,
+  skipped/requeued, and merge-error outcomes include commit statuses, durable
+  comments, and staging debug links when available.
+
 ## [0.3.0] - 2026-06-23
 
 v0.3.0 adds the first operational hardening layer on top of the v0.2 queue:
