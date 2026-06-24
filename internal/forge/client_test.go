@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -287,6 +288,71 @@ func TestRunStatusSucceedsWhenNewestMatchingTasksAreTerminalGreen(t *testing.T) 
 	}
 }
 
+func TestRunStatusUsesRunAggregateBeforeMaterializedTaskRows(t *testing.T) {
+	c := newRunStatusDualEndpointClient(t,
+		runsResponse{WorkflowRuns: []workflowRun{
+			{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 8, WorkflowID: "ci.yaml", Status: "running"},
+		}},
+		tasksResponse{WorkflowRuns: []workflowTask{
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+	)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("RunStatus = %q, want running", status)
+	}
+}
+
+func TestRunStatusWaitsWhenRunEndpointHasNoMatchingRun(t *testing.T) {
+	c := newRunStatusDualEndpointClient(t,
+		runsResponse{WorkflowRuns: []workflowRun{
+			{CommitSHA: "other", PrettyRef: "mq/main/staging", IndexInRepo: 9, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+		tasksResponse{WorkflowRuns: []workflowTask{
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+	)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "" {
+		t.Fatalf("RunStatus = %q, want wait/unknown", status)
+	}
+}
+
+func TestRunStatusReadsPaginatedRuns(t *testing.T) {
+	firstPage := make([]workflowRun, runPageLimit)
+	for i := range firstPage {
+		firstPage[i] = workflowRun{CommitSHA: "other", PrettyRef: "mq/main/staging", IndexInRepo: i + 1, WorkflowID: "ci.yaml", Status: "success"}
+	}
+	c := newRunStatusPagedDualEndpointClient(t,
+		[]runsResponse{
+			{WorkflowRuns: firstPage},
+			{WorkflowRuns: []workflowRun{
+				{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: runPageLimit + 1, WorkflowID: "ci.yaml", Status: "running"},
+			}},
+		},
+		tasksResponse{WorkflowRuns: []workflowTask{
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+	)
+
+	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("RunStatus = %q, want running from paginated run", status)
+	}
+}
+
 func TestRunStatusReadsPaginatedTasks(t *testing.T) {
 	firstPage := make([]workflowTask, taskPageLimit)
 	for i := range firstPage {
@@ -325,6 +391,25 @@ func TestRunTargetURLReturnsNewestMatchingHTMLURL(t *testing.T) {
 	}
 }
 
+func TestRunTargetURLUsesRunAggregateURL(t *testing.T) {
+	c := newRunStatusDualEndpointClient(t,
+		runsResponse{WorkflowRuns: []workflowRun{
+			{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 8, WorkflowID: "ci.yaml", Status: "success", HTMLURL: "https://forge/o/r/actions/runs/8"},
+		}},
+		tasksResponse{WorkflowRuns: []workflowTask{
+			{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success", HTMLURL: "https://forge/o/r/actions/tasks/8"},
+		}},
+	)
+
+	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "https://forge/o/r/actions/runs/8" {
+		t.Fatalf("RunTargetURL = %q, want run aggregate URL", u)
+	}
+}
+
 func TestRunTargetURLFallsBackToTargetURL(t *testing.T) {
 	payload := tasksResponse{WorkflowRuns: []workflowTask{
 		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success", TargetURL: "https://forge/o/r/actions/runs/8"},
@@ -343,6 +428,10 @@ func TestRunTargetURLFallsBackToTargetURL(t *testing.T) {
 func newRunStatusTestClient(t *testing.T, payload tasksResponse) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/repos/o/r/actions/runs" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if r.URL.Path != "/api/v1/repos/o/r/actions/tasks" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -354,9 +443,68 @@ func newRunStatusTestClient(t *testing.T, payload tasksResponse) *Client {
 	return New(srv.URL, "token")
 }
 
+func newRunStatusDualEndpointClient(t *testing.T, runs runsResponse, tasks tasksResponse) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/o/r/actions/runs":
+			if err := json.NewEncoder(w).Encode(runs); err != nil {
+				t.Fatal(err)
+			}
+		case "/api/v1/repos/o/r/actions/tasks":
+			if err := json.NewEncoder(w).Encode(tasks); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "token")
+}
+
+func newRunStatusPagedDualEndpointClient(t *testing.T, runs []runsResponse, tasks tasksResponse) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/o/r/actions/runs":
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			pageNum, err := strconv.Atoi(page)
+			if err != nil {
+				t.Fatalf("invalid page %q", page)
+			}
+			idx := pageNum - 1
+			if idx < 0 || idx >= len(runs) {
+				if err := json.NewEncoder(w).Encode(runsResponse{}); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err := json.NewEncoder(w).Encode(runs[idx]); err != nil {
+				t.Fatal(err)
+			}
+		case "/api/v1/repos/o/r/actions/tasks":
+			if err := json.NewEncoder(w).Encode(tasks); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "token")
+}
+
 func newRunStatusPagedTestClient(t *testing.T, pages ...tasksResponse) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/repos/o/r/actions/runs" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if r.URL.Path != "/api/v1/repos/o/r/actions/tasks" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}

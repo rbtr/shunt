@@ -294,6 +294,10 @@ func (e *Engine) land(a *activeBatch) (bool, error) {
 				return false, fmt.Errorf("merge #%d failed: %v; also failed to revalidate after merge error: %w", pr.Number, mErr, err)
 			}
 			if !ok {
+				if current.Merged {
+					mErr = nil
+					break
+				}
 				if err := e.fc.SetCommitStatus(e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", a.debugURL); err != nil {
 					return false, fmt.Errorf("merge #%d failed after PR changed: %v; also failed to reset status: %w", pr.Number, mErr, err)
 				}

@@ -78,8 +78,22 @@ type tasksResponse struct {
 	WorkflowRuns []workflowTask `json:"workflow_runs"`
 }
 
+type workflowRun struct {
+	CommitSHA   string `json:"commit_sha"`
+	PrettyRef   string `json:"prettyref"`
+	IndexInRepo int    `json:"index_in_repo"`
+	WorkflowID  string `json:"workflow_id"`
+	Status      string `json:"status"`
+	HTMLURL     string `json:"html_url"`
+}
+
+type runsResponse struct {
+	WorkflowRuns []workflowRun `json:"workflow_runs"`
+}
+
 const branchPageLimit = 50
 const taskPageLimit = 100
+const runPageLimit = 50
 
 func (c *Client) do(method, path string, body, out any) error {
 	var rdr io.Reader
@@ -203,9 +217,21 @@ func (c *Client) AutomergeScheduled(owner, repo string, index int) (bool, error)
 }
 
 // RunStatus returns the aggregate gate workflow status for (sha, branch), or ""
-// if no run exists yet. Forgejo's actions/tasks API is job-shaped despite the
-// workflow_runs field name, so aggregate all tasks from the newest matching run.
+// if no run exists yet. Prefer Forgejo's run-level status because dependent task
+// rows are materialized lazily in multi-job workflows.
 func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
+	runs, err := c.listActionRuns(owner, repo)
+	if err == nil {
+		if run := latestMatchingRun(runs, sha, branch); run != nil {
+			if run.Status != "" {
+				return run.Status, nil
+			}
+		}
+		return "", nil
+	} else if !strings.Contains(err.Error(), "http 404") {
+		return "", err
+	}
+
 	tasks, err := c.listActionTasks(owner, repo)
 	if err != nil {
 		return "", err
@@ -258,6 +284,17 @@ func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
 // when Forgejo/Gitea exposes one. Not every version includes this in the task
 // payload, so an empty URL is a valid "not available" result.
 func (c *Client) RunTargetURL(owner, repo, sha, branch string) (string, error) {
+	runs, err := c.listActionRuns(owner, repo)
+	if err == nil {
+		if run := latestMatchingRun(runs, sha, branch); run != nil {
+			if run.HTMLURL != "" {
+				return run.HTMLURL, nil
+			}
+		}
+	} else if !strings.Contains(err.Error(), "http 404") {
+		return "", err
+	}
+
 	tasks, err := c.listActionTasks(owner, repo)
 	if err != nil {
 		return "", err
@@ -283,6 +320,20 @@ func (c *Client) RunTargetURL(owner, repo, sha, branch string) (string, error) {
 	return "", nil
 }
 
+func latestMatchingRun(runs []workflowRun, sha, branch string) *workflowRun {
+	var out *workflowRun
+	for i := range runs {
+		run := &runs[i]
+		if run.CommitSHA != sha || (branch != "" && run.PrettyRef != branch) {
+			continue
+		}
+		if out == nil || run.IndexInRepo > out.IndexInRepo {
+			out = run
+		}
+	}
+	return out
+}
+
 func latestRun(tasks []workflowTask, sha, branch string) (int, string) {
 	var runNumber int
 	var workflowID string
@@ -295,6 +346,20 @@ func latestRun(tasks []workflowTask, sha, branch string) (int, string) {
 		}
 	}
 	return runNumber, workflowID
+}
+
+func (c *Client) listActionRuns(owner, repo string) ([]workflowRun, error) {
+	var out []workflowRun
+	for page := 1; ; page++ {
+		var rr runsResponse
+		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs?limit=%d&page=%d", repoPath(owner, repo), runPageLimit, page), nil, &rr); err != nil {
+			return nil, err
+		}
+		out = append(out, rr.WorkflowRuns...)
+		if len(rr.WorkflowRuns) < runPageLimit {
+			return out, nil
+		}
+	}
 }
 
 func (c *Client) listActionTasks(owner, repo string) ([]workflowTask, error) {
