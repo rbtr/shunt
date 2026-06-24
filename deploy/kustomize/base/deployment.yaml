@@ -33,6 +33,9 @@ spec:
               value: "1"
             - name: SHUNT_QUEUE_COMMENTS
               value: "false"
+            # Set this to the public /webhook URL to let shunt create repo webhooks.
+            # - name: SHUNT_WEBHOOK_URL
+            #   value: "https://shunt.example.com/webhook"
             - name: HOME
               value: "/tmp"
             - name: SHUNT_TOKEN

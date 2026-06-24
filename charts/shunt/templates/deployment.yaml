@@ -71,6 +71,17 @@ spec:
             {{- end }}
             - name: SHUNT_LISTEN
               value: {{ .Values.config.listen | quote }}
+            {{- if .Values.config.webhookUrl }}
+            - name: SHUNT_WEBHOOK_URL
+              value: {{ .Values.config.webhookUrl | quote }}
+            {{- end }}
+            {{- if .Values.webhookSecret.existingSecret }}
+            - name: SHUNT_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.webhookSecret.existingSecret | quote }}
+                  key: {{ .Values.webhookSecret.key | quote }}
+            {{- end }}
             - name: HOME
               value: /tmp
             - name: SHUNT_TOKEN

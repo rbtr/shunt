@@ -42,6 +42,9 @@ spec:
               value: "merge-queue"
             - name: SHUNT_QUEUE_COMMENTS
               value: "false"
+            # Set this to the public /webhook URL to let shunt create repo webhooks.
+            # - name: SHUNT_WEBHOOK_URL
+            #   value: "https://shunt.example.com/webhook"
             - name: HOME # git writes config/temp here
               value: "/tmp"
             - name: SHUNT_TOKEN

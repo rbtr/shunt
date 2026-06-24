@@ -149,6 +149,72 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 	}
 }
 
+func TestRefreshEnsuresWebhookWhenConfigured(t *testing.T) {
+	var createdHook map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/search":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
+				"name":           "r",
+				"default_branch": "main",
+				"owner":          map[string]string{"login": "o"},
+			}}})
+		case "/api/v1/repos/o/r/raw/.shunt.yml":
+			http.NotFound(w, r)
+		case "/api/v1/repos/o/r/branch_protections/main":
+			_ = json.NewEncoder(w).Encode(forge.BranchProtection{
+				EnableStatusCheck:      true,
+				StatusCheckContexts:    []string{"merge-queue"},
+				EnablePush:             true,
+				EnablePushWhitelist:    true,
+				PushWhitelistUsernames: []string{"bot"},
+			})
+		case "/api/v1/repos/o/r/hooks":
+			switch r.Method {
+			case http.MethodGet:
+				_ = json.NewEncoder(w).Encode([]forge.Hook{})
+			case http.MethodPost:
+				if err := json.NewDecoder(r.Body).Decode(&createdHook); err != nil {
+					t.Fatalf("decode hook body: %v", err)
+				}
+				w.WriteHeader(http.StatusCreated)
+			default:
+				t.Fatalf("hook method = %s", r.Method)
+			}
+		case "/api/v1/repos/o/r/branches":
+			_ = json.NewEncoder(w).Encode([]forge.Branch{})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	m := New(forge.New(srv.URL, "token"), Config{
+		Topic:         "merge-queue",
+		StatusCtx:     "merge-queue",
+		MergeStyle:    "merge",
+		BisectFanout:  1,
+		WebhookURL:    "https://shunt.example.com/webhook",
+		WebhookSecret: "secret",
+		InstanceURL:   srv.URL,
+		PublicURL:     srv.URL,
+		Token:         "token",
+		BotUser:       "bot",
+		BotEmail:      "bot@example.invalid",
+		Metrics:       metrics.New(),
+	})
+	if err := m.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if createdHook == nil {
+		t.Fatal("webhook was not created")
+	}
+	config := createdHook["config"].(map[string]any)
+	if config["url"] != "https://shunt.example.com/webhook" || config["secret"] != "secret" {
+		t.Fatalf("hook config = %#v", config)
+	}
+}
+
 func TestRefreshRejectsInvalidRepoConfig(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

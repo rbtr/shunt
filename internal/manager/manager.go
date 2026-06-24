@@ -24,6 +24,8 @@ type Config struct {
 	BatchTarget   int
 	BisectFanout  int
 	QueueComments bool
+	WebhookURL    string
+	WebhookSecret string
 	InstanceURL   string
 	PublicURL     string
 	Token         string
@@ -75,6 +77,12 @@ func (m *Manager) Refresh() error {
 			continue
 		} else if changed {
 			log.Printf("manager: %s: configured branch protection", k)
+		}
+		if changed, err := m.fc.EnsureWebhook(r.Owner, r.Name, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
+			log.Printf("manager: %s: ensure webhook: %v", k, err)
+			continue
+		} else if changed {
+			log.Printf("manager: %s: configured webhook", k)
 		}
 		if deleted, err := m.fc.PruneStagingBranches(r.Owner, r.Name, settings.Base); err != nil {
 			log.Printf("manager: %s: staging branch gc: %v", k, err)

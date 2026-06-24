@@ -52,6 +52,25 @@ type BranchProtection struct {
 	PushWhitelistUsernames []string `json:"push_whitelist_usernames"`
 }
 
+// Hook is the subset of a Forgejo/Gitea repository webhook we manage.
+type Hook struct {
+	ID     int64             `json:"id"`
+	Type   string            `json:"type"`
+	Config map[string]string `json:"config"`
+	Events []string          `json:"events"`
+	Active bool              `json:"active"`
+}
+
+var shuntWebhookEvents = []string{
+	"auto_merge_pull_request",
+	"pull_request",
+	"pull_request_review_approved",
+	"pull_request_review_rejected",
+	"pull_request_review_comment",
+	"push",
+	"status",
+}
+
 // EnsureBranchProtection makes sure base requires statusCtx and that botUser may
 // push. It is additive: it never removes existing contexts or whitelist entries.
 func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser string) (changed bool, err error) {
@@ -101,6 +120,56 @@ func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser st
 	return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), body, nil)
 }
 
+// EnsureWebhook makes sure the repository has one active shunt webhook pointing
+// at targetURL. It only manages hooks with the same URL, so unrelated operator
+// hooks are left alone.
+func (c *Client) EnsureWebhook(owner, repo, targetURL, secret string) (changed bool, err error) {
+	targetURL = strings.TrimSpace(targetURL)
+	if targetURL == "" {
+		return false, nil
+	}
+	path := repoPath(owner, repo)
+	var hooks []Hook
+	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/hooks", path), nil, &hooks); err != nil {
+		return false, err
+	}
+	for _, hook := range hooks {
+		if hook.Type != "gitea" || hook.Config["url"] != targetURL {
+			continue
+		}
+		if webhookMatches(hook, targetURL, secret) {
+			return false, nil
+		}
+		return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/hooks/%d", path, hook.ID), webhookBody(targetURL, secret, false), nil)
+	}
+	return true, c.do(http.MethodPost, fmt.Sprintf("/repos/%s/hooks", path), webhookBody(targetURL, secret, true), nil)
+}
+
+func webhookBody(targetURL, secret string, includeType bool) map[string]any {
+	body := map[string]any{
+		"active": true,
+		"events": shuntWebhookEvents,
+		"config": map[string]string{
+			"url":          targetURL,
+			"content_type": "json",
+			"secret":       secret,
+		},
+	}
+	if includeType {
+		body["type"] = "gitea"
+	}
+	return body
+}
+
+func webhookMatches(hook Hook, targetURL, secret string) bool {
+	returnedSecret, hasReturnedSecret := hook.Config["secret"]
+	return hook.Active &&
+		sameStringSet(hook.Events, shuntWebhookEvents) &&
+		hook.Config["url"] == targetURL &&
+		hook.Config["content_type"] == "json" &&
+		(!hasReturnedSecret || returnedSecret == secret)
+}
+
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
@@ -108,4 +177,23 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, v := range a {
+		counts[v]++
+	}
+	for _, v := range b {
+		counts[v]--
+	}
+	for _, n := range counts {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
 }

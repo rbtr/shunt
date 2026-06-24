@@ -77,6 +77,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	webhookURL := strings.TrimSpace(os.Getenv("SHUNT_WEBHOOK_URL"))
+	webhookSecret := os.Getenv("SHUNT_WEBHOOK_SECRET")
 	interval, err := time.ParseDuration(env("SHUNT_POLL_INTERVAL", "10s"))
 	if err != nil {
 		log.Fatalf("bad SHUNT_POLL_INTERVAL: %v", err)
@@ -89,7 +91,7 @@ func main() {
 	metricsCollector := metrics.New()
 	wake := make(chan struct{}, 1)
 	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector, webhookConfig{
-		Secret: os.Getenv("SHUNT_WEBHOOK_SECRET"),
+		Secret: webhookSecret,
 		Wake:   wakeReconcile(wake),
 	})
 
@@ -98,6 +100,7 @@ func main() {
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
 			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout, QueueComments: queueComments,
+			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector,
 		})
@@ -132,6 +135,11 @@ func main() {
 		log.Printf("shunt: %s/%s@%s: staging branch gc: %v", owner, repo, base, err)
 	} else if len(deleted) > 0 {
 		log.Printf("shunt: %s/%s@%s: deleted stale staging branches: %s", owner, repo, base, strings.Join(deleted, ", "))
+	}
+	if changed, err := fc.EnsureWebhook(owner, repo, webhookURL, webhookSecret); err != nil {
+		log.Fatalf("shunt: %s/%s@%s: ensure webhook: %v", owner, repo, base, err)
+	} else if changed {
+		log.Printf("shunt: %s/%s@%s: configured webhook", owner, repo, base)
 	}
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
