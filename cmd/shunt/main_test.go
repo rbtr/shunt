@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -189,7 +190,7 @@ func TestEnvBool(t *testing.T) {
 
 func TestOpenCheckpointStoreDisabledByDefault(t *testing.T) {
 	t.Setenv("SHUNT_STATE_PATH", "")
-	store, err := openCheckpointStore()
+	store, err := openCheckpointStore(slog.Default())
 	if err != nil {
 		t.Fatalf("open checkpoint store: %v", err)
 	}
@@ -200,7 +201,7 @@ func TestOpenCheckpointStoreDisabledByDefault(t *testing.T) {
 
 func TestOpenCheckpointStoreUsesStatePath(t *testing.T) {
 	t.Setenv("SHUNT_STATE_PATH", t.TempDir()+"/shunt.db")
-	store, err := openCheckpointStore()
+	store, err := openCheckpointStore(slog.Default())
 	if err != nil {
 		t.Fatalf("open checkpoint store: %v", err)
 	}

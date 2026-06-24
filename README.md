@@ -161,8 +161,10 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 - `shunt_gate_outcomes_total{outcome="success|failure|cancelled|error"}` for
   terminal gate results.
 
-Metrics are process-local and intentionally minimal in v0.1: they do not persist
-across restarts and do not yet include time-in-queue histograms or a queue UI.
+Logs are structured JSON on stdout, with stable fields such as `component`,
+`owner`, `repo`, and `base` where they apply. Metrics are process-local and
+intentionally minimal in v0.3: they do not include persisted history,
+time-in-queue histograms, or a queue UI.
 
 Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
 keeps one sticky comment per queued PR, identified by a stable hidden marker, and

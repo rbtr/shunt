@@ -3,6 +3,7 @@
 package gitops
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,7 +37,7 @@ type MergedRef struct {
 // BuildStaging creates stagingBranch from base, merges each ref in order, force
 // pushes it, and returns the resulting SHA. On a merge conflict it returns the
 // offending PR number (conflictPR > 0) with an error.
-func (s *Stager) BuildStaging(base, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error) {
+func (s *Stager) BuildStaging(ctx context.Context, base, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error) {
 	parent, err := os.MkdirTemp("", "shunt-stage-")
 	if err != nil {
 		return "", 0, err
@@ -60,7 +61,7 @@ esac
 	}
 
 	run := func(args ...string) (string, error) {
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = parent
 		if len(args) > 0 && args[0] != "clone" {
 			cmd.Dir = dir

@@ -4,7 +4,7 @@
 # Build for your runtime arch (e.g. arm64 or amd64) with:
 #   podman build --platform linux/arm64 -t shunt:<tag> .
 #   docker buildx build --platform linux/amd64,linux/arm64 -t shunt:<tag> .
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.25-alpine@sha256:523c3effe300580ed375e43f43b1c9b091b68e935a7c3a92bfcc4e7ed55b18c2 AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY . .

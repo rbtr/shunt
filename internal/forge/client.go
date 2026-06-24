@@ -5,6 +5,7 @@ package forge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,7 +96,7 @@ const branchPageLimit = 50
 const taskPageLimit = 100
 const runPageLimit = 50
 
-func (c *Client) do(method, path string, body, out any) error {
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -104,7 +105,7 @@ func (c *Client) do(method, path string, body, out any) error {
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.apiBase+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, rdr)
 	if err != nil {
 		return err
 	}
@@ -130,7 +131,7 @@ func (c *Client) do(method, path string, body, out any) error {
 	return nil
 }
 
-func (c *Client) doRaw(method, path string, body any) ([]byte, error) {
+func (c *Client) doRaw(ctx context.Context, method, path string, body any) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -139,7 +140,7 @@ func (c *Client) doRaw(method, path string, body any) ([]byte, error) {
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.apiBase+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -166,9 +167,9 @@ func (c *Client) doRaw(method, path string, body any) ([]byte, error) {
 }
 
 // ListOpenPRs returns open PRs, optionally filtered to those targeting base.
-func (c *Client) ListOpenPRs(owner, repo, base string) ([]PullRequest, error) {
+func (c *Client) ListOpenPRs(ctx context.Context, owner, repo, base string) ([]PullRequest, error) {
 	var prs []PullRequest
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/pulls?state=open&limit=50", repoPath(owner, repo)), nil, &prs); err != nil {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls?state=open&limit=50", repoPath(owner, repo)), nil, &prs); err != nil {
 		return nil, err
 	}
 	if base == "" {
@@ -184,25 +185,25 @@ func (c *Client) ListOpenPRs(owner, repo, base string) ([]PullRequest, error) {
 }
 
 // GetPR fetches a single pull request.
-func (c *Client) GetPR(owner, repo string, index int) (PullRequest, error) {
+func (c *Client) GetPR(ctx context.Context, owner, repo string, index int) (PullRequest, error) {
 	var pr PullRequest
-	err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repoPath(owner, repo), index), nil, &pr)
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repoPath(owner, repo), index), nil, &pr)
 	return pr, err
 }
 
-func (c *Client) ReadFile(owner, repo, ref, path string) ([]byte, error) {
+func (c *Client) ReadFile(ctx context.Context, owner, repo, ref, path string) ([]byte, error) {
 	u := fmt.Sprintf("/repos/%s/raw/%s", repoPath(owner, repo), url.PathEscape(path))
 	if ref != "" {
 		u += "?ref=" + url.QueryEscape(ref)
 	}
-	return c.doRaw(http.MethodGet, u, nil)
+	return c.doRaw(ctx, http.MethodGet, u, nil)
 }
 
 // AutomergeScheduled scans the PR timeline newest-first for the canonical
 // auto-merge signals (Forgejo does not expose this on the PR object).
-func (c *Client) AutomergeScheduled(owner, repo string, index int) (bool, error) {
+func (c *Client) AutomergeScheduled(ctx context.Context, owner, repo string, index int) (bool, error) {
 	var tl []timelineComment
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/timeline", repoPath(owner, repo), index), nil, &tl); err != nil {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/timeline", repoPath(owner, repo), index), nil, &tl); err != nil {
 		return false, err
 	}
 	for i := len(tl) - 1; i >= 0; i-- {
@@ -219,8 +220,8 @@ func (c *Client) AutomergeScheduled(owner, repo string, index int) (bool, error)
 // RunStatus returns the aggregate gate workflow status for (sha, branch), or ""
 // if no run exists yet. Prefer Forgejo's run-level status because dependent task
 // rows are materialized lazily in multi-job workflows.
-func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
-	runs, err := c.listActionRuns(owner, repo)
+func (c *Client) RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error) {
+	runs, err := c.listActionRuns(ctx, owner, repo)
 	if err == nil {
 		if run := latestMatchingRun(runs, sha, branch); run != nil {
 			if run.Status != "" {
@@ -232,7 +233,7 @@ func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
 		return "", err
 	}
 
-	tasks, err := c.listActionTasks(owner, repo)
+	tasks, err := c.listActionTasks(ctx, owner, repo)
 	if err != nil {
 		return "", err
 	}
@@ -283,8 +284,8 @@ func (c *Client) RunStatus(owner, repo, sha, branch string) (string, error) {
 // RunTargetURL returns a browser/debug URL for the newest matching staging run
 // when Forgejo/Gitea exposes one. Not every version includes this in the task
 // payload, so an empty URL is a valid "not available" result.
-func (c *Client) RunTargetURL(owner, repo, sha, branch string) (string, error) {
-	runs, err := c.listActionRuns(owner, repo)
+func (c *Client) RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error) {
+	runs, err := c.listActionRuns(ctx, owner, repo)
 	if err == nil {
 		if run := latestMatchingRun(runs, sha, branch); run != nil {
 			if run.HTMLURL != "" {
@@ -295,7 +296,7 @@ func (c *Client) RunTargetURL(owner, repo, sha, branch string) (string, error) {
 		return "", err
 	}
 
-	tasks, err := c.listActionTasks(owner, repo)
+	tasks, err := c.listActionTasks(ctx, owner, repo)
 	if err != nil {
 		return "", err
 	}
@@ -348,11 +349,11 @@ func latestRun(tasks []workflowTask, sha, branch string) (int, string) {
 	return runNumber, workflowID
 }
 
-func (c *Client) listActionRuns(owner, repo string) ([]workflowRun, error) {
+func (c *Client) listActionRuns(ctx context.Context, owner, repo string) ([]workflowRun, error) {
 	var out []workflowRun
 	for page := 1; ; page++ {
 		var rr runsResponse
-		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs?limit=%d&page=%d", repoPath(owner, repo), runPageLimit, page), nil, &rr); err != nil {
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs?limit=%d&page=%d", repoPath(owner, repo), runPageLimit, page), nil, &rr); err != nil {
 			return nil, err
 		}
 		out = append(out, rr.WorkflowRuns...)
@@ -362,11 +363,11 @@ func (c *Client) listActionRuns(owner, repo string) ([]workflowRun, error) {
 	}
 }
 
-func (c *Client) listActionTasks(owner, repo string) ([]workflowTask, error) {
+func (c *Client) listActionTasks(ctx context.Context, owner, repo string) ([]workflowTask, error) {
 	var out []workflowTask
 	for page := 1; ; page++ {
 		var tr tasksResponse
-		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/actions/tasks?limit=%d&page=%d", repoPath(owner, repo), taskPageLimit, page), nil, &tr); err != nil {
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/tasks?limit=%d&page=%d", repoPath(owner, repo), taskPageLimit, page), nil, &tr); err != nil {
 			return nil, err
 		}
 		out = append(out, tr.WorkflowRuns...)
@@ -376,36 +377,36 @@ func (c *Client) listActionTasks(owner, repo string) ([]workflowTask, error) {
 	}
 }
 
-func (c *Client) SetCommitStatus(owner, repo, sha, context, state, desc, targetURL string) error {
-	return c.do(http.MethodPost, fmt.Sprintf("/repos/%s/statuses/%s", repoPath(owner, repo), url.PathEscape(sha)), map[string]string{
-		"state": state, "context": context, "description": desc, "target_url": targetURL,
+func (c *Client) SetCommitStatus(ctx context.Context, owner, repo, sha, statusContext, state, desc, targetURL string) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/statuses/%s", repoPath(owner, repo), url.PathEscape(sha)), map[string]string{
+		"state": state, "context": statusContext, "description": desc, "target_url": targetURL,
 	}, nil)
 }
 
-func (c *Client) MergePR(owner, repo string, index int, style, headSHA string) error {
-	return c.do(http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
+func (c *Client) MergePR(ctx context.Context, owner, repo string, index int, style, headSHA string) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
 		"Do": style, "head_commit_id": headSHA,
 	}, nil)
 }
 
 // CancelAutomerge removes a scheduled auto-merge; a 404 (none scheduled) is ok.
-func (c *Client) CancelAutomerge(owner, repo string, index int) error {
-	err := c.do(http.MethodDelete, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), nil, nil)
+func (c *Client) CancelAutomerge(ctx context.Context, owner, repo string, index int) error {
+	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), nil, nil)
 	if err != nil && strings.Contains(err.Error(), "http 404") {
 		return nil
 	}
 	return err
 }
 
-func (c *Client) Comment(owner, repo string, index int, body string) error {
-	return c.do(http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repoPath(owner, repo), index), map[string]string{"body": body}, nil)
+func (c *Client) Comment(ctx context.Context, owner, repo string, index int, body string) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repoPath(owner, repo), index), map[string]string{"body": body}, nil)
 }
 
-func (c *Client) ListBranches(owner, repo string) ([]Branch, error) {
+func (c *Client) ListBranches(ctx context.Context, owner, repo string) ([]Branch, error) {
 	var out []Branch
 	for page := 1; ; page++ {
 		var branches []Branch
-		if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/branches?limit=%d&page=%d", repoPath(owner, repo), branchPageLimit, page), nil, &branches); err != nil {
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branches?limit=%d&page=%d", repoPath(owner, repo), branchPageLimit, page), nil, &branches); err != nil {
 			return nil, err
 		}
 		out = append(out, branches...)
@@ -416,8 +417,8 @@ func (c *Client) ListBranches(owner, repo string) ([]Branch, error) {
 }
 
 // PruneStagingBranches deletes stale shunt-owned staging branches for base.
-func (c *Client) PruneStagingBranches(owner, repo, base string) ([]string, error) {
-	branches, err := c.ListBranches(owner, repo)
+func (c *Client) PruneStagingBranches(ctx context.Context, owner, repo, base string) ([]string, error) {
+	branches, err := c.ListBranches(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -426,7 +427,7 @@ func (c *Client) PruneStagingBranches(owner, repo, base string) ([]string, error
 		if !isShuntStagingBranch(base, branch.Name) {
 			continue
 		}
-		if err := c.DeleteBranch(owner, repo, branch.Name); err != nil {
+		if err := c.DeleteBranch(ctx, owner, repo, branch.Name); err != nil {
 			return deleted, fmt.Errorf("delete branch %q: %w", branch.Name, err)
 		}
 		deleted = append(deleted, branch.Name)
@@ -434,9 +435,9 @@ func (c *Client) PruneStagingBranches(owner, repo, base string) ([]string, error
 	return deleted, nil
 }
 
-func (c *Client) UpsertComment(owner, repo string, index int, marker, botUser, body string) error {
+func (c *Client) UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error {
 	var comments []IssueComment
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?limit=50", repoPath(owner, repo), index), nil, &comments); err != nil {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?limit=50", repoPath(owner, repo), index), nil, &comments); err != nil {
 		return err
 	}
 	for _, comment := range comments {
@@ -449,13 +450,13 @@ func (c *Client) UpsertComment(owner, repo string, index int, marker, botUser, b
 		if comment.Body == body {
 			return nil
 		}
-		return c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), comment.ID), map[string]string{"body": body}, nil)
+		return c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), comment.ID), map[string]string{"body": body}, nil)
 	}
-	return c.Comment(owner, repo, index, body)
+	return c.Comment(ctx, owner, repo, index, body)
 }
 
-func (c *Client) DeleteBranch(owner, repo, branch string) error {
-	err := c.do(http.MethodDelete, fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil, nil)
+func (c *Client) DeleteBranch(ctx context.Context, owner, repo, branch string) error {
+	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil, nil)
 	if err != nil && strings.Contains(err.Error(), "http 404") {
 		return nil
 	}

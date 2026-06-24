@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.23"
+          go-version: "1.25"
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
       - name: vet
@@ -23,6 +23,12 @@ jobs:
         run: go build ./...
       - name: test
         run: go test ./...
+      - name: race
+        run: go test -race ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
+          govulncheck ./...
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
       - name: helm lint
         run: helm lint charts/shunt

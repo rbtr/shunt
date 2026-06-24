@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -24,7 +25,7 @@ func TestEnsureWebhookCreatesMissingHook(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, err := New(srv.URL, "token").EnsureWebhook("o", "r", "https://shunt.example.com/webhook", "secret")
+	changed, err := New(srv.URL, "token").EnsureWebhook(context.Background(), "o", "r", "https://shunt.example.com/webhook", "secret")
 	if err != nil {
 		t.Fatalf("EnsureWebhook: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestEnsureWebhookUpdatesExistingManagedHook(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, err := New(srv.URL, "token").EnsureWebhook("o", "r", "https://shunt.example.com/webhook", "")
+	changed, err := New(srv.URL, "token").EnsureWebhook(context.Background(), "o", "r", "https://shunt.example.com/webhook", "")
 	if err != nil {
 		t.Fatalf("EnsureWebhook: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestEnsureWebhookLeavesMatchingHookAlone(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, err := New(srv.URL, "token").EnsureWebhook("o", "r", "https://shunt.example.com/webhook", "secret")
+	changed, err := New(srv.URL, "token").EnsureWebhook(context.Background(), "o", "r", "https://shunt.example.com/webhook", "secret")
 	if err != nil {
 		t.Fatalf("EnsureWebhook: %v", err)
 	}
@@ -113,7 +114,7 @@ func TestEnsureWebhookTreatsRedactedSecretAsMatching(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	changed, err := New(srv.URL, "token").EnsureWebhook("o", "r", "https://shunt.example.com/webhook", "secret")
+	changed, err := New(srv.URL, "token").EnsureWebhook(context.Background(), "o", "r", "https://shunt.example.com/webhook", "secret")
 	if err != nil {
 		t.Fatalf("EnsureWebhook: %v", err)
 	}

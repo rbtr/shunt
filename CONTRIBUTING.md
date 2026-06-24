@@ -24,7 +24,7 @@ make test    # unit tests — the bisection state machine is mock-driven
 make lint    # gofmt + go vet (the CI gate)
 ```
 
-Requires Go 1.23+. There are **no external dependencies** — please keep it that
+Requires Go 1.25+. There are **no external dependencies** — please keep it that
 way unless there's a compelling reason.
 
 ## Pull requests

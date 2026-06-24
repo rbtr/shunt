@@ -14,7 +14,7 @@ type CheckpointStore interface {
 	DeleteQueue(ctx context.Context, key checkpoint.QueueKey) error
 }
 
-func (e *Engine) loadCheckpoint() error {
+func (e *Engine) loadCheckpoint(ctx context.Context) error {
 	if e.checkpointLoaded {
 		return nil
 	}
@@ -22,7 +22,7 @@ func (e *Engine) loadCheckpoint() error {
 		e.checkpointLoaded = true
 		return nil
 	}
-	snapshot, ok, err := e.cfg.Checkpoint.LoadQueue(context.Background(), e.queueKey())
+	snapshot, ok, err := e.cfg.Checkpoint.LoadQueue(ctx, e.queueKey())
 	if err != nil {
 		return fmt.Errorf("load queue checkpoint: %w", err)
 	}
@@ -42,7 +42,7 @@ func (e *Engine) loadCheckpoint() error {
 	return nil
 }
 
-func (e *Engine) saveCheckpoint() error {
+func (e *Engine) saveCheckpoint(ctx context.Context) error {
 	if e.cfg.Checkpoint == nil || !e.checkpointLoaded {
 		return nil
 	}
@@ -50,7 +50,7 @@ func (e *Engine) saveCheckpoint() error {
 		if !e.checkpointExists {
 			return nil
 		}
-		if err := e.cfg.Checkpoint.DeleteQueue(context.Background(), e.queueKey()); err != nil {
+		if err := e.cfg.Checkpoint.DeleteQueue(ctx, e.queueKey()); err != nil {
 			return fmt.Errorf("delete queue checkpoint: %w", err)
 		}
 		e.checkpointExists = false
@@ -60,7 +60,7 @@ func (e *Engine) saveCheckpoint() error {
 	if err := snapshot.Validate(); err != nil {
 		return err
 	}
-	if err := e.cfg.Checkpoint.SaveQueue(context.Background(), snapshot); err != nil {
+	if err := e.cfg.Checkpoint.SaveQueue(ctx, snapshot); err != nil {
 		return fmt.Errorf("save queue checkpoint: %w", err)
 	}
 	e.checkpointExists = true

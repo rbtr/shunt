@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -28,9 +29,9 @@ type repoSearchResp struct {
 }
 
 // SearchReposByTopic returns non-archived repos carrying the given topic.
-func (c *Client) SearchReposByTopic(topic string) ([]RepoRef, error) {
+func (c *Client) SearchReposByTopic(ctx context.Context, topic string) ([]RepoRef, error) {
 	var r repoSearchResp
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/search?q=%s&topic=true&limit=50", url.QueryEscape(topic)), nil, &r); err != nil {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/search?q=%s&topic=true&limit=50", url.QueryEscape(topic)), nil, &r); err != nil {
 		return nil, err
 	}
 	var out []RepoRef
@@ -73,11 +74,11 @@ var shuntWebhookEvents = []string{
 
 // EnsureBranchProtection makes sure base requires statusCtx and that botUser may
 // push. It is additive: it never removes existing contexts or whitelist entries.
-func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser string) (changed bool, err error) {
+func (c *Client) EnsureBranchProtection(ctx context.Context, owner, repo, base, statusCtx, botUser string) (changed bool, err error) {
 	var bp BranchProtection
 	path := repoPath(owner, repo)
 	branch := url.PathEscape(base)
-	getErr := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), nil, &bp)
+	getErr := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), nil, &bp)
 	if getErr != nil {
 		if !strings.Contains(getErr.Error(), "http 404") {
 			return false, getErr
@@ -92,7 +93,7 @@ func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser st
 			"required_approvals":       0,
 			"block_on_outdated_branch": false,
 		}
-		return true, c.do(http.MethodPost, fmt.Sprintf("/repos/%s/branch_protections", path), body, nil)
+		return true, c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/branch_protections", path), body, nil)
 	}
 	ctxs, wl := bp.StatusCheckContexts, bp.PushWhitelistUsernames
 	need := false
@@ -117,20 +118,20 @@ func (c *Client) EnsureBranchProtection(owner, repo, base, statusCtx, botUser st
 		"enable_push_whitelist":    true,
 		"push_whitelist_usernames": wl,
 	}
-	return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), body, nil)
+	return true, c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), body, nil)
 }
 
 // EnsureWebhook makes sure the repository has one active shunt webhook pointing
 // at targetURL. It only manages hooks with the same URL, so unrelated operator
 // hooks are left alone.
-func (c *Client) EnsureWebhook(owner, repo, targetURL, secret string) (changed bool, err error) {
+func (c *Client) EnsureWebhook(ctx context.Context, owner, repo, targetURL, secret string) (changed bool, err error) {
 	targetURL = strings.TrimSpace(targetURL)
 	if targetURL == "" {
 		return false, nil
 	}
 	path := repoPath(owner, repo)
 	var hooks []Hook
-	if err := c.do(http.MethodGet, fmt.Sprintf("/repos/%s/hooks", path), nil, &hooks); err != nil {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/hooks", path), nil, &hooks); err != nil {
 		return false, err
 	}
 	for _, hook := range hooks {
@@ -140,9 +141,9 @@ func (c *Client) EnsureWebhook(owner, repo, targetURL, secret string) (changed b
 		if webhookMatches(hook, targetURL, secret) {
 			return false, nil
 		}
-		return true, c.do(http.MethodPatch, fmt.Sprintf("/repos/%s/hooks/%d", path, hook.ID), webhookBody(targetURL, secret, false), nil)
+		return true, c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/hooks/%d", path, hook.ID), webhookBody(targetURL, secret, false), nil)
 	}
-	return true, c.do(http.MethodPost, fmt.Sprintf("/repos/%s/hooks", path), webhookBody(targetURL, secret, true), nil)
+	return true, c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/hooks", path), webhookBody(targetURL, secret, true), nil)
 }
 
 func webhookBody(targetURL, secret string, includeType bool) map[string]any {

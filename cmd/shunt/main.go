@@ -4,17 +4,20 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	checkpointbolt "github.com/rbtr/shunt/internal/checkpoint/bolt"
@@ -49,59 +52,66 @@ func envBool(k string, def bool) (bool, error) {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	baseLogger := slog.Default()
+	logger := baseLogger.With("component", "main")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	instance := os.Getenv("SHUNT_INSTANCE")
 	if instance == "" {
-		log.Fatal("SHUNT_INSTANCE required (e.g. https://forge.example.com)")
+		fatal(logger, "SHUNT_INSTANCE required")
 	}
 	publicURL := env("SHUNT_PUBLIC_URL", instance)
 	token := os.Getenv("SHUNT_TOKEN")
 	if token == "" {
-		log.Fatal("SHUNT_TOKEN required")
+		fatal(logger, "SHUNT_TOKEN required")
 	}
 	botUser := env("SHUNT_BOT_USER", "mq-bot")
 	botEmail := env("SHUNT_BOT_EMAIL", botUser+"@noreply.invalid")
 	statusCtx := env("SHUNT_STATUS_CONTEXT", "merge-queue")
 	mergeStyle, err := normalizeMergeStyle(env("SHUNT_MERGE_STYLE", "merge"))
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "config error", "error", err)
 	}
 	maxBatch, _ := strconv.Atoi(env("SHUNT_MAX_BATCH", "0"))
 	batchTarget, err := strconv.Atoi(env("SHUNT_BATCH_TARGET", "0"))
 	if err != nil || batchTarget < 0 {
-		log.Fatalf("bad SHUNT_BATCH_TARGET: must be a non-negative integer")
+		fatal(logger, "bad SHUNT_BATCH_TARGET")
 	}
 	bisectFanout, err := strconv.Atoi(env("SHUNT_BISECT_FANOUT", "1"))
 	if err != nil || bisectFanout < 1 {
-		log.Fatalf("bad SHUNT_BISECT_FANOUT: must be a positive integer")
+		fatal(logger, "bad SHUNT_BISECT_FANOUT")
 	}
 	queueComments, err := envBool("SHUNT_QUEUE_COMMENTS", false)
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "config error", "error", err)
 	}
 	webhookURL := strings.TrimSpace(os.Getenv("SHUNT_WEBHOOK_URL"))
 	webhookSecret := os.Getenv("SHUNT_WEBHOOK_SECRET")
 	interval, err := time.ParseDuration(env("SHUNT_POLL_INTERVAL", "10s"))
 	if err != nil {
-		log.Fatalf("bad SHUNT_POLL_INTERVAL: %v", err)
+		fatal(logger, "bad SHUNT_POLL_INTERVAL", "error", err)
 	}
 	batchLinger, err := time.ParseDuration(env("SHUNT_BATCH_LINGER", "0"))
 	if err != nil || batchLinger < 0 {
-		log.Fatalf("bad SHUNT_BATCH_LINGER: must be a non-negative duration")
+		fatal(logger, "bad SHUNT_BATCH_LINGER")
 	}
 
 	metricsCollector := metrics.New()
-	checkpointStore, err := openCheckpointStore()
+	checkpointStore, err := openCheckpointStore(logger)
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "checkpoint store error", "error", err)
 	}
 	if checkpointStore != nil {
 		defer checkpointStore.Close()
 	}
 	wake := make(chan struct{}, 1)
-	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector, webhookConfig{
+	webhook := webhookConfig{
 		Secret: webhookSecret,
 		Wake:   wakeReconcile(wake),
-	})
+		Logger: baseLogger.With("component", "webhook"),
+	}
 
 	fc := forge.New(instance, token)
 
@@ -111,60 +121,73 @@ func main() {
 			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector, Checkpoint: checkpointStore,
+			Logger:       baseLogger.With("component", "manager"),
+			EngineLogger: baseLogger.With("component", "engine"),
 		})
-		log.Printf("shunt: multi-repo mode, topic=%q every %s", topic, interval)
-		runReconcileLoop(interval, wake, func() {
-			if err := mgr.Refresh(); err != nil {
-				log.Printf("discovery error: %v", err)
+		logger.Info("multi-repo mode", "topic", topic, "interval", interval)
+		if err := runDaemon(ctx, baseLogger, env("SHUNT_LISTEN", ":8080"), metricsCollector, webhook, interval, wake, func(ctx context.Context) {
+			if err := mgr.Refresh(ctx); err != nil {
+				logger.Error("discovery failed", "error", err)
 			}
-			mgr.Tick()
-		})
+			mgr.Tick(ctx)
+		}); err != nil {
+			fatal(logger, "daemon failed", "error", err)
+		}
+		return
 	}
 
 	// Single-repo mode.
 	parts := strings.SplitN(os.Getenv("SHUNT_REPO"), "/", 2)
 	if len(parts) != 2 {
-		log.Fatal("set SHUNT_TOPIC or SHUNT_REPO=owner/repo")
+		fatal(logger, "set SHUNT_TOPIC or SHUNT_REPO")
 	}
 	owner, repo := parts[0], parts[1]
 	base := env("SHUNT_BASE", "main")
 	settings := repoconfig.Settings{
 		Base: base, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
 	}
-	if data, err := fc.ReadFile(owner, repo, base, repoconfig.FileName); errors.Is(err, forge.ErrNotFound) {
+	if data, err := fc.ReadFile(ctx, owner, repo, base, repoconfig.FileName); errors.Is(err, forge.ErrNotFound) {
 		// No per-repo config; keep global defaults.
 	} else if err != nil {
-		log.Fatalf("%s/%s: read %s: %v", owner, repo, repoconfig.FileName, err)
+		fatal(logger, "repo config read failed", "owner", owner, "repo", repo, "path", repoconfig.FileName, "error", err)
 	} else if settings, err = repoconfig.Apply(data, settings); err != nil {
-		log.Fatalf("%s/%s: invalid %s: %v", owner, repo, repoconfig.FileName, err)
+		fatal(logger, "repo config invalid", "owner", owner, "repo", repo, "path", repoconfig.FileName, "error", err)
 	}
 	base = settings.Base
-	if deleted, err := fc.PruneStagingBranches(owner, repo, base); err != nil {
-		log.Printf("shunt: %s/%s@%s: staging branch gc: %v", owner, repo, base, err)
+	queueLogger := logger.With("owner", owner, "repo", repo, "base", base)
+	if deleted, err := fc.PruneStagingBranches(ctx, owner, repo, base); err != nil {
+		queueLogger.Warn("staging branch GC failed", "error", err)
 	} else if len(deleted) > 0 {
-		log.Printf("shunt: %s/%s@%s: deleted stale staging branches: %s", owner, repo, base, strings.Join(deleted, ", "))
+		queueLogger.Info("stale staging branches deleted", "branches", deleted)
 	}
-	if changed, err := fc.EnsureWebhook(owner, repo, webhookURL, webhookSecret); err != nil {
-		log.Fatalf("shunt: %s/%s@%s: ensure webhook: %v", owner, repo, base, err)
+	if changed, err := fc.EnsureWebhook(ctx, owner, repo, webhookURL, webhookSecret); err != nil {
+		fatal(queueLogger, "ensure webhook failed", "error", err)
 	} else if changed {
-		log.Printf("shunt: %s/%s@%s: configured webhook", owner, repo, base)
+		queueLogger.Info("webhook configured")
 	}
 	cloneURL := strings.TrimRight(instance, "/") + "/" + owner + "/" + repo + ".git"
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
 		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
-		Metrics: metricsCollector, Checkpoint: checkpointStore,
+		Metrics: metricsCollector, Checkpoint: checkpointStore, Logger: baseLogger.With("component", "engine"),
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
-	log.Printf("shunt: watching %s/%s base=%s every %s", owner, repo, base, interval)
-	runReconcileLoop(interval, wake, func() {
-		if err := eng.Reconcile(); err != nil {
-			log.Printf("reconcile error: %v", err)
+	queueLogger.Info("single-repo mode", "interval", interval)
+	if err := runDaemon(ctx, baseLogger, env("SHUNT_LISTEN", ":8080"), metricsCollector, webhook, interval, wake, func(ctx context.Context) {
+		if err := eng.Reconcile(ctx); err != nil {
+			queueLogger.Error("reconcile failed", "error", err)
 		}
-	})
+	}); err != nil {
+		fatal(logger, "daemon failed", "error", err)
+	}
 }
 
-func openCheckpointStore() (*checkpointbolt.Store, error) {
+func fatal(logger *slog.Logger, msg string, args ...any) {
+	logger.Error(msg, args...)
+	os.Exit(1)
+}
+
+func openCheckpointStore(logger *slog.Logger) (*checkpointbolt.Store, error) {
 	path := strings.TrimSpace(os.Getenv("SHUNT_STATE_PATH"))
 	if path == "" {
 		return nil, nil
@@ -173,14 +196,45 @@ func openCheckpointStore() (*checkpointbolt.Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open SHUNT_STATE_PATH: %w", err)
 	}
-	log.Printf("shunt: using bbolt queue state at %s", path)
+	logger.Info("using bbolt queue state", "path", path)
 	return store, nil
 }
 
-func serveHealth(addr string, metricsCollector *metrics.Collector, webhook webhookConfig) {
-	if err := http.ListenAndServe(addr, newHTTPMux(metricsCollector, webhook)); err != nil {
-		log.Printf("health server: %v", err)
+func runDaemon(ctx context.Context, logger *slog.Logger, addr string, metricsCollector *metrics.Collector, webhook webhookConfig, interval time.Duration, wake <-chan struct{}, reconcile func(context.Context)) error {
+	errc := make(chan error, 2)
+	go func() {
+		errc <- serveHealth(ctx, logger.With("component", "http"), addr, metricsCollector, webhook)
+	}()
+	go func() {
+		errc <- runReconcileLoop(ctx, interval, wake, reconcile)
+	}()
+
+	err := <-errc
+	if errors.Is(err, context.Canceled) {
+		return nil
 	}
+	return err
+}
+
+func serveHealth(ctx context.Context, logger *slog.Logger, addr string, metricsCollector *metrics.Collector, webhook webhookConfig) error {
+	server := &http.Server{
+		Addr:    addr,
+		Handler: newHTTPMux(metricsCollector, webhook),
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("HTTP shutdown failed", "error", err)
+		}
+	}()
+
+	logger.Info("HTTP listener started", "addr", addr)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP: %w", err)
+	}
+	return nil
 }
 
 func newHTTPMux(metricsCollector *metrics.Collector, webhook webhookConfig) *http.ServeMux {
@@ -199,6 +253,7 @@ func newHTTPMux(metricsCollector *metrics.Collector, webhook webhookConfig) *htt
 type webhookConfig struct {
 	Secret string
 	Wake   func()
+	Logger *slog.Logger
 }
 
 func (c webhookConfig) handler(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +279,7 @@ func (c webhookConfig) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !webhookWakes(event) {
-		log.Print("webhook: ignored event")
+		c.logger().Debug("webhook ignored", "event", event)
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte("ignored\n"))
 		return
@@ -234,9 +289,16 @@ func (c webhookConfig) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.Wake()
-	log.Print("webhook: wake requested")
+	c.logger().Info("webhook wake requested", "event", event)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("wake\n"))
+}
+
+func (c webhookConfig) logger() *slog.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return slog.Default().With("component", "webhook")
 }
 
 func webhookEvent(h http.Header) string {
@@ -289,11 +351,22 @@ func wakeReconcile(wake chan<- struct{}) func() {
 	}
 }
 
-func runReconcileLoop(interval time.Duration, wake <-chan struct{}, reconcile func()) {
+func runReconcileLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, reconcile func(context.Context)) error {
 	for {
-		reconcile()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		reconcile(ctx)
 		timer := time.NewTimer(interval)
 		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
 		case <-timer.C:
 		case <-wake:
 			if !timer.Stop() {
