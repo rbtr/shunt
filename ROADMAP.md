@@ -13,7 +13,7 @@ welcome.
 - **v0.3 release train.** The next hardening pass added webhook wakeups,
   per-repository configuration, startup staging-branch cleanup, opt-in sticky
   queue-status comments, operator gotchas, and correct aggregation of Forgejo
-  action task statuses.
+  Actions run statuses.
 - **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
   queue tunables such as status context, merge style, batch sizing/linger,
   bisection fan-out, and managed base branch on top of process defaults.
@@ -39,6 +39,10 @@ welcome.
 - **Managed repository webhooks.** When `SHUNT_WEBHOOK_URL` is set, shunt uses
   its existing admin token to create or update matching repository webhooks,
   mirroring the branch-protection setup it already performs.
+- **Forgejo Actions run readiness.** shunt now prefers Forgejo's run-level
+  aggregate status for staging branches before falling back to task aggregation,
+  so multi-job gates are not considered green while dependent jobs are still
+  being materialized.
 
 ## Current limitations
 
@@ -83,15 +87,14 @@ welcome.
   fan-out limit.~~ Completed: `SHUNT_BISECT_FANOUT` controls process-wide
   bisection concurrency; a value of `1` preserves serial behavior. Ordered
   landing is still enforced, and later speculative runs are re-staged if an
-  earlier candidate advances the base. Per-repository overrides remain covered by
-  the pending per-repository configuration item above.
+  earlier candidate advances the base. Per-repository overrides are available via
+  `.shunt.yml`.
 - ~~**Configurable batch-linger window.** Before forming the first batch,
   optionally wait up to a duration *or* until a target number of PRs are ready
   (whichever comes first), so bursty and low-traffic repos batch intentionally.~~
   Completed: `SHUNT_BATCH_LINGER` and `SHUNT_BATCH_TARGET` provide a process-wide
   default; a linger duration of `0` preserves form-immediately behavior.
-  Per-repository overrides remain covered by the pending per-repository
-  configuration item above.
+  Per-repository overrides are available via `.shunt.yml`.
 
 ### v0.5 — Correctness & safety
 - ~~Re-validate a PR's head SHA immediately before the gated merge (close the

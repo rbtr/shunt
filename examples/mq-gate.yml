@@ -4,9 +4,9 @@
 # those branches so it runs ONCE PER BATCH instead of once per PR. Per-PR
 # workflows can keep a lighter, faster check.
 #
-# Keep this gate simple. A single job is easiest for shunt to observe via the
-# Forgejo/Gitea Actions API. If you split it into multiple jobs, make mq-only
-# non-applicable jobs run a successful no-op instead of being skipped.
+# shunt reads Forgejo's run-level aggregate status, so multi-job gate workflows
+# are OK. Older compatible forges without the runs endpoint fall back to task
+# aggregation.
 name: mq-gate
 on:
   push:

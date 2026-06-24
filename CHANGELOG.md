@@ -13,6 +13,10 @@ All notable changes to this project are documented here. The format is based on
   skipped/requeued, and merge-error outcomes include commit statuses, durable
   comments, and staging debug links when available.
 
+### Fixed
+- Forgejo Actions readiness now prefers the run-level aggregate status before
+  falling back to task aggregation, avoiding early landings while dependent jobs
+  are still being materialized.
 
 ## [0.3.0] - 2026-06-23
 
