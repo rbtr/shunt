@@ -64,6 +64,13 @@ State, per `(repo, base)`:
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
+The engine has a checkpoint boundary around that state: when configured with its
+consumer-side `CheckpointStore`, it loads one queue snapshot before the first
+reconcile tick, saves after each tick that leaves queue work in progress, and
+deletes the snapshot once the queue is idle. The production command wires the
+default bbolt store when `SHUNT_STATE_PATH` is set; otherwise releases keep the
+historical process-local state.
+
 Each `Reconcile()` tick advances one step. Ticks are driven by relevant
 Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the
 backstop so a missed webhook only delays progress:
@@ -136,6 +143,17 @@ from the *current* base tip, a successful sub-batch that advances the base is
 handled safely: any later speculative staging run from the old base generation is
 deleted and re-queued, then re-staged before it can land.
 
+The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
+consumer-side store interface, and the concrete bbolt implementation lives in
+the more specific `checkpoint/bolt` package. Restored active batches are
+conservatively re-queued for fresh staging instead of resuming an old staging
+branch/run, so startup staging-branch cleanup cannot delete a branch that the
+restored engine still expects to observe. The production command wires the
+default bbolt implementation when `SHUNT_STATE_PATH` is set. That store persists
+one snapshot per `(owner, repo, base)` and keeps the binary static/CGO-free;
+operators should place the database on persistent storage if they want queue
+state to survive pod replacement or host reboots.
+
 ### Worked example
 
 Four ready PRs `[1 2 3 4]`, where `3` is broken:
@@ -192,9 +210,12 @@ against the unchanged current base, so `2` can still pass.
   repository; squash-only repositories need `SHUNT_MERGE_STYLE=squash`. Keep
   "block on outdated branch" disabled so the queue, not per-PR freshness checks,
   decides when a tested PR can land.
-- **Crash safety (today).** State is in-memory; a restart re-derives the queue
-  from open auto-merge PRs. It may repeat a staging run, but never double-merges
-  and never loses a PR. Durable state is a roadmap item.
+- **Crash safety.** By default, state is still in-memory; a restart re-derives
+  the queue from open auto-merge PRs. It may repeat a staging run, but never
+  double-merges and never loses a PR. With `SHUNT_STATE_PATH`, shunt persists the
+  pending frontier, linger state, bisection counters, and active batch metadata
+  in bbolt. Active batches are re-staged after restore so no PR lands from a
+  pre-restart staging result that may have been invalidated by a base change.
 
 ## Observability
 

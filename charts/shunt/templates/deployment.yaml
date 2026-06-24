@@ -63,6 +63,10 @@ spec:
               value: {{ .Values.config.bisectFanout | quote }}
             - name: SHUNT_QUEUE_COMMENTS
               value: {{ .Values.config.queueComments | quote }}
+            {{- if .Values.config.statePath }}
+            - name: SHUNT_STATE_PATH
+              value: {{ .Values.config.statePath | quote }}
+            {{- end }}
             - name: SHUNT_POLL_INTERVAL
               value: {{ .Values.config.pollInterval | quote }}
             {{- if .Values.config.publicUrl }}
@@ -108,9 +112,18 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.persistence.enabled }}
+            - name: state
+              mountPath: /var/lib/shunt
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.persistence.enabled }}
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-state" (include "shunt.fullname" .)) .Values.persistence.existingClaim | quote }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

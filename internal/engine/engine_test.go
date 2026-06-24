@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rbtr/shunt/internal/checkpoint"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
 	"github.com/rbtr/shunt/internal/metrics"
@@ -409,6 +411,77 @@ func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
 	}
 	if !m.bounced[1] {
 		t.Error("PR 1 should have been bounced")
+	}
+}
+
+func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if got := len(m.staged); got != 1 {
+		t.Fatalf("staged batches before restart = %d, want 1", got)
+	}
+	if store.saved == nil || len(store.saved.Active) != 1 {
+		t.Fatalf("checkpoint active batches = %v, want 1 active batch", store.saved)
+	}
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(); err != nil {
+		t.Fatalf("restage restored batch: %v", err)
+	}
+	if got := len(m.staged); got != 2 {
+		t.Fatalf("restored active batch should be restaged; staged = %d, want 2", got)
+	}
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged after restage = %s, want []", got)
+	}
+	if err := restarted.Reconcile(); err != nil {
+		t.Fatalf("land restaged batch: %v", err)
+	}
+	if got := fmt.Sprint(m.merged); got != "[1 2]" {
+		t.Errorf("merged after restore = %s, want [1 2]", got)
+	}
+	if !store.deleted {
+		t.Error("empty queue should delete checkpoint after restored batch lands")
+	}
+}
+
+func TestCheckpointRestoresPendingBisectionFrontier(t *testing.T) {
+	m := newMock(3, 1, 2, 3, 4)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start root batch: %v", err)
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("split root batch: %v", err)
+	}
+	if store.saved == nil {
+		t.Fatal("expected pending frontier checkpoint")
+	}
+	if got := fmt.Sprint(store.saved.Pending); got != "[[1 2] [3 4]]" {
+		t.Fatalf("checkpoint pending = %s, want [[1 2] [3 4]]", got)
+	}
+
+	restarted := New(cfg, m, m)
+	drive(restarted, 30)
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2] [3 4] [3] [4]]" {
+		t.Errorf("staged after restoring frontier = %s, want resumed bisection without root rerun", got)
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 2 4]" {
+		t.Errorf("merged after restore = %s, want [1 2 4]", got)
+	}
+	if !m.bounced[3] {
+		t.Error("PR 3 should be bounced after restored bisection")
 	}
 }
 
@@ -833,4 +906,29 @@ func assertMetric(t *testing.T, c *metrics.Collector, want string) {
 	if !strings.Contains(out.String(), want) {
 		t.Fatalf("metrics output missing %q in:\n%s", want, out.String())
 	}
+}
+
+type memoryCheckpointStore struct {
+	saved   *checkpoint.QueueSnapshot
+	deleted bool
+}
+
+func (s *memoryCheckpointStore) LoadQueue(_ context.Context, _ checkpoint.QueueKey) (checkpoint.QueueSnapshot, bool, error) {
+	if s.saved == nil {
+		return checkpoint.QueueSnapshot{}, false, nil
+	}
+	return s.saved.Clone(), true, nil
+}
+
+func (s *memoryCheckpointStore) SaveQueue(_ context.Context, snapshot checkpoint.QueueSnapshot) error {
+	clone := snapshot.Clone()
+	s.saved = &clone
+	s.deleted = false
+	return nil
+}
+
+func (s *memoryCheckpointStore) DeleteQueue(_ context.Context, _ checkpoint.QueueKey) error {
+	s.saved = nil
+	s.deleted = true
+	return nil
 }

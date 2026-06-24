@@ -12,6 +12,9 @@ All notable changes to this project are documented here. The format is based on
 - Source PRs now receive explicit terminal queue feedback: landed, rejected,
   skipped/requeued, and merge-error outcomes include commit statuses, durable
   comments, and staging debug links when available.
+- Optional bbolt queue checkpoint storage via `SHUNT_STATE_PATH`, preserving
+  pending candidates, active batch metadata, linger state, and bisection counters
+  across restarts; restored active batches are re-staged before landing.
 
 ### Fixed
 - Forgejo Actions readiness now prefers the run-level aggregate status before

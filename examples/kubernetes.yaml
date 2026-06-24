@@ -42,6 +42,10 @@ spec:
               value: "merge-queue"
             - name: SHUNT_QUEUE_COMMENTS
               value: "false"
+            # Optional durable bbolt checkpoints. Mount this path on persistent
+            # storage; emptyDir only survives restarts within the same pod.
+            # - name: SHUNT_STATE_PATH
+            #   value: "/var/lib/shunt/shunt.db"
             # Set this to the public /webhook URL to let shunt create repo webhooks.
             # - name: SHUNT_WEBHOOK_URL
             #   value: "https://shunt.example.com/webhook"
@@ -78,6 +82,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # - name: state
+            #   mountPath: /var/lib/shunt
       volumes:
         - name: tmp
           emptyDir: {}
+        # - name: state
+        #   persistentVolumeClaim:
+        #     claimName: shunt-state

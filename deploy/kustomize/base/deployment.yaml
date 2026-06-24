@@ -33,6 +33,9 @@ spec:
               value: "1"
             - name: SHUNT_QUEUE_COMMENTS
               value: "false"
+            # Set this to a mounted persistent path to enable bbolt checkpoints.
+            # - name: SHUNT_STATE_PATH
+            #   value: "/var/lib/shunt/shunt.db"
             # Set this to the public /webhook URL to let shunt create repo webhooks.
             # - name: SHUNT_WEBHOOK_URL
             #   value: "https://shunt.example.com/webhook"
@@ -69,6 +72,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # - name: state
+            #   mountPath: /var/lib/shunt
       volumes:
         - name: tmp
           emptyDir: {}
+        # - name: state
+        #   persistentVolumeClaim:
+        #     claimName: shunt-state

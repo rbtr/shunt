@@ -46,11 +46,11 @@ welcome.
 
 ## Current limitations
 
-- **In-memory state.** The queue and the bisection frontier live in memory. A
-  restart never double-merges or loses a PR (it re-derives the queue from the
-  open auto-merge PRs), but it forgets an in-flight bisection and re-runs that
-  CI. A crash mid-landing merges part of a batch and re-queues the rest next
-  cycle.
+- **Durable state is opt-in.** By default, shunt still runs with in-memory state.
+  Set `SHUNT_STATE_PATH` to enable the built-in bbolt checkpoint store so pending
+  candidates, active batch metadata, linger state, and bisection counters survive
+  restarts. Restored active batches are re-staged before landing. A crash
+  mid-landing can still merge part of a batch and re-queue the rest next cycle.
 - **Polling backstop.** shunt still reconciles on a timer (default 10s) to
   tolerate missed webhooks, so there is some steady API traffic even when webhook
   wakeups are configured.
@@ -68,9 +68,13 @@ welcome.
 ## Milestones
 
 ### v0.3 — Durability
-- Postgres-backed state: persist the per-`(repo, base)` work queue, the active
-  batch (staging branch/SHA, members), and the bisection frontier; resume
-  cleanly across restarts.
+- ~~Engine checkpoint/resume boundary and default local store: load and save the
+  per-`(repo, base)` work queue, active batch metadata, linger timestamp, and
+  bisection counters through a pluggable store.~~ Completed with an opt-in bbolt
+  implementation via `SHUNT_STATE_PATH`; restored active batches are re-staged
+  on restart.
+- External durable stores: adapt the checkpoint boundary to Postgres or other
+  deployment-specific backends without changing the engine state machine.
 - ~~Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
   immediately, keeping the poll as a backstop.~~ Completed: `/webhook` wakes the
   reconcile loop for auto-merge, pull-request, review, status, and push events

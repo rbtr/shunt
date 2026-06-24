@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	checkpointbolt "github.com/rbtr/shunt/internal/checkpoint/bolt"
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
@@ -89,6 +90,13 @@ func main() {
 	}
 
 	metricsCollector := metrics.New()
+	checkpointStore, err := openCheckpointStore()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if checkpointStore != nil {
+		defer checkpointStore.Close()
+	}
 	wake := make(chan struct{}, 1)
 	go serveHealth(env("SHUNT_LISTEN", ":8080"), metricsCollector, webhookConfig{
 		Secret: webhookSecret,
@@ -102,7 +110,7 @@ func main() {
 			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout, QueueComments: queueComments,
 			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
-			Metrics: metricsCollector,
+			Metrics: metricsCollector, Checkpoint: checkpointStore,
 		})
 		log.Printf("shunt: multi-repo mode, topic=%q every %s", topic, interval)
 		runReconcileLoop(interval, wake, func() {
@@ -146,7 +154,7 @@ func main() {
 		Owner: owner, Repo: repo, Base: base,
 		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
-		Metrics: metricsCollector,
+		Metrics: metricsCollector, Checkpoint: checkpointStore,
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
 	log.Printf("shunt: watching %s/%s base=%s every %s", owner, repo, base, interval)
 	runReconcileLoop(interval, wake, func() {
@@ -154,6 +162,19 @@ func main() {
 			log.Printf("reconcile error: %v", err)
 		}
 	})
+}
+
+func openCheckpointStore() (*checkpointbolt.Store, error) {
+	path := strings.TrimSpace(os.Getenv("SHUNT_STATE_PATH"))
+	if path == "" {
+		return nil, nil
+	}
+	store, err := checkpointbolt.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open SHUNT_STATE_PATH: %w", err)
+	}
+	log.Printf("shunt: using bbolt queue state at %s", path)
+	return store, nil
 }
 
 func serveHealth(addr string, metricsCollector *metrics.Collector, webhook webhookConfig) {

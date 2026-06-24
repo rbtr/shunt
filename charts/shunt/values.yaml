@@ -24,6 +24,7 @@ config:
   batchTarget: "0"
   bisectFanout: "1"
   queueComments: "false"
+  statePath: ""
   pollInterval: "10s"
   listen: ":8080"
   webhookUrl: ""
@@ -35,6 +36,14 @@ token:
 webhookSecret:
   existingSecret: ""
   key: webhook-secret
+
+persistence:
+  enabled: false
+  existingClaim: ""
+  size: 1Gi
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
 
 podAnnotations: {}
 
