@@ -308,6 +308,38 @@ func TestRunStatusReadsPaginatedTasks(t *testing.T) {
 	}
 }
 
+func TestRunTargetURLReturnsNewestMatchingHTMLURL(t *testing.T) {
+	payload := tasksResponse{WorkflowRuns: []workflowTask{
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success", HTMLURL: "https://forge/o/r/actions/runs/8"},
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 7, WorkflowID: "ci.yaml", Status: "success", HTMLURL: "https://forge/o/r/actions/runs/7"},
+		{HeadSHA: "other", HeadBranch: "mq/main/staging", RunNumber: 9, WorkflowID: "ci.yaml", Status: "success", HTMLURL: "https://forge/o/r/actions/runs/9"},
+	}}
+	c := newRunStatusTestClient(t, payload)
+
+	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "https://forge/o/r/actions/runs/8" {
+		t.Fatalf("RunTargetURL = %q, want newest matching run URL", u)
+	}
+}
+
+func TestRunTargetURLFallsBackToTargetURL(t *testing.T) {
+	payload := tasksResponse{WorkflowRuns: []workflowTask{
+		{HeadSHA: "sha", HeadBranch: "mq/main/staging", RunNumber: 8, WorkflowID: "ci.yaml", Status: "success", TargetURL: "https://forge/o/r/actions/runs/8"},
+	}}
+	c := newRunStatusTestClient(t, payload)
+
+	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "https://forge/o/r/actions/runs/8" {
+		t.Fatalf("RunTargetURL = %q, want target URL", u)
+	}
+}
+
 func newRunStatusTestClient(t *testing.T, payload tasksResponse) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

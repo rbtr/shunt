@@ -31,6 +31,7 @@ type mock struct {
 	comments       map[int][]string
 	queueComments  map[int][]string
 	mergeHeads     map[int][]string
+	runURLs        map[string]string
 	beforeMerge    func(int)
 }
 
@@ -38,7 +39,7 @@ func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
 		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
-		comments: map[int][]string{}, queueComments: map[int][]string{}, mergeHeads: map[int][]string{},
+		comments: map[int][]string{}, queueComments: map[int][]string{}, mergeHeads: map[int][]string{}, runURLs: map[string]string{},
 	}
 	for _, n := range prNums {
 		m.addPR(n)
@@ -90,6 +91,7 @@ func (m *mock) RunStatus(_, _, sha, _ string) (string, error) {
 	}
 	return "success", nil
 }
+func (m *mock) RunTargetURL(_, _, sha, _ string) (string, error) { return m.runURLs[sha], nil }
 
 func (m *mock) MergePR(_, _ string, n int, _, headSHA string) error {
 	m.mergeHeads[n] = append(m.mergeHeads[n], headSHA)
@@ -216,8 +218,8 @@ func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
 	if got := len(m.queueComments[1]); got != 2 {
 		t.Fatalf("PR 1 queue comment updates = %d, want 2", got)
 	}
-	if body := m.queueComments[1][1]; !strings.Contains(body, "State: not currently queued") {
-		t.Fatalf("final queue comment did not mark PR as not queued:\n%s", body)
+	if body := m.queueComments[1][1]; !strings.Contains(body, "State: Landed via merge queue") {
+		t.Fatalf("final queue comment did not mark PR as landed:\n%s", body)
 	}
 }
 
@@ -345,6 +347,38 @@ func TestBisectionIsolatesBadPR(t *testing.T) {
 	if m.prs[3].Merged {
 		t.Error("PR 3 must not be merged")
 	}
+	if got := fmt.Sprint(m.statuses); !strings.Contains(got, "head-3:failure") {
+		t.Errorf("statuses = %s, want bounced PR failure status", got)
+	}
+	if got := strings.Join(m.comments[3], "\n"); !strings.Contains(got, "Bounced from merge queue") || !strings.Contains(got, "staging run/commit") {
+		t.Errorf("bounce comment missing reason/debug link:\n%s", got)
+	}
+}
+
+func TestTerminalGateOutcomeStatusState(t *testing.T) {
+	for _, tc := range []struct {
+		outcome string
+		want    string
+	}{
+		{outcome: "failure", want: "head-1:failure"},
+		{outcome: "cancelled", want: "head-1:error"},
+		{outcome: "error", want: "head-1:error"},
+	} {
+		t.Run(tc.outcome, func(t *testing.T) {
+			m := newMock(-1, 1)
+			m.runStatus = tc.outcome
+			e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+			drive(e, 2)
+
+			if !m.bounced[1] {
+				t.Fatal("PR 1 should have been bounced")
+			}
+			if got := m.statuses[len(m.statuses)-1]; got != tc.want {
+				t.Errorf("last status = %s, want %s", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
@@ -415,6 +449,7 @@ func TestLandRevalidatesHappyPath(t *testing.T) {
 	if err := e.Reconcile(); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
+
 	if err := e.Reconcile(); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
@@ -430,6 +465,23 @@ func TestLandRevalidatesHappyPath(t *testing.T) {
 	}
 }
 
+func TestTerminalCommentsUseRunTargetURLWhenAvailable(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.runURLs[e.active[0].stagingSHA] = "https://forge.example.com/o/r/actions/runs/7"
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("land batch: %v", err)
+	}
+
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "https://forge.example.com/o/r/actions/runs/7") {
+		t.Fatalf("terminal comment did not use run target URL:\n%s", got)
+	}
+}
+
 func TestLandSkipsChangedHead(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
@@ -442,8 +494,13 @@ func TestLandSkipsChangedHead(t *testing.T) {
 		t.Fatalf("land batch: %v", err)
 	}
 
-	assertNoLand(t, m)
-	if got := fmt.Sprint(m.comments[1]); got != "[Skipped by the merge queue: head changed from head-1 to head-1-new.]" {
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Errorf("merged = %s, want []", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1-new:error]" {
+		t.Errorf("statuses = %s, want error on current head", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "head changed from head-1 to head-1-new") {
 		t.Errorf("comments = %s, want changed-head skip comment", got)
 	}
 }
@@ -460,8 +517,13 @@ func TestLandSkipsCancelledAutomerge(t *testing.T) {
 		t.Fatalf("land batch: %v", err)
 	}
 
-	assertNoLand(t, m)
-	if got := fmt.Sprint(m.comments[1]); got != "[Skipped by the merge queue: auto-merge is no longer scheduled.]" {
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Errorf("merged = %s, want []", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:error]" {
+		t.Errorf("statuses = %s, want error on skipped head", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "auto-merge is no longer scheduled") {
 		t.Errorf("comments = %s, want cancelled-auto-merge skip comment", got)
 	}
 }
@@ -517,13 +579,13 @@ func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
 	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
 		t.Errorf("merge head SHA = %s, want [head-1]", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error]" {
-		t.Errorf("statuses = %s, want success then error on tested head", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error head-1-new:error]" {
+		t.Errorf("statuses = %s, want success/error on tested head and error on current head", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Errorf("merged = %s, want []", got)
 	}
-	if got := fmt.Sprint(m.comments[1]); got != "[Skipped by the merge queue: head changed from head-1 to head-1-new.]" {
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "head changed from head-1 to head-1-new") {
 		t.Errorf("comments = %s, want changed-head skip comment", got)
 	}
 }
@@ -572,6 +634,9 @@ func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
 	}
 	if !m.bounced[2] {
 		t.Fatal("conflicter should bounce after it still conflicts on the base that includes the prefix")
+	}
+	if got := fmt.Sprint(m.statuses); !strings.Contains(got, "head-2:error") {
+		t.Errorf("statuses = %s, want staging conflict error status", got)
 	}
 	if got := fmt.Sprint(e.pending); got != "[[3]]" {
 		t.Fatalf("pending after conflicter bounce = %s, want [[3]]", got)

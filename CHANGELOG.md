@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - Optional managed repository webhook setup via `SHUNT_WEBHOOK_URL`, reusing the
   existing admin token to create or update shunt-owned hooks.
+- Source PRs now receive explicit terminal queue feedback: landed, rejected,
+  skipped/requeued, and merge-error outcomes include commit statuses, durable
+  comments, and staging debug links when available.
+
 
 ## [0.3.0] - 2026-06-23
 

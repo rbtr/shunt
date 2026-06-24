@@ -109,7 +109,20 @@ of `1` preserves serial bisection. Higher values use sibling staging branches
 such as `mq/main/staging-1`, `mq/main/staging-2`, so the gate workflow must keep
 matching `mq/**`.
 
-`land` sets the status and merges each PR in order. `bisectOrBounce`:
+`land` sets the source-head status and merges each PR in order. Terminal queue
+outcomes are also written back to source PRs:
+
+- landed PRs get a durable comment with the staging commit/run link;
+- bounced PRs get auto-merge cancelled, a source-head `failure` status for gate
+  failures or `error` for staging/infrastructure failures, and a durable
+  rejection comment;
+- skipped/requeued PRs get an `error` status plus a comment explaining why they
+  were not landed.
+
+If sticky queue comments are enabled, terminal outcomes update the sticky comment
+too. Intermediate multi-PR batch failures are not broadcast to every source PR;
+bisection first isolates the terminal culprit so innocent PRs are not blamed or
+spammed. `bisectOrBounce`:
 
 ```
 nums = active.prs
@@ -135,8 +148,9 @@ test [3]        -> fail  -> bounce 3            (culprit isolated)
 test [4]        -> pass  -> merge 4
 ```
 
-`1, 2, 4` land; `3` is bounced with a comment. Five CI runs instead of four
-per-PR runs, but the common all-green case is a single run.
+`1, 2, 4` land; `3` is bounced with a failed source-head status, auto-merge
+cancelled, and a comment linking to the failing staging run/commit. Five CI runs
+instead of four per-PR runs, but the common all-green case is a single run.
 
 For staging conflicts, the split point is the PR that failed to apply:
 

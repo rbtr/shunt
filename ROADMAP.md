@@ -20,6 +20,9 @@ welcome.
 - **Sticky PR queue-status comments.** Operators can opt in with
   `SHUNT_QUEUE_COMMENTS=true` to keep one updated status comment on each queued
   PR with base, position, state, and active batch details when known.
+- **Source PR queue outcomes.** Landed, rejected, skipped, and merge-error PRs
+  now get explicit source-head statuses and durable comments with staging
+  run/commit links where available.
 - **Order-preserving conflict handling.** A staging conflict splits the candidate
   at the conflict point: earlier PRs are tested first, then the conflicting
   suffix is retried on the current base. If the conflict is already first in a
@@ -113,6 +116,9 @@ welcome.
   (`SHUNT_QUEUE_COMMENTS=true`) so write traffic remains an operator choice.
   A small status page remains a possible follow-up since the forge can't host a
   native queue UI.
+- ~~PR-visible rejection/debug feedback.~~ Completed: terminal queue outcomes
+  update source PR statuses and post durable comments with staging debug links
+  where available.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.
