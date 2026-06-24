@@ -1,6 +1,6 @@
 module github.com/rbtr/shunt
 
-go 1.23
+go 1.25
 
 require (
 	go.etcd.io/bbolt v1.3.11

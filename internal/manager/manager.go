@@ -3,8 +3,9 @@
 package manager
 
 import (
+	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -33,12 +34,16 @@ type Config struct {
 	BotEmail      string
 	Metrics       *metrics.Collector
 	Checkpoint    engine.CheckpointStore
+	Logger        *slog.Logger
+	EngineLogger  *slog.Logger
 }
 
 type Manager struct {
-	fc      *forge.Client
-	cfg     Config
-	engines map[string]*managedEngine
+	fc           *forge.Client
+	cfg          Config
+	logger       *slog.Logger
+	engineLogger *slog.Logger
+	engines      map[string]*managedEngine
 }
 
 type managedEngine struct {
@@ -47,73 +52,82 @@ type managedEngine struct {
 }
 
 func New(fc *forge.Client, cfg Config) *Manager {
-	return &Manager{fc: fc, cfg: cfg, engines: map[string]*managedEngine{}}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default().With("component", "manager")
+	}
+	engineLogger := cfg.EngineLogger
+	if engineLogger == nil {
+		engineLogger = slog.Default().With("component", "engine")
+	}
+	return &Manager{fc: fc, cfg: cfg, logger: logger, engineLogger: engineLogger, engines: map[string]*managedEngine{}}
 }
 
 func keyOf(owner, repo, base string) string { return owner + "/" + repo + "@" + base }
 
 // Refresh discovers topic repos and registers an engine per configured
 // (repo, base), ensuring branch protection on first sight.
-func (m *Manager) Refresh() error {
-	repos, err := m.fc.SearchReposByTopic(m.cfg.Topic)
+func (m *Manager) Refresh(ctx context.Context) error {
+	repos, err := m.fc.SearchReposByTopic(ctx, m.cfg.Topic)
 	if err != nil {
 		return err
 	}
 	seen := make(map[string]bool, len(repos))
 	for _, r := range repos {
-		settings, err := m.repoSettings(r)
+		settings, err := m.repoSettings(ctx, r)
 		if err != nil {
-			log.Printf("manager: %s/%s: %s: %v", r.Owner, r.Name, repoconfig.FileName, err)
+			m.logger.Warn("repo config skipped", "owner", r.Owner, "repo", r.Name, "path", repoconfig.FileName, "error", err)
 			m.keepExistingRepo(seen, r.Owner, r.Name)
 			continue
 		}
 		k := keyOf(r.Owner, r.Name, settings.Base)
 		seen[k] = true
 		cfg := m.engineConfig(r, settings)
-		if existing, ok := m.engines[k]; ok && existing.cfg == cfg {
+		if existing, ok := m.engines[k]; ok && sameEngineConfig(existing.cfg, cfg) {
 			continue
 		}
-		if changed, err := m.fc.EnsureBranchProtection(r.Owner, r.Name, settings.Base, settings.StatusCtx, m.cfg.BotUser); err != nil {
-			log.Printf("manager: %s: ensure protection: %v", k, err)
-			continue
-		} else if changed {
-			log.Printf("manager: %s: configured branch protection", k)
-		}
-		if changed, err := m.fc.EnsureWebhook(r.Owner, r.Name, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
-			log.Printf("manager: %s: ensure webhook: %v", k, err)
+		queueLogger := m.logger.With("owner", r.Owner, "repo", r.Name, "base", settings.Base)
+		if changed, err := m.fc.EnsureBranchProtection(ctx, r.Owner, r.Name, settings.Base, settings.StatusCtx, m.cfg.BotUser); err != nil {
+			queueLogger.Warn("ensure branch protection failed", "error", err)
 			continue
 		} else if changed {
-			log.Printf("manager: %s: configured webhook", k)
+			queueLogger.Info("branch protection configured")
 		}
-		if deleted, err := m.fc.PruneStagingBranches(r.Owner, r.Name, settings.Base); err != nil {
-			log.Printf("manager: %s: staging branch gc: %v", k, err)
+		if changed, err := m.fc.EnsureWebhook(ctx, r.Owner, r.Name, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
+			queueLogger.Warn("ensure webhook failed", "error", err)
+			continue
+		} else if changed {
+			queueLogger.Info("webhook configured")
+		}
+		if deleted, err := m.fc.PruneStagingBranches(ctx, r.Owner, r.Name, settings.Base); err != nil {
+			queueLogger.Warn("staging branch GC failed", "error", err)
 		} else if len(deleted) > 0 {
-			log.Printf("manager: %s: deleted stale staging branches: %s", k, strings.Join(deleted, ", "))
+			queueLogger.Info("stale staging branches deleted", "branches", deleted)
 		}
 		st := gitops.NewStager(cloneURL(m.cfg.InstanceURL, r.Owner, r.Name), m.cfg.BotUser, m.cfg.Token, m.cfg.BotUser, m.cfg.BotEmail)
 		m.engines[k] = &managedEngine{engine: engine.New(cfg, m.fc, st), cfg: cfg}
-		log.Printf("manager: managing %s", k)
+		queueLogger.Info("repo managed")
 	}
 	for k := range m.engines {
 		if !seen[k] {
 			delete(m.engines, k)
 			m.cfg.Metrics.ForgetQueue(labelsOfKey(k))
-			log.Printf("manager: stopped managing %s (topic removed or repo archived)", k)
+			m.logger.Info("repo no longer managed", "queue", k)
 		}
 	}
 	return nil
 }
 
 // Tick reconciles every managed queue once.
-func (m *Manager) Tick() {
+func (m *Manager) Tick(ctx context.Context) {
 	for k, e := range m.engines {
-		if err := e.engine.Reconcile(); err != nil {
-			log.Printf("manager: %s: reconcile: %v", k, err)
+		if err := e.engine.Reconcile(ctx); err != nil {
+			m.logger.Error("reconcile failed", "queue", k, "error", err)
 		}
 	}
 }
 
-func (m *Manager) repoSettings(r forge.RepoRef) (repoconfig.Settings, error) {
+func (m *Manager) repoSettings(ctx context.Context, r forge.RepoRef) (repoconfig.Settings, error) {
 	base := r.DefaultBranch
 	if base == "" {
 		base = "main"
@@ -127,7 +141,7 @@ func (m *Manager) repoSettings(r forge.RepoRef) (repoconfig.Settings, error) {
 		BatchTarget:  m.cfg.BatchTarget,
 		BisectFanout: m.cfg.BisectFanout,
 	}
-	data, err := m.fc.ReadFile(r.Owner, r.Name, base, repoconfig.FileName)
+	data, err := m.fc.ReadFile(ctx, r.Owner, r.Name, base, repoconfig.FileName)
 	if errors.Is(err, forge.ErrNotFound) {
 		return defaults, nil
 	}
@@ -155,7 +169,14 @@ func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) en
 		BotUser:       m.cfg.BotUser,
 		Metrics:       m.cfg.Metrics,
 		Checkpoint:    m.cfg.Checkpoint,
+		Logger:        m.engineLogger,
 	}
+}
+
+func sameEngineConfig(a, b engine.Config) bool {
+	a.Logger = nil
+	b.Logger = nil
+	return a == b
 }
 
 func (m *Manager) keepExistingRepo(seen map[string]bool, owner, repo string) {

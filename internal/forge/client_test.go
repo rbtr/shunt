@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -31,7 +32,7 @@ func TestMergePRSendsStyleAndHeadCommitID(t *testing.T) {
 			defer srv.Close()
 
 			c := New(srv.URL, "token")
-			if err := c.MergePR("o", "r", 7, style, "abc123"); err != nil {
+			if err := c.MergePR(context.Background(), "o", "r", 7, style, "abc123"); err != nil {
 				t.Fatalf("MergePR: %v", err)
 			}
 
@@ -80,7 +81,7 @@ func TestPruneStagingBranchesDeletesOnlyShuntStagingBranches(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	got, err := c.PruneStagingBranches("o", "r", "main")
+	got, err := c.PruneStagingBranches(context.Background(), "o", "r", "main")
 	if err != nil {
 		t.Fatalf("PruneStagingBranches: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestReadFileUsesRawEndpointAndRef(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	got, err := c.ReadFile("o", "r", "main", ".shunt.yml")
+	got, err := c.ReadFile(context.Background(), "o", "r", "main", ".shunt.yml")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestReadFileReturnsErrNotFound(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	_, err := c.ReadFile("o", "r", "main", ".shunt.yml")
+	_, err := c.ReadFile(context.Background(), "o", "r", "main", ".shunt.yml")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ReadFile error = %v, want ErrNotFound", err)
 	}
@@ -169,7 +170,7 @@ func TestUpsertCommentCreatesWhenMarkerIsMissing(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker -->\nbody"); err != nil {
+	if err := c.UpsertComment(context.Background(), "o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker -->\nbody"); err != nil {
 		t.Fatalf("UpsertComment: %v", err)
 	}
 	if got := posted["body"]; got != "<!-- marker -->\nbody" {
@@ -195,7 +196,7 @@ func TestUpsertCommentEditsExistingBotComment(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
+	if err := c.UpsertComment(context.Background(), "o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
 		t.Fatalf("UpsertComment: %v", err)
 	}
 	if got := patched["body"]; got != "<!-- marker --> new" {
@@ -225,7 +226,7 @@ func TestUpsertCommentDoesNotEditAnotherUsersMarker(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	if err := c.UpsertComment("o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
+	if err := c.UpsertComment(context.Background(), "o", "r", 7, "<!-- marker -->", "mq-bot", "<!-- marker --> new"); err != nil {
 		t.Fatalf("UpsertComment: %v", err)
 	}
 	if sawPatch {
@@ -245,7 +246,7 @@ func TestRunStatusAggregatesNewestMatchingTaskRun(t *testing.T) {
 	}}
 	c := newRunStatusTestClient(t, payload)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +263,7 @@ func TestRunStatusFailsIfAnyNewestMatchingTaskFails(t *testing.T) {
 	}}
 	c := newRunStatusTestClient(t, payload)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +280,7 @@ func TestRunStatusSucceedsWhenNewestMatchingTasksAreTerminalGreen(t *testing.T) 
 	}}
 	c := newRunStatusTestClient(t, payload)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +300,7 @@ func TestRunStatusUsesRunAggregateBeforeMaterializedTaskRows(t *testing.T) {
 		}},
 	)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +319,7 @@ func TestRunStatusWaitsWhenRunEndpointHasNoMatchingRun(t *testing.T) {
 		}},
 	)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +345,7 @@ func TestRunStatusReadsPaginatedRuns(t *testing.T) {
 		}},
 	)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +366,7 @@ func TestRunStatusReadsPaginatedTasks(t *testing.T) {
 		}},
 	)
 
-	status, err := c.RunStatus("o", "r", "sha", "mq/main/staging")
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +383,7 @@ func TestRunTargetURLReturnsNewestMatchingHTMLURL(t *testing.T) {
 	}}
 	c := newRunStatusTestClient(t, payload)
 
-	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	u, err := c.RunTargetURL(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +402,7 @@ func TestRunTargetURLUsesRunAggregateURL(t *testing.T) {
 		}},
 	)
 
-	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	u, err := c.RunTargetURL(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +417,7 @@ func TestRunTargetURLFallsBackToTargetURL(t *testing.T) {
 	}}
 	c := newRunStatusTestClient(t, payload)
 
-	u, err := c.RunTargetURL("o", "r", "sha", "mq/main/staging")
+	u, err := c.RunTargetURL(context.Background(), "o", "r", "sha", "mq/main/staging")
 	if err != nil {
 		t.Fatal(err)
 	}

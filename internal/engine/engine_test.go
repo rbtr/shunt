@@ -57,7 +57,7 @@ func (m *mock) addPR(n int) {
 	m.automerge[n] = true
 }
 
-func (m *mock) ListOpenPRs(_, _, _ string) ([]forge.PullRequest, error) {
+func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullRequest, error) {
 	var out []forge.PullRequest
 	for _, pr := range m.prs {
 		if pr.State == "open" {
@@ -66,23 +66,27 @@ func (m *mock) ListOpenPRs(_, _, _ string) ([]forge.PullRequest, error) {
 	}
 	return out, nil
 }
-func (m *mock) GetPR(_, _ string, n int) (forge.PullRequest, error) { return *m.prs[n], nil }
-func (m *mock) AutomergeScheduled(_, _ string, n int) (bool, error) { return m.automerge[n], nil }
-func (m *mock) SetCommitStatus(_, _, sha, _, state, _, _ string) error {
+func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, error) {
+	return *m.prs[n], nil
+}
+func (m *mock) AutomergeScheduled(_ context.Context, _, _ string, n int) (bool, error) {
+	return m.automerge[n], nil
+}
+func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, _, state, _, _ string) error {
 	m.statuses = append(m.statuses, sha+":"+state)
 	return nil
 }
-func (m *mock) Comment(_, _ string, n int, body string) error {
+func (m *mock) Comment(_ context.Context, _, _ string, n int, body string) error {
 	m.comments[n] = append(m.comments[n], body)
 	return nil
 }
-func (m *mock) UpsertComment(_, _ string, n int, _, _, body string) error {
+func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, _, _, body string) error {
 	m.queueComments[n] = append(m.queueComments[n], body)
 	return nil
 }
-func (m *mock) DeleteBranch(_, _, _ string) error { return nil }
+func (m *mock) DeleteBranch(_ context.Context, _, _, _ string) error { return nil }
 
-func (m *mock) RunStatus(_, _, sha, _ string) (string, error) {
+func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
 	if m.runStatus != "" {
 		return m.runStatus, nil
 	}
@@ -93,9 +97,11 @@ func (m *mock) RunStatus(_, _, sha, _ string) (string, error) {
 	}
 	return "success", nil
 }
-func (m *mock) RunTargetURL(_, _, sha, _ string) (string, error) { return m.runURLs[sha], nil }
+func (m *mock) RunTargetURL(_ context.Context, _, _, sha, _ string) (string, error) {
+	return m.runURLs[sha], nil
+}
 
-func (m *mock) MergePR(_, _ string, n int, _, headSHA string) error {
+func (m *mock) MergePR(_ context.Context, _, _ string, n int, _, headSHA string) error {
 	m.mergeHeads[n] = append(m.mergeHeads[n], headSHA)
 	if m.beforeMerge != nil {
 		m.beforeMerge(n)
@@ -113,13 +119,13 @@ func (m *mock) MergePR(_, _ string, n int, _, headSHA string) error {
 	return nil
 }
 
-func (m *mock) CancelAutomerge(_, _ string, n int) error {
+func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) error {
 	m.bounced[n] = true
 	m.automerge[n] = false
 	return nil
 }
 
-func (m *mock) BuildStaging(_, _ string, refs []gitops.MergedRef) (string, int, error) {
+func (m *mock) BuildStaging(_ context.Context, _, _ string, refs []gitops.MergedRef) (string, int, error) {
 	var nums []int
 	for _, r := range refs {
 		nums = append(nums, r.PR)
@@ -136,7 +142,7 @@ func (m *mock) BuildStaging(_, _ string, refs []gitops.MergedRef) (string, int, 
 
 func drive(e *Engine, n int) {
 	for i := 0; i < n; i++ {
-		_ = e.Reconcile()
+		_ = e.Reconcile(context.Background())
 	}
 }
 
@@ -144,7 +150,7 @@ func TestBatchLingerDisabledByDefaultStartsImmediately(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -161,7 +167,7 @@ func TestQueueStatusCommentsDisabledByDefault(t *testing.T) {
 	m.runStatus = "running"
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -175,7 +181,7 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 	m.runStatus = "running"
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true, BotUser: "mq-bot"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 
@@ -196,7 +202,7 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 		}
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("unchanged running batch: %v", err)
 	}
 	if got := len(m.queueComments[1]); got != 1 {
@@ -209,11 +215,11 @@ func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
 	m.runStatus = "running"
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.runStatus = "success"
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -231,11 +237,11 @@ func TestBatchLingerWaitsWhileUnderTargetAndWindow(t *testing.T) {
 	now := time.Unix(100, 0)
 	e.now = func() time.Time { return now }
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start linger: %v", err)
 	}
 	now = now.Add(9 * time.Second)
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("continue linger: %v", err)
 	}
 
@@ -253,12 +259,12 @@ func TestBatchLingerStartsWhenTargetReached(t *testing.T) {
 	now := time.Unix(100, 0)
 	e.now = func() time.Time { return now }
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start linger: %v", err)
 	}
 	m.addPR(3)
 	now = now.Add(time.Second)
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("target reached: %v", err)
 	}
 
@@ -279,11 +285,11 @@ func TestBatchLingerStartsWhenWindowExpires(t *testing.T) {
 	now := time.Unix(100, 0)
 	e.now = func() time.Time { return now }
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start linger: %v", err)
 	}
 	now = now.Add(10 * time.Second)
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("window expired: %v", err)
 	}
 
@@ -301,24 +307,24 @@ func TestBatchLingerResetsAfterBatchStarts(t *testing.T) {
 	now := time.Unix(100, 0)
 	e.now = func() time.Time { return now }
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start first linger: %v", err)
 	}
 	m.addPR(2)
 	now = now.Add(time.Second)
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start first batch: %v", err)
 	}
 	if !e.lingerSince.IsZero() {
 		t.Fatal("linger state should reset when first batch starts")
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land first batch: %v", err)
 	}
 
 	m.addPR(3)
 	now = now.Add(10 * time.Second)
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start second linger: %v", err)
 	}
 
@@ -387,13 +393,13 @@ func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
 	m := newMock(1, 1, 2, 3, 4)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BisectFanout: 2}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start root batch: %v", err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("split root batch: %v", err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start split subtrees: %v", err)
 	}
 
@@ -420,7 +426,7 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
 	e := New(cfg, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	if got := len(m.staged); got != 1 {
@@ -431,7 +437,7 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	}
 
 	restarted := New(cfg, m, m)
-	if err := restarted.Reconcile(); err != nil {
+	if err := restarted.Reconcile(context.Background()); err != nil {
 		t.Fatalf("restage restored batch: %v", err)
 	}
 	if got := len(m.staged); got != 2 {
@@ -440,7 +446,7 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Fatalf("merged after restage = %s, want []", got)
 	}
-	if err := restarted.Reconcile(); err != nil {
+	if err := restarted.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land restaged batch: %v", err)
 	}
 	if got := fmt.Sprint(m.merged); got != "[1 2]" {
@@ -457,10 +463,10 @@ func TestCheckpointRestoresPendingBisectionFrontier(t *testing.T) {
 	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
 	e := New(cfg, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start root batch: %v", err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("split root batch: %v", err)
 	}
 	if store.saved == nil {
@@ -538,11 +544,11 @@ func TestLandRevalidatesHappyPath(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -561,11 +567,11 @@ func TestTerminalCommentsUseRunTargetURLWhenAvailable(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.runURLs[e.active[0].stagingSHA] = "https://forge.example.com/o/r/actions/runs/7"
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -578,11 +584,11 @@ func TestLandSkipsChangedHead(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.prs[1].Head.Sha = "head-1-new"
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -601,11 +607,11 @@ func TestLandSkipsCancelledAutomerge(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.automerge[1] = false
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -633,12 +639,12 @@ func TestLandSkipsClosedOrMergedPR(t *testing.T) {
 			m := newMock(-1, 1)
 			e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-			if err := e.Reconcile(); err != nil {
+			if err := e.Reconcile(context.Background()); err != nil {
 				t.Fatalf("start batch: %v", err)
 			}
 			m.prs[1].State = tc.state
 			m.prs[1].Merged = tc.merged
-			if err := e.Reconcile(); err != nil {
+			if err := e.Reconcile(context.Background()); err != nil {
 				t.Fatalf("land batch: %v", err)
 			}
 
@@ -661,10 +667,10 @@ func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
 	}
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}
 
@@ -687,7 +693,7 @@ func TestStagingConflictOnSecondPRQueuesPrefixBeforeSuffix(t *testing.T) {
 	m.conflictPR = 2
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -708,20 +714,20 @@ func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
 	m.conflictBasePR = 1
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := fmt.Sprint(m.merged); got != "[1]" {
 		t.Fatalf("merged after prefix = %s, want [1]", got)
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !m.bounced[2] {
@@ -734,10 +740,10 @@ func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
 		t.Fatalf("pending after conflicter bounce = %s, want [[3]]", got)
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	sort.Ints(m.merged)
@@ -755,23 +761,23 @@ func TestStagingConflictAfterPrefixFailsCanLandConflicter(t *testing.T) {
 	m.conflictBasePR = 1
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !m.bounced[1] {
 		t.Fatal("failing prefix should bounce")
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if m.bounced[2] {
@@ -791,21 +797,21 @@ func TestStagingConflictKeepsChangedPrefixBeforeSuffix(t *testing.T) {
 	m.conflictPR = 2
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	m.prs[1].Head.Sha = "head-1-new"
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := fmt.Sprint(e.pending); got != "[[1] [2]]" {
 		t.Fatalf("pending after changed prefix = %s, want [[1] [2]]", got)
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := fmt.Sprint(m.staged); got != "[[1 2] [1] [1]]" {
@@ -819,7 +825,7 @@ func TestStagingConflictOnFirstPRBouncesAndRequeuesRest(t *testing.T) {
 	m.conflictFirst = true
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !m.bounced[1] {
@@ -829,10 +835,10 @@ func TestStagingConflictOnFirstPRBouncesAndRequeuesRest(t *testing.T) {
 		t.Fatalf("pending after first conflict = %s, want [[2 3]]", got)
 	}
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	sort.Ints(m.merged)
@@ -865,14 +871,14 @@ func TestMetricsTrackQueueActivity(t *testing.T) {
 	c := metrics.New()
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Metrics: c}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start reconcile: %v", err)
 	}
 	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 2`)
 	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 1`)
 	assertMetric(t, c, `shunt_batches_started_total{owner="o",repo="r",base="main"} 1`)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land reconcile: %v", err)
 	}
 	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 0`)
@@ -888,7 +894,7 @@ func TestMetricsTrackStagingConflictAndBounce(t *testing.T) {
 	c := metrics.New()
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Metrics: c}, m, m)
 
-	if err := e.Reconcile(); err != nil {
+	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !m.bounced[1] {

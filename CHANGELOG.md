@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- Structured JSON logging with stable fields for daemon lifecycle, webhook,
+  manager, and queue events.
 - Optional managed repository webhook setup via `SHUNT_WEBHOOK_URL`, reusing the
   existing admin token to create or update shunt-owned hooks.
 - Source PRs now receive explicit terminal queue feedback: landed, rejected,
@@ -17,9 +19,15 @@ All notable changes to this project are documented here. The format is based on
   across restarts; restored active batches are re-staged before landing.
 
 ### Fixed
+- Reconcile, checkpoint, forge API, and git staging operations now receive the
+  process context so shutdown can cancel in-flight work cleanly.
 - Forgejo Actions readiness now prefers the run-level aggregate status before
   falling back to task aggregation, avoiding early landings while dependent jobs
   are still being materialized.
+
+### Changed
+- Raised the minimum supported Go version to 1.25 and added CI race/vulnerability
+  checks.
 
 ## [0.3.0] - 2026-06-23
 

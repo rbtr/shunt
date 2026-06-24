@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -73,7 +74,7 @@ bisect_fanout: 2
 		BotEmail:     "bot@example.invalid",
 		Metrics:      metrics.New(),
 	})
-	if err := m.Refresh(); err != nil {
+	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	if rawRef != "main" {
@@ -89,6 +90,13 @@ bisect_fanout: 2
 	if got.cfg.StatusCtx != "shunt" || got.cfg.MergeStyle != "squash" || got.cfg.MaxBatch != 4 ||
 		got.cfg.BatchLinger != 20*time.Second || got.cfg.BatchTarget != 3 || got.cfg.BisectFanout != 2 {
 		t.Fatalf("engine config = %+v", got.cfg)
+	}
+	firstEngine := got.engine
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+	if m.engines["o/r@trunk"].engine != firstEngine {
+		t.Fatal("refresh recreated unchanged engine")
 	}
 }
 
@@ -137,7 +145,7 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 		BotEmail:     "bot@example.invalid",
 		Metrics:      metrics.New(),
 	})
-	if err := m.Refresh(); err != nil {
+	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	got, ok := m.engines["o/r@main"]
@@ -203,7 +211,7 @@ func TestRefreshEnsuresWebhookWhenConfigured(t *testing.T) {
 		BotEmail:      "bot@example.invalid",
 		Metrics:       metrics.New(),
 	})
-	if err := m.Refresh(); err != nil {
+	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	if createdHook == nil {
@@ -244,7 +252,7 @@ func TestRefreshRejectsInvalidRepoConfig(t *testing.T) {
 		BotEmail:     "bot@example.invalid",
 		Metrics:      metrics.New(),
 	})
-	if err := m.Refresh(); err != nil {
+	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	if len(m.engines) != 0 {
