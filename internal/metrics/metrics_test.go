@@ -6,12 +6,15 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandlerExposesPrometheusText(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: "o", Repo: "r", Base: "main"}
 	c.ObserveQueue(labels, 3, true)
+	c.ObserveQueueAge(labels, 90*time.Second)
+	c.ObserveTimeInQueue(labels, "merged", 90*time.Second)
 	c.IncBatchesStarted(labels)
 	c.IncPRMerge(labels)
 	c.IncBounce(labels)
@@ -30,12 +33,18 @@ func TestHandlerExposesPrometheusText(t *testing.T) {
 		"# TYPE shunt_queue_depth gauge\n",
 		`shunt_queue_depth{owner="o",repo="r",base="main"} 3`,
 		`shunt_active_batch{owner="o",repo="r",base="main"} 1`,
+		`shunt_queue_oldest_age_seconds{owner="o",repo="r",base="main"} 90`,
 		`shunt_batches_started_total{owner="o",repo="r",base="main"} 1`,
 		`shunt_pr_merges_total{owner="o",repo="r",base="main"} 1`,
 		`shunt_bounces_total{owner="o",repo="r",base="main"} 1`,
 		`shunt_staging_conflicts_total{owner="o",repo="r",base="main"} 1`,
 		`shunt_reconcile_errors_total{owner="o",repo="r",base="main"} 1`,
 		`shunt_gate_outcomes_total{owner="o",repo="r",base="main",outcome="success"} 1`,
+		`shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="60"} 0`,
+		`shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="300"} 1`,
+		`shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="+Inf"} 1`,
+		`shunt_time_in_queue_seconds_sum{owner="o",repo="r",base="main",outcome="merged"} 90`,
+		`shunt_time_in_queue_seconds_count{owner="o",repo="r",base="main",outcome="merged"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics output missing %q in:\n%s", want, body)

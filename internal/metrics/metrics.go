@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Labels identify one managed merge queue.
@@ -19,16 +21,36 @@ type Labels struct {
 }
 
 type queueMetrics struct {
-	QueueDepth       int
-	ActiveBatch      bool
-	PendingBatches   [][]int
-	ActiveBatches    [][]int
-	BatchesStarted   uint64
-	PRMerges         uint64
-	Bounces          uint64
-	StagingConflicts uint64
-	ReconcileErrors  uint64
-	GateOutcomes     map[string]uint64
+	QueueDepth            int
+	ActiveBatch           bool
+	PendingBatches        [][]int
+	ActiveBatches         [][]int
+	OldestQueueAgeSeconds float64
+	BatchesStarted        uint64
+	PRMerges              uint64
+	Bounces               uint64
+	StagingConflicts      uint64
+	ReconcileErrors       uint64
+	GateOutcomes          map[string]uint64
+	TimeInQueue           map[string]timeInQueueHistogram
+}
+
+type timeInQueueHistogram struct {
+	Buckets []uint64
+	Count   uint64
+	Sum     float64
+}
+
+var timeInQueueBuckets = []float64{
+	60,
+	300,
+	900,
+	1800,
+	3600,
+	7200,
+	21600,
+	43200,
+	86400,
 }
 
 // Collector stores process-local metrics and renders Prometheus text exposition.
@@ -86,6 +108,45 @@ func (c *Collector) ObserveQueueStatus(labels Labels, pending, active [][]int) {
 	q.ActiveBatches = cloneBatches(active)
 	q.QueueDepth = batchDepth(q.PendingBatches) + batchDepth(q.ActiveBatches)
 	q.ActiveBatch = len(q.ActiveBatches) > 0
+}
+
+// ObserveQueueAge records the oldest process-local age among currently queued PRs.
+func (c *Collector) ObserveQueueAge(labels Labels, oldest time.Duration) {
+	if c == nil {
+		return
+	}
+	if oldest < 0 {
+		oldest = 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureLocked(labels).OldestQueueAgeSeconds = oldest.Seconds()
+}
+
+// ObserveTimeInQueue records how long a PR spent in the process-local queue.
+func (c *Collector) ObserveTimeInQueue(labels Labels, outcome string, age time.Duration) {
+	if c == nil || outcome == "" {
+		return
+	}
+	if age < 0 {
+		age = 0
+	}
+	seconds := age.Seconds()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q := c.ensureLocked(labels)
+	h := q.TimeInQueue[outcome]
+	if h.Buckets == nil {
+		h.Buckets = make([]uint64, len(timeInQueueBuckets))
+	}
+	for i, le := range timeInQueueBuckets {
+		if seconds <= le {
+			h.Buckets[i]++
+		}
+	}
+	h.Count++
+	h.Sum += seconds
+	q.TimeInQueue[outcome] = h
 }
 
 // IncBatchesStarted records a batch that was staged and sent to the gate.
@@ -164,8 +225,17 @@ func (c *Collector) ensureLocked(labels Labels) *queueMetrics {
 	}
 	q, ok := c.queues[labels]
 	if !ok {
-		q = &queueMetrics{GateOutcomes: map[string]uint64{}}
+		q = &queueMetrics{
+			GateOutcomes: map[string]uint64{},
+			TimeInQueue:  map[string]timeInQueueHistogram{},
+		}
 		c.queues[labels] = q
+	}
+	if q.GateOutcomes == nil {
+		q.GateOutcomes = map[string]uint64{}
+	}
+	if q.TimeInQueue == nil {
+		q.TimeInQueue = map[string]timeInQueueHistogram{}
 	}
 	return q
 }
@@ -182,6 +252,8 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		"# TYPE shunt_queue_depth gauge",
 		"# HELP shunt_active_batch Whether a queue currently has a batch under gate test.",
 		"# TYPE shunt_active_batch gauge",
+		"# HELP shunt_queue_oldest_age_seconds Oldest process-local age of any PR currently known in the in-memory queue.",
+		"# TYPE shunt_queue_oldest_age_seconds gauge",
 		"# HELP shunt_batches_started_total Number of batches staged and sent to the gate.",
 		"# TYPE shunt_batches_started_total counter",
 		"# HELP shunt_pr_merges_total Number of pull requests merged by shunt.",
@@ -194,6 +266,8 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		"# TYPE shunt_reconcile_errors_total counter",
 		"# HELP shunt_gate_outcomes_total Number of terminal gate outcomes by result.",
 		"# TYPE shunt_gate_outcomes_total counter",
+		"# HELP shunt_time_in_queue_seconds Process-local time a PR spent in the queue before leaving, partitioned by outcome.",
+		"# TYPE shunt_time_in_queue_seconds histogram",
 	} {
 		fmt.Fprintln(w, line)
 	}
@@ -206,6 +280,7 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 			active = 1
 		}
 		fmt.Fprintf(w, "shunt_active_batch%s %d\n", labels, active)
+		fmt.Fprintf(w, "shunt_queue_oldest_age_seconds%s %s\n", labels, formatFloat(q.metrics.OldestQueueAgeSeconds))
 		fmt.Fprintf(w, "shunt_batches_started_total%s %d\n", labels, q.metrics.BatchesStarted)
 		fmt.Fprintf(w, "shunt_pr_merges_total%s %d\n", labels, q.metrics.PRMerges)
 		fmt.Fprintf(w, "shunt_bounces_total%s %d\n", labels, q.metrics.Bounces)
@@ -219,6 +294,25 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		sort.Strings(outcomes)
 		for _, outcome := range outcomes {
 			fmt.Fprintf(w, "shunt_gate_outcomes_total%s %d\n", labelSet(q.labels, "outcome", outcome), q.metrics.GateOutcomes[outcome])
+		}
+
+		timeOutcomes := make([]string, 0, len(q.metrics.TimeInQueue))
+		for outcome := range q.metrics.TimeInQueue {
+			timeOutcomes = append(timeOutcomes, outcome)
+		}
+		sort.Strings(timeOutcomes)
+		for _, outcome := range timeOutcomes {
+			h := q.metrics.TimeInQueue[outcome]
+			for i, le := range timeInQueueBuckets {
+				var count uint64
+				if i < len(h.Buckets) {
+					count = h.Buckets[i]
+				}
+				fmt.Fprintf(w, "shunt_time_in_queue_seconds_bucket%s %d\n", labelSet(q.labels, "outcome", outcome, "le", formatFloat(le)), count)
+			}
+			fmt.Fprintf(w, "shunt_time_in_queue_seconds_bucket%s %d\n", labelSet(q.labels, "outcome", outcome, "le", "+Inf"), h.Count)
+			fmt.Fprintf(w, "shunt_time_in_queue_seconds_sum%s %s\n", labelSet(q.labels, "outcome", outcome), formatFloat(h.Sum))
+			fmt.Fprintf(w, "shunt_time_in_queue_seconds_count%s %d\n", labelSet(q.labels, "outcome", outcome), h.Count)
 		}
 	}
 }
@@ -239,6 +333,11 @@ func (c *Collector) snapshot() []snapshotQueue {
 		}
 		copyMetrics.PendingBatches = cloneBatches(metrics.PendingBatches)
 		copyMetrics.ActiveBatches = cloneBatches(metrics.ActiveBatches)
+		copyMetrics.TimeInQueue = make(map[string]timeInQueueHistogram, len(metrics.TimeInQueue))
+		for outcome, h := range metrics.TimeInQueue {
+			h.Buckets = append([]uint64(nil), h.Buckets...)
+			copyMetrics.TimeInQueue[outcome] = h
+		}
 		out = append(out, snapshotQueue{labels: labels, metrics: copyMetrics})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -317,4 +416,8 @@ func labelSet(labels Labels, extra ...string) string {
 func escape(s string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
 	return replacer.Replace(s)
+}
+
+func formatFloat(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }

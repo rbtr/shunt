@@ -895,6 +895,31 @@ func TestMetricsTrackQueueActivity(t *testing.T) {
 	}
 }
 
+func TestMetricsTrackQueueAgeAndTimeInQueue(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	c := metrics.New()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Metrics: c}, m, m)
+	now := time.Unix(100, 0)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start reconcile: %v", err)
+	}
+	now = now.Add(30 * time.Second)
+	e.observeQueue()
+	assertMetric(t, c, `shunt_queue_oldest_age_seconds{owner="o",repo="r",base="main"} 30`)
+
+	now = now.Add(15 * time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("land reconcile: %v", err)
+	}
+	assertMetric(t, c, `shunt_queue_oldest_age_seconds{owner="o",repo="r",base="main"} 0`)
+	assertMetric(t, c, `shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="60"} 2`)
+	assertMetric(t, c, `shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="+Inf"} 2`)
+	assertMetric(t, c, `shunt_time_in_queue_seconds_sum{owner="o",repo="r",base="main",outcome="merged"} 90`)
+	assertMetric(t, c, `shunt_time_in_queue_seconds_count{owner="o",repo="r",base="main",outcome="merged"} 2`)
+}
+
 func TestMetricsTrackStagingConflictAndBounce(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	m.conflictPR = 1
@@ -910,6 +935,7 @@ func TestMetricsTrackStagingConflictAndBounce(t *testing.T) {
 	}
 	assertMetric(t, c, `shunt_staging_conflicts_total{owner="o",repo="r",base="main"} 1`)
 	assertMetric(t, c, `shunt_bounces_total{owner="o",repo="r",base="main"} 1`)
+	assertMetric(t, c, `shunt_time_in_queue_seconds_count{owner="o",repo="r",base="main",outcome="bounced"} 1`)
 	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 1`)
 }
 

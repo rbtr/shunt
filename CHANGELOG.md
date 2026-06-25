@@ -20,6 +20,8 @@ All notable changes to this project are documented here. The format is based on
 - Optional bbolt queue checkpoint storage via `SHUNT_STATE_PATH`, preserving
   pending candidates, active batch metadata, linger state, and bisection counters
   across restarts; restored active batches are re-staged before landing.
+- Process-local queue-age gauge and time-in-queue histogram metrics for PRs that
+  merge, bounce, or drop out of the in-memory queue.
 
 ### Fixed
 - Reconcile, checkpoint, forge API, and git staging operations now receive the
