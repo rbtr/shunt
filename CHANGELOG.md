@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format is based on
 - JSON `/status` endpoint with safe process-local queue identity, depth, and
   active/pending PR-number batches, complementing `/metrics` and optional
   sticky PR comments.
+- Human-readable `/status.html` page for the same process-local queue status
+  data exposed by `/status`.
 - Optional managed repository webhook setup via `SHUNT_WEBHOOK_URL`, reusing the
   existing admin token to create or update shunt-owned hooks.
 - Source PRs now receive explicit terminal queue feedback: landed, rejected,

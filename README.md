@@ -174,10 +174,11 @@ from when the current process first sees a PR, and metrics do not include
 persisted history.
 
 `GET /status` exposes the process-local queue membership as JSON for lightweight
-ops surfaces that need more detail than counters. The response contains only
-queue identity (`owner`, `repo`, `base`), depth, active/pending PR-number
-batches, and whether any batch is active; it omits tokens, clone URLs, staging
-SHAs, and other internal details.
+ops surfaces that need more detail than counters. `GET /status.html` serves the
+same data as a small human-readable page. Both surfaces contain only queue
+identity (`owner`, `repo`, `base`), depth, active/pending PR-number batches, and
+whether any batch is active; they omit tokens, clone URLs, staging SHAs, and
+other internal details.
 
 Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
 keeps one sticky comment per queued PR, identified by a stable hidden marker, and

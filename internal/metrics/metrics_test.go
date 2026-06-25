@@ -112,6 +112,58 @@ func TestStatusHandlerExposesSafeQueueSnapshot(t *testing.T) {
 	}
 }
 
+func TestStatusPageHandlerExposesHumanQueueSnapshot(t *testing.T) {
+	c := New()
+	labels := Labels{Owner: "octo", Repo: "widgets", Base: "main"}
+	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, [][]int{{1, 2}})
+
+	rr := httptest.NewRecorder()
+	c.StatusPageHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status.html", nil))
+
+	if got := rr.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{
+		"shunt queue status",
+		"octo/widgets@main",
+		"<td>5</td>",
+		"[1 2]",
+		"[3] [4 5]",
+		"/status",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status page missing %q in:\n%s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"token", "clone", ".git", "staging_sha", "staging_branch"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("status page contains forbidden value %q in %s", forbidden, body)
+		}
+	}
+}
+
+func TestStatusPageHandlerEscapesQueueIdentity(t *testing.T) {
+	c := New()
+	labels := Labels{Owner: `<script>`, Repo: `widgets&tools`, Base: `main"branch`}
+	c.ObserveQueueStatus(labels, [][]int{{1}}, nil)
+
+	rr := httptest.NewRecorder()
+	c.StatusPageHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status.html", nil))
+
+	body := rr.Body.String()
+	for _, forbidden := range []string{`<script>`, `widgets&tools`, `main"branch`} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("status page did not escape %q in:\n%s", forbidden, body)
+		}
+	}
+	for _, want := range []string{`&lt;script&gt;`, `widgets&amp;tools`, `main&#34;branch`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status page missing escaped value %q in:\n%s", want, body)
+		}
+	}
+}
+
 func TestStatusSnapshotCopiesBatches(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: "o", Repo: "r", Base: "main"}

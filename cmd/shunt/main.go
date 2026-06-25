@@ -247,6 +247,7 @@ func newHTTPMux(metricsCollector *metrics.Collector, webhook webhookConfig) *htt
 	})
 	mux.Handle("/metrics", metricsCollector.Handler())
 	mux.Handle("/status", metricsCollector.StatusHandler())
+	mux.Handle("/status.html", metricsCollector.StatusPageHandler())
 	mux.HandleFunc("/webhook", webhook.handler)
 	return mux
 }
