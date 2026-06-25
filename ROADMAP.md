@@ -64,9 +64,10 @@ welcome.
 - **Serial initial batches.** One rollup batch is seeded at a time per
   `(repo, base)`. Bisection can fan out, but shunt still avoids speculative
   parallel batches from fresh queue entries.
-- **No automated end-to-end burn-in.** The forge client now has an env-gated live
-  integration harness, but disposable-repo and busy-repo queue burn-in are still
-  manual.
+- **No automated live-forge burn-in.** The default test suite now includes a
+  local engine + native-git burn-in for bisection and landing, and the forge
+  client has an env-gated live integration harness, but disposable-repo and
+  busy-repo live queue burn-in are still manual.
 - **Process-local observability only.** Prometheus text metrics, JSON status, and
   optional sticky PR queue-status comments cover process-local queue depth,
   active/pending PR numbers, oldest queued PR age, time-in-queue histograms, and
@@ -152,9 +153,13 @@ welcome.
   file-lock standby is not a supported HA mode.
 
 ### Validation
-- Burn-in on a real, busy repository with a heavy end-to-end suite and
+- ~~Local end-to-end burn-in through the engine and native git staging.~~
+  Completed: the default test suite exercises a failed multi-PR batch, bisection,
+  bad-PR bounce, and successful landing of the good PRs using a real temporary git
+  repository.
+- Live burn-in on a real, busy repository with a heavy end-to-end suite and
   concurrent contributors — the scenario shunt is built for, and the one that
-  will surface the edges above.
+  will surface forge-specific edges.
 
 ## Non-goals (for now)
 

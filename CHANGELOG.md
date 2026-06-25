@@ -22,6 +22,8 @@ All notable changes to this project are documented here. The format is based on
   across restarts; restored active batches are re-staged before landing.
 - Process-local queue-age gauge and time-in-queue histogram metrics for PRs that
   merge, bounce, or drop out of the in-memory queue.
+- Local burn-in test coverage that drives the engine through real native-git
+  staging, failed batch bisection, bad-PR bounce, and good-PR landings.
 
 ### Fixed
 - Reconcile, checkpoint, forge API, and git staging operations now receive the
