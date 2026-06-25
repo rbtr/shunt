@@ -191,6 +191,11 @@ stage [2 3] still conflicts at 2   -> bounce 2, queue [3]
 If `[1]` fails or is skipped and does not land, `[2 3]` is instead retried
 against the unchanged current base, so `2` can still pass.
 
+The default test suite includes a local burn-in scenario for this path. It uses a
+temporary real git repository, the production git staging implementation, and a
+test forge adapter to stage a multi-PR batch, fail the batch gate, bisect to the
+bad PR, bounce it, and land the good PRs.
+
 ## Correctness
 
 - **Nothing lands un-tested.** Branch protection blocks merges without the
