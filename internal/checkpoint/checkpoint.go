@@ -8,36 +8,36 @@ import (
 
 // QueueKey identifies a single merge queue.
 type QueueKey struct {
-	Owner string
-	Repo  string
-	Base  string
+	Owner string `json:"Owner"`
+	Repo  string `json:"Repo"`
+	Base  string `json:"Base"`
 }
 
 // QueueSnapshot is the durable shape of queue state.
 type QueueSnapshot struct {
-	Key             QueueKey
-	Pending         [][]int
-	Active          []ActiveBatchSnapshot
-	LingerSince     time.Time
-	BaseGeneration  int
-	StagingSequence int
+	Key             QueueKey              `json:"Key"`
+	Pending         [][]int               `json:"Pending"`
+	Active          []ActiveBatchSnapshot `json:"Active"`
+	LingerSince     time.Time             `json:"LingerSince"`
+	BaseGeneration  int                   `json:"BaseGeneration"`
+	StagingSequence int                   `json:"StagingSequence"`
 }
 
 // ActiveBatchSnapshot records a staging branch currently waiting on its gate.
 // Restores re-queue active batches for fresh staging instead of trusting an old
 // run from before the process restart.
 type ActiveBatchSnapshot struct {
-	PRs            []PullRequestSnapshot
-	StagingBranch  string
-	StagingSHA     string
-	BaseGeneration int
-	Outcome        string
+	PRs            []PullRequestSnapshot `json:"PRs"`
+	StagingBranch  string                `json:"StagingBranch"`
+	StagingSHA     string                `json:"StagingSHA"`
+	BaseGeneration int                   `json:"BaseGeneration"`
+	Outcome        string                `json:"Outcome"`
 }
 
 // PullRequestSnapshot is the PR identity needed to resume a staged batch.
 type PullRequestSnapshot struct {
-	Number  int
-	HeadSHA string
+	Number  int    `json:"Number"`
+	HeadSHA string `json:"HeadSHA"`
 }
 
 // Validate checks the snapshot before it is persisted or restored.

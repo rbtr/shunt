@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"testing"
@@ -21,9 +22,10 @@ func TestForgeIntegrationHarness(t *testing.T) {
 
 	cfg := requireForgeIntegrationConfig(t)
 	client := New(cfg.instance, cfg.token)
+	ctx := context.Background()
 
 	t.Run("list pull requests", func(t *testing.T) {
-		prs, err := client.ListOpenPRs(cfg.owner, cfg.repo, cfg.base)
+		prs, err := client.ListOpenPRs(ctx, cfg.owner, cfg.repo, cfg.base)
 		if err != nil {
 			t.Fatalf("ListOpenPRs: %v", err)
 		}
@@ -36,7 +38,7 @@ func TestForgeIntegrationHarness(t *testing.T) {
 			t.Skip("set SHUNT_FORGE_PR_INDEX to exercise PR fetch and timeline auto-merge detection")
 		}
 
-		pr, err := client.GetPR(cfg.owner, cfg.repo, index)
+		pr, err := client.GetPR(ctx, cfg.owner, cfg.repo, index)
 		if err != nil {
 			t.Fatalf("GetPR(%d): %v", index, err)
 		}
@@ -44,7 +46,7 @@ func TestForgeIntegrationHarness(t *testing.T) {
 			t.Fatalf("PR number = %d, want %d", pr.Number, index)
 		}
 
-		scheduled, err := client.AutomergeScheduled(cfg.owner, cfg.repo, index)
+		scheduled, err := client.AutomergeScheduled(ctx, cfg.owner, cfg.repo, index)
 		if err != nil {
 			t.Fatalf("AutomergeScheduled(%d): %v", index, err)
 		}
@@ -57,11 +59,11 @@ func TestForgeIntegrationHarness(t *testing.T) {
 			t.Skip("set SHUNT_FORGE_STATUS_SHA to post a non-required integration-test commit status")
 		}
 
-		context := envOrDefault("SHUNT_FORGE_STATUS_CONTEXT", "shunt-integration")
+		statusContext := envOrDefault("SHUNT_FORGE_STATUS_CONTEXT", "shunt-integration")
 		state := envOrDefault("SHUNT_FORGE_STATUS_STATE", "pending")
 		desc := envOrDefault("SHUNT_FORGE_STATUS_DESCRIPTION", "shunt forge integration harness")
 		targetURL := os.Getenv("SHUNT_FORGE_STATUS_TARGET_URL")
-		if err := client.SetCommitStatus(cfg.owner, cfg.repo, sha, context, state, desc, targetURL); err != nil {
+		if err := client.SetCommitStatus(ctx, cfg.owner, cfg.repo, sha, statusContext, state, desc, targetURL); err != nil {
 			t.Fatalf("SetCommitStatus(%s): %v", sha, err)
 		}
 	})
@@ -72,7 +74,7 @@ func TestForgeIntegrationHarness(t *testing.T) {
 			t.Skip("set SHUNT_FORGE_RUN_SHA to look up a workflow run status")
 		}
 
-		status, err := client.RunStatus(cfg.owner, cfg.repo, sha, os.Getenv("SHUNT_FORGE_RUN_BRANCH"))
+		status, err := client.RunStatus(ctx, cfg.owner, cfg.repo, sha, os.Getenv("SHUNT_FORGE_RUN_BRANCH"))
 		if err != nil {
 			t.Fatalf("RunStatus(%s): %v", sha, err)
 		}
@@ -87,7 +89,7 @@ func TestForgeIntegrationHarness(t *testing.T) {
 		branch := requiredEnv(t, "SHUNT_FORGE_BRANCH_PROTECTION_BRANCH")
 		statusContext := envOrDefault("SHUNT_FORGE_BRANCH_PROTECTION_STATUS_CONTEXT", "merge-queue")
 		botUser := requiredEnv(t, "SHUNT_FORGE_BRANCH_PROTECTION_BOT_USER")
-		changed, err := client.EnsureBranchProtection(cfg.owner, cfg.repo, branch, statusContext, botUser)
+		changed, err := client.EnsureBranchProtection(ctx, cfg.owner, cfg.repo, branch, statusContext, botUser)
 		if err != nil {
 			t.Fatalf("EnsureBranchProtection(%s): %v", branch, err)
 		}

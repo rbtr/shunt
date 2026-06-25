@@ -2,6 +2,7 @@ package bolt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -94,5 +95,29 @@ func TestStoreHonorsCanceledContext(t *testing.T) {
 	err = store.SaveQueue(ctx, checkpoint.QueueSnapshot{Key: checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"}, Pending: [][]int{{1}}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("save canceled err = %v, want context.Canceled", err)
+	}
+}
+
+func TestQueueSnapshotJSONReadsLegacyFieldNames(t *testing.T) {
+	data := []byte(`{
+		"Key":{"Owner":"o","Repo":"r","Base":"main"},
+		"Pending":[[1]],
+		"Active":[{"PRs":[{"Number":1,"HeadSHA":"head-1"}],"StagingBranch":"mq/main/staging","StagingSHA":"stage-1","BaseGeneration":2,"Outcome":"failure"}],
+		"LingerSince":"0001-01-01T00:00:00Z",
+		"BaseGeneration":2,
+		"StagingSequence":7
+	}`)
+	var snapshot checkpoint.QueueSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("validate snapshot: %v", err)
+	}
+	if got := snapshot.Active[0].PRs[0].HeadSHA; got != "head-1" {
+		t.Fatalf("head SHA = %q, want head-1", got)
+	}
+	if got := snapshot.StagingSequence; got != 7 {
+		t.Fatalf("staging sequence = %d, want 7", got)
 	}
 }
