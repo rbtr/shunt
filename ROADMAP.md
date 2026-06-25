@@ -65,10 +65,11 @@ welcome.
 - **No automated end-to-end burn-in.** The forge client now has an env-gated live
   integration harness, but disposable-repo and busy-repo queue burn-in are still
   manual.
-- **Basic observability only.** Prometheus text metrics cover process-local queue
-  depth and key counters, and operators can enable sticky PR queue-status
-  comments. There is still no persisted metrics history, no time-in-queue
-  histogram, and no queue UI (Forgejo has no plugin surface for a native one).
+- **Basic observability only.** Prometheus text metrics, JSON status, and optional
+  sticky PR queue-status comments cover process-local queue depth, active/pending
+  PR numbers, and key counters. There is still no persisted metrics history, no
+  time-in-queue histogram, and no native queue UI (Forgejo has no plugin surface
+  for one).
 
 ## Milestones
 
@@ -124,12 +125,14 @@ welcome.
   `/metrics` exposes process-local Prometheus text metrics for queue depth,
   active batch presence, batches started, PR merges, bounces, staging conflicts,
   reconcile errors, and terminal gate outcomes.
-- Deeper observability: time-in-queue histograms, a status surface, and any
-  persistence needed to preserve operational history across restarts.
+- Deeper observability: time-in-queue histograms and any persistence needed to
+  preserve operational history across restarts.
 - ~~A sticky per-repo PR queue-status comment.~~ Completed as an opt-in
   (`SHUNT_QUEUE_COMMENTS=true`) so write traffic remains an operator choice.
-  A small status page remains a possible follow-up since the forge can't host a
-  native queue UI.
+- ~~A queue status surface (a sticky per-repo PR comment and/or a small status
+  page) since the forge can't host a native one.~~ Completed: `/status` exposes
+  safe process-local JSON with queue identity, depth, active batches, and pending
+  PR-number batches.
 - ~~PR-visible rejection/debug feedback.~~ Completed: terminal queue outcomes
   update source PR statuses and post durable comments with staging debug links
   where available.
@@ -148,4 +151,5 @@ welcome.
 - Bot chat commands (`/merge`, priority labels). The auto-merge button is the
   one and only entry point by design.
 - A native forge UI. Not possible without a plugin system Forgejo/Gitea don't
-  have; a status page is the planned substitute.
+  have; a separate status page can be built on the process-local `/status` API
+  if operators need one.

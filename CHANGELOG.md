@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - Structured JSON logging with stable fields for daemon lifecycle, webhook,
   manager, and queue events.
+- JSON `/status` endpoint with safe process-local queue identity, depth, and
+  active/pending PR-number batches, complementing `/metrics` and optional
+  sticky PR comments.
 - Optional managed repository webhook setup via `SHUNT_WEBHOOK_URL`, reusing the
   existing admin token to create or update shunt-owned hooks.
 - Source PRs now receive explicit terminal queue feedback: landed, rejected,

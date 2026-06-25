@@ -2,6 +2,7 @@
 package metrics
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,8 @@ type Labels struct {
 type queueMetrics struct {
 	QueueDepth       int
 	ActiveBatch      bool
+	PendingBatches   [][]int
+	ActiveBatches    [][]int
 	BatchesStarted   uint64
 	PRMerges         uint64
 	Bounces          uint64
@@ -47,6 +50,16 @@ func (c *Collector) Handler() http.Handler {
 	})
 }
 
+// StatusHandler returns an HTTP handler for the JSON queue status endpoint.
+func (c *Collector) StatusHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(c.StatusSnapshot()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+}
+
 // ObserveQueue records the current in-memory queue state.
 func (c *Collector) ObserveQueue(labels Labels, depth int, active bool) {
 	if c == nil {
@@ -57,6 +70,22 @@ func (c *Collector) ObserveQueue(labels Labels, depth int, active bool) {
 	q := c.ensureLocked(labels)
 	q.QueueDepth = depth
 	q.ActiveBatch = active
+	q.PendingBatches = nil
+	q.ActiveBatches = nil
+}
+
+// ObserveQueueStatus records the current in-memory queue batches.
+func (c *Collector) ObserveQueueStatus(labels Labels, pending, active [][]int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q := c.ensureLocked(labels)
+	q.PendingBatches = cloneBatches(pending)
+	q.ActiveBatches = cloneBatches(active)
+	q.QueueDepth = batchDepth(q.PendingBatches) + batchDepth(q.ActiveBatches)
+	q.ActiveBatch = len(q.ActiveBatches) > 0
 }
 
 // IncBatchesStarted records a batch that was staged and sent to the gate.
@@ -149,7 +178,7 @@ type snapshotQueue struct {
 // WritePrometheus writes a full Prometheus text-format snapshot.
 func (c *Collector) WritePrometheus(w io.Writer) {
 	for _, line := range []string{
-		"# HELP shunt_queue_depth Number of PRs known in the in-memory queue, including the active batch.",
+		"# HELP shunt_queue_depth Number of PRs known in the in-memory queue, including active batches and queued bisection candidates.",
 		"# TYPE shunt_queue_depth gauge",
 		"# HELP shunt_active_batch Whether a queue currently has a batch under gate test.",
 		"# TYPE shunt_active_batch gauge",
@@ -208,6 +237,8 @@ func (c *Collector) snapshot() []snapshotQueue {
 		for outcome, n := range metrics.GateOutcomes {
 			copyMetrics.GateOutcomes[outcome] = n
 		}
+		copyMetrics.PendingBatches = cloneBatches(metrics.PendingBatches)
+		copyMetrics.ActiveBatches = cloneBatches(metrics.ActiveBatches)
 		out = append(out, snapshotQueue{labels: labels, metrics: copyMetrics})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -221,6 +252,54 @@ func (c *Collector) snapshot() []snapshotQueue {
 		return a.Base < b.Base
 	})
 	return out
+}
+
+type StatusSnapshot struct {
+	Queues []QueueStatus `json:"queues"`
+}
+
+type QueueStatus struct {
+	Owner          string  `json:"owner"`
+	Repo           string  `json:"repo"`
+	Base           string  `json:"base"`
+	QueueDepth     int     `json:"queue_depth"`
+	ActiveBatch    bool    `json:"active_batch"`
+	ActiveBatches  [][]int `json:"active_batches"`
+	PendingBatches [][]int `json:"pending_batches"`
+}
+
+// StatusSnapshot returns a safe, machine-readable snapshot of queue state.
+func (c *Collector) StatusSnapshot() StatusSnapshot {
+	queues := c.snapshot()
+	out := StatusSnapshot{Queues: make([]QueueStatus, 0, len(queues))}
+	for _, q := range queues {
+		out.Queues = append(out.Queues, QueueStatus{
+			Owner:          q.labels.Owner,
+			Repo:           q.labels.Repo,
+			Base:           q.labels.Base,
+			QueueDepth:     q.metrics.QueueDepth,
+			ActiveBatch:    q.metrics.ActiveBatch,
+			ActiveBatches:  cloneBatches(q.metrics.ActiveBatches),
+			PendingBatches: cloneBatches(q.metrics.PendingBatches),
+		})
+	}
+	return out
+}
+
+func cloneBatches(in [][]int) [][]int {
+	out := make([][]int, len(in))
+	for i, batch := range in {
+		out[i] = append([]int(nil), batch...)
+	}
+	return out
+}
+
+func batchDepth(batches [][]int) int {
+	depth := 0
+	for _, batch := range batches {
+		depth += len(batch)
+	}
+	return depth
 }
 
 func labelSet(labels Labels, extra ...string) string {

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -877,6 +878,9 @@ func TestMetricsTrackQueueActivity(t *testing.T) {
 	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 2`)
 	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 1`)
 	assertMetric(t, c, `shunt_batches_started_total{owner="o",repo="r",base="main"} 1`)
+	if got, want := c.StatusSnapshot().Queues[0].ActiveBatches, [][]int{{1, 2}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active status batches = %v, want %v", got, want)
+	}
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land reconcile: %v", err)
@@ -885,6 +889,10 @@ func TestMetricsTrackQueueActivity(t *testing.T) {
 	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 0`)
 	assertMetric(t, c, `shunt_pr_merges_total{owner="o",repo="r",base="main"} 2`)
 	assertMetric(t, c, `shunt_gate_outcomes_total{owner="o",repo="r",base="main",outcome="success"} 1`)
+	snap := c.StatusSnapshot().Queues[0]
+	if snap.ActiveBatch || len(snap.ActiveBatches) != 0 || len(snap.PendingBatches) != 0 {
+		t.Fatalf("status after landing = %#v, want no active or pending batches", snap)
+	}
 }
 
 func TestMetricsTrackStagingConflictAndBounce(t *testing.T) {

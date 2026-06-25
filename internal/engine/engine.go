@@ -575,14 +575,15 @@ func firstPR(prs []forge.PullRequest) int {
 }
 
 func (e *Engine) observeQueue() {
-	depth := 0
+	pending := make([][]int, 0, len(e.pending))
 	for _, cand := range e.pending {
-		depth += len(cand)
+		pending = append(pending, append([]int(nil), cand...))
 	}
+	active := make([][]int, 0, len(e.active))
 	for _, a := range e.active {
-		depth += len(a.prs)
+		active = append(active, numbersOf(a.prs))
 	}
-	e.cfg.Metrics.ObserveQueue(e.metricLabels(), depth, len(e.active) > 0)
+	e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active)
 }
 
 const queueCommentMarker = "<!-- shunt:queue-status -->"
