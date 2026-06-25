@@ -84,8 +84,8 @@ welcome.
   on restart.
 - ~~Postgres checkpoint store: schema plus a tested implementation of the engine
   checkpoint boundary can persist the per-`(repo, base)` work queue, active batch
-  metadata, linger timestamp, and bisection counters.~~ Completed as a reference
-  external store; runtime configuration remains a follow-up.
+  metadata, linger timestamp, and bisection counters.~~ Completed with runtime
+  configuration via `SHUNT_POSTGRES_DSN`; migrations are applied at startup.
 - ~~Webhooks: react to `auto_merge_pull_request` (and `push`) to wake reconcile
   immediately, keeping the poll as a backstop.~~ Completed: `/webhook` wakes the
   reconcile loop for auto-merge, pull-request, review, status, and push events

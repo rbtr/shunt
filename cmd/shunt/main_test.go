@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -211,7 +212,8 @@ func TestEnvBool(t *testing.T) {
 
 func TestOpenCheckpointStoreDisabledByDefault(t *testing.T) {
 	t.Setenv("SHUNT_STATE_PATH", "")
-	store, err := openCheckpointStore(slog.Default())
+	t.Setenv("SHUNT_POSTGRES_DSN", "")
+	store, err := openCheckpointStore(context.Background(), slog.Default())
 	if err != nil {
 		t.Fatalf("open checkpoint store: %v", err)
 	}
@@ -221,8 +223,9 @@ func TestOpenCheckpointStoreDisabledByDefault(t *testing.T) {
 }
 
 func TestOpenCheckpointStoreUsesStatePath(t *testing.T) {
+	t.Setenv("SHUNT_POSTGRES_DSN", "")
 	t.Setenv("SHUNT_STATE_PATH", t.TempDir()+"/shunt.db")
-	store, err := openCheckpointStore(slog.Default())
+	store, err := openCheckpointStore(context.Background(), slog.Default())
 	if err != nil {
 		t.Fatalf("open checkpoint store: %v", err)
 	}
@@ -231,5 +234,14 @@ func TestOpenCheckpointStoreUsesStatePath(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
+	}
+}
+
+func TestOpenCheckpointStoreRejectsMultipleBackends(t *testing.T) {
+	t.Setenv("SHUNT_STATE_PATH", t.TempDir()+"/shunt.db")
+	t.Setenv("SHUNT_POSTGRES_DSN", "postgres://user:pass@example.invalid/db")
+	_, err := openCheckpointStore(context.Background(), slog.Default())
+	if err == nil {
+		t.Fatal("open checkpoint store should reject multiple backends")
 	}
 }

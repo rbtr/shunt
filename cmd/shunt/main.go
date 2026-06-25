@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	checkpointbolt "github.com/rbtr/shunt/internal/checkpoint/bolt"
+	checkpointpostgres "github.com/rbtr/shunt/internal/checkpoint/postgres"
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/gitops"
@@ -99,7 +102,7 @@ func main() {
 	}
 
 	metricsCollector := metrics.New()
-	checkpointStore, err := openCheckpointStore(logger)
+	checkpointStore, err := openCheckpointStore(ctx, logger)
 	if err != nil {
 		fatal(logger, "checkpoint store error", "error", err)
 	}
@@ -187,10 +190,51 @@ func fatal(logger *slog.Logger, msg string, args ...any) {
 	os.Exit(1)
 }
 
-func openCheckpointStore(logger *slog.Logger) (*checkpointbolt.Store, error) {
+type checkpointStoreCloser interface {
+	engine.CheckpointStore
+	Close() error
+}
+
+type postgresCheckpointStore struct {
+	*checkpointpostgres.Store
+	db *sql.DB
+}
+
+func (s *postgresCheckpointStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func openCheckpointStore(ctx context.Context, logger *slog.Logger) (checkpointStoreCloser, error) {
 	path := strings.TrimSpace(os.Getenv("SHUNT_STATE_PATH"))
-	if path == "" {
+	dsn := strings.TrimSpace(os.Getenv("SHUNT_POSTGRES_DSN"))
+	if path != "" && dsn != "" {
+		return nil, fmt.Errorf("set only one of SHUNT_STATE_PATH or SHUNT_POSTGRES_DSN")
+	}
+	if path == "" && dsn == "" {
 		return nil, nil
+	}
+	if dsn != "" {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open SHUNT_POSTGRES_DSN: %w", err)
+		}
+		configurePostgresDB(db)
+		store := checkpointpostgres.New(db)
+		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := db.PingContext(startupCtx); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("ping SHUNT_POSTGRES_DSN: %w", err)
+		}
+		if err := store.ApplyMigrations(startupCtx); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		logger.Info("using postgres queue state")
+		return &postgresCheckpointStore{Store: store, db: db}, nil
 	}
 	store, err := checkpointbolt.Open(path)
 	if err != nil {
@@ -198,6 +242,13 @@ func openCheckpointStore(logger *slog.Logger) (*checkpointbolt.Store, error) {
 	}
 	logger.Info("using bbolt queue state", "path", path)
 	return store, nil
+}
+
+func configurePostgresDB(db *sql.DB) {
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 }
 
 func runDaemon(ctx context.Context, logger *slog.Logger, addr string, metricsCollector *metrics.Collector, webhook webhookConfig, interval time.Duration, wake <-chan struct{}, reconcile func(context.Context)) error {

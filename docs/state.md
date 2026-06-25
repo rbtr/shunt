@@ -1,9 +1,9 @@
 # Durable queue state
 
-shunt's default durable store is the built-in bbolt implementation enabled by
-`SHUNT_STATE_PATH`. The `internal/checkpoint/postgres` package is a reference
-Postgres implementation of the same engine checkpoint contract for deployments
-that need an external database-backed store.
+shunt can persist queue checkpoints with either the local bbolt implementation
+enabled by `SHUNT_STATE_PATH` or the Postgres implementation enabled by
+`SHUNT_POSTGRES_DSN`. Leave both unset to keep in-memory queue state, and do not
+set both at once.
 
 The Postgres store persists one snapshot per `(owner, repo, base)` queue in
 `shunt_queue_state`:
@@ -13,7 +13,6 @@ The Postgres store persists one snapshot per `(owner, repo, base)` queue in
 - batch-linger start time
 - base generation and staging branch sequence counters
 
-Call `postgres.New(db).ApplyMigrations(ctx)` once at startup before using the
-store. Runtime configuration is intentionally not exposed yet; bbolt remains the
-built-in configured store while external stores settle behind the shared
-checkpoint boundary.
+When `SHUNT_POSTGRES_DSN` is set, shunt opens the DSN with pgx's `database/sql`
+driver and applies the embedded migration at startup before using the store. Keep
+the DSN in a runtime secret store rather than in repository files.
