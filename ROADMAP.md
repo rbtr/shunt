@@ -139,13 +139,13 @@ welcome.
   (`SHUNT_QUEUE_COMMENTS=true`) so write traffic remains an operator choice.
 - ~~A queue status surface (a sticky per-repo PR comment and/or a small status
   page) since the forge can't host a native one.~~ Completed: `/status` exposes
-  safe process-local JSON with queue identity, depth, active batches, and pending
-  PR-number batches.
+  safe process-local JSON and `/status.html` renders a small human page with
+  queue identity, depth, active batches, and pending PR-number batches.
 - ~~PR-visible rejection/debug feedback.~~ Completed: terminal queue outcomes
   update source PR statuses and post durable comments with staging debug links
   where available.
-- Deeper observability: persisted metrics history and a small status page to
-  preserve and expose operational history across restarts.
+- Deeper observability: persisted metrics history and historical status views to
+  preserve operational history across restarts.
 - ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
   are pruned on startup or first discovery before reconciliation begins for a
   managed `(repo, base)`.

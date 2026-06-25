@@ -256,9 +256,10 @@ metrics history remains a roadmap item.
 
 The JSON status endpoint complements those counters with safe queue membership:
 owner, repo, base, depth, active/pending PR-number batches, and active-batch
-presence. It omits staging SHAs and runtime configuration. When
-`SHUNT_QUEUE_COMMENTS=true`, shunt also keeps one sticky status comment on each
-queued PR and updates terminal queue outcomes there.
+presence. `/status.html` renders the same data for humans. Both omit staging
+SHAs and runtime configuration. When `SHUNT_QUEUE_COMMENTS=true`, shunt also
+keeps one sticky status comment on each queued PR and updates terminal queue
+outcomes there.
 
 ## Running against a real instance (safely)
 

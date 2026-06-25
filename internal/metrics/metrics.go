@@ -4,6 +4,7 @@ package metrics
 import (
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"sort"
@@ -77,6 +78,16 @@ func (c *Collector) StatusHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(c.StatusSnapshot()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+}
+
+// StatusPageHandler returns a small human-readable queue status page.
+func (c *Collector) StatusPageHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := statusPageTemplate.Execute(w, c.StatusSnapshot()); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
@@ -367,6 +378,46 @@ type QueueStatus struct {
 	PendingBatches [][]int `json:"pending_batches"`
 }
 
+var statusPageTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
+	"batchList": formatBatchList,
+}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>shunt queue status</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.4}
+table{border-collapse:collapse;width:100%;max-width:72rem}
+th,td{border:1px solid #ddd;padding:.5rem;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+code{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>shunt queue status</h1>
+{{if .Queues}}
+<table>
+<thead><tr><th>Queue</th><th>Depth</th><th>Active</th><th>Active batches</th><th>Pending batches</th></tr></thead>
+<tbody>
+{{range .Queues}}
+<tr>
+<td><code>{{.Owner}}/{{.Repo}}@{{.Base}}</code></td>
+<td>{{.QueueDepth}}</td>
+<td>{{.ActiveBatch}}</td>
+<td><code>{{batchList .ActiveBatches}}</code></td>
+<td><code>{{batchList .PendingBatches}}</code></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p>No queues are currently known to this process.</p>
+{{end}}
+<p>This page is process-local and exposes only queue identity and PR numbers. JSON is available at <a href="/status">/status</a>.</p>
+</body>
+</html>
+`))
+
 // StatusSnapshot returns a safe, machine-readable snapshot of queue state.
 func (c *Collector) StatusSnapshot() StatusSnapshot {
 	queues := c.snapshot()
@@ -399,6 +450,21 @@ func batchDepth(batches [][]int) int {
 		depth += len(batch)
 	}
 	return depth
+}
+
+func formatBatchList(batches [][]int) string {
+	if len(batches) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(batches))
+	for i, batch := range batches {
+		items := make([]string, len(batch))
+		for j, n := range batch {
+			items[j] = strconv.Itoa(n)
+		}
+		parts[i] = "[" + strings.Join(items, " ") + "]"
+	}
+	return strings.Join(parts, " ")
 }
 
 func labelSet(labels Labels, extra ...string) string {

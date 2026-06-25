@@ -44,6 +44,15 @@ func TestHTTPMuxServesHealthMetricsAndStatus(t *testing.T) {
 			t.Fatalf("/status missing %q in:\n%s", want, statusBody)
 		}
 	}
+
+	statusPageResp := httptest.NewRecorder()
+	mux.ServeHTTP(statusPageResp, httptest.NewRequest("GET", "/status.html", nil))
+	if got := statusPageResp.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("/status.html Content-Type = %q", got)
+	}
+	if body := statusPageResp.Body.String(); !strings.Contains(body, "o/r@main") || !strings.Contains(body, "[1]") || !strings.Contains(body, "[2]") {
+		t.Fatalf("/status.html missing queue details in:\n%s", body)
+	}
 }
 
 func TestWebhookWakesForRelevantEvents(t *testing.T) {
