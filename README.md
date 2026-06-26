@@ -171,7 +171,7 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 
 Logs are structured JSON on stdout, with stable fields such as `component`,
 `owner`, `repo`, and `base` where they apply. Metrics are process-local and
-intentionally minimal in v0.3: queue-age and time-in-queue observations restart
+intentionally minimal in v0.4: queue-age and time-in-queue observations restart
 from when the current process first sees a PR, and metrics do not include
 persisted history.
 
@@ -206,10 +206,10 @@ pure-Go git library so staging merges match real Git behavior.
 ```sh
 cp examples/.env.example .env
 $EDITOR .env
-docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.1.0
+docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.4.0
 
 helm install shunt oci://ghcr.io/rbtr/charts/shunt \
-  --version 0.1.0 \
+  --version 0.4.0 \
   --set config.instance=https://forge.example.com \
   --set token.existingSecret=shunt-bot
 
@@ -266,7 +266,7 @@ comments link to a public-safe forge URL instead of private infrastructure names
 
 ## Status & roadmap
 
-v0.3 is functional but young. Known limitations (opt-in durable state, polling
+v0.4 is functional but young. Known limitations (opt-in durable state, polling
 as a webhook backstop, single replica) and the plan to address them are tracked in
 [`ROADMAP.md`](ROADMAP.md).
 
