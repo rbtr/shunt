@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-26
+
 ### Fixed
 - Managed webhook setup now adopts same-URL Forgejo-typed JSON hooks instead of
   creating a duplicate Gitea-typed hook.
@@ -118,7 +120,8 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/rbtr/shunt/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rbtr/shunt/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rbtr/shunt/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rbtr/shunt/compare/v0.1.0...v0.2.0

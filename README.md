@@ -1,5 +1,9 @@
 # shunt
 
+<p align="center">
+  <img src="docs/assets/shunt-punter.png" alt="A Go gopher punting a queue of boxes down a canal" width="420">
+</p>
+
 **A merge queue for [Forgejo](https://forgejo.org/) and Gitea: batch the stack,
 test once, and bisect only when the batch fails.**
 
@@ -207,10 +211,10 @@ pure-Go git library so staging merges match real Git behavior.
 ```sh
 cp examples/.env.example .env
 $EDITOR .env
-docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.4.0
+docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.4.1
 
 helm install shunt oci://ghcr.io/rbtr/charts/shunt \
-  --version 0.4.0 \
+  --version 0.4.1 \
   --set config.instance=https://forge.example.com \
   --set token.existingSecret=shunt-bot
 
