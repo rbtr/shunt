@@ -75,6 +75,40 @@ func TestEnsureWebhookUpdatesExistingManagedHook(t *testing.T) {
 	}
 }
 
+func TestEnsureWebhookAdoptsForgejoTypedHook(t *testing.T) {
+	var patched map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/hooks":
+			_ = json.NewEncoder(w).Encode([]Hook{{
+				ID:     42,
+				Type:   "forgejo",
+				Active: false,
+				Config: map[string]string{"url": "https://shunt.example.com/webhook", "content_type": "form"},
+				Events: []string{"push"},
+			}})
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/repos/o/r/hooks/42":
+			if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+				t.Fatalf("decode patch body: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	changed, err := New(srv.URL, "token").EnsureWebhook(context.Background(), "o", "r", "https://shunt.example.com/webhook", "secret")
+	if err != nil {
+		t.Fatalf("EnsureWebhook: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	if patched["active"] != true {
+		t.Fatalf("patched active = %v, want true", patched["active"])
+	}
+}
+
 func TestEnsureWebhookLeavesMatchingHookAlone(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/o/r/hooks" {

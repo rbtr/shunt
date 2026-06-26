@@ -135,7 +135,7 @@ func (c *Client) EnsureWebhook(ctx context.Context, owner, repo, targetURL, secr
 		return false, err
 	}
 	for _, hook := range hooks {
-		if hook.Type != "gitea" || hook.Config["url"] != targetURL {
+		if !isGiteaWebhook(hook.Type) || hook.Config["url"] != targetURL {
 			continue
 		}
 		if webhookMatches(hook, targetURL, secret) {
@@ -144,6 +144,10 @@ func (c *Client) EnsureWebhook(ctx context.Context, owner, repo, targetURL, secr
 		return true, c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/hooks/%d", path, hook.ID), webhookBody(targetURL, secret, false), nil)
 	}
 	return true, c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/hooks", path), webhookBody(targetURL, secret, true), nil)
+}
+
+func isGiteaWebhook(hookType string) bool {
+	return hookType == "gitea" || hookType == "forgejo"
 }
 
 func webhookBody(targetURL, secret string, includeType bool) map[string]any {

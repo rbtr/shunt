@@ -243,7 +243,8 @@ timer remains the correctness backstop.
 When `SHUNT_WEBHOOK_URL` is set, shunt uses the same repository-admin token it
 already needs for branch protection to create or update a matching repository
 webhook for each managed repo. Hooks with different URLs are left alone; shunt
-only manages the hook whose URL matches the configured listener URL.
+only manages a Forgejo/Gitea JSON webhook whose URL matches the configured
+listener URL.
 
 Metrics are Prometheus text format, intentionally dependency-free and
 process-local: they are scoped per managed `(owner, repo, base)` queue and cover

@@ -119,7 +119,8 @@ is discovered and managed automatically. For a single repo, set
 If `SHUNT_WEBHOOK_URL` is set, shunt uses the same admin token it already needs
 for branch protection to create or update a repository webhook for each managed
 repo. It leaves unrelated hooks alone and only manages a hook whose URL matches
-`SHUNT_WEBHOOK_URL`. Without that setting, configure a repository or
+`SHUNT_WEBHOOK_URL` and whose type is Forgejo/Gitea's JSON webhook type.
+Without that setting, configure a repository or
 organization webhook yourself. shunt wakes immediately for auto-merge,
 pull-request, review, status, and push events, but still polls on
 `SHUNT_POLL_INTERVAL` so missed webhooks only add latency.

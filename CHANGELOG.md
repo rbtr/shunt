@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Managed webhook setup now adopts same-URL Forgejo-typed JSON hooks instead of
+  creating a duplicate Gitea-typed hook.
+
 ## [0.4.0] - 2026-06-25
 
 ### Added
