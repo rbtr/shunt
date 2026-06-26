@@ -1,6 +1,6 @@
 # Roadmap
 
-shunt v0.3 is usable, but still intentionally small. This page tracks what it
+shunt v0.4 is usable, but still intentionally small. This page tracks what it
 does **not** yet do and the order we intend to fix it. Issues and PRs are
 welcome.
 
