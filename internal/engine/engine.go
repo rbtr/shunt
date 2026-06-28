@@ -232,7 +232,7 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 	if err != nil {
 		if conflictPR > 0 {
 			e.cfg.Metrics.IncStagingConflict(e.metricLabels())
-			return false, e.handleStagingConflict(ctx, numbersOf(prs), conflictPR)
+			return false, e.handleStagingConflict(ctx, prs, conflictPR)
 		}
 		return false, err
 	}
@@ -261,6 +261,13 @@ func (e *Engine) linger(ready []int) bool {
 
 func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 	for _, a := range e.active {
+		changed, err := e.requeueActiveIfHeadChanged(ctx, a)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			return false, nil
+		}
 		if a.outcome == "" {
 			status, err := e.fc.RunStatus(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingSHA, a.stagingBranch)
 			if err != nil {
@@ -268,8 +275,23 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 			}
 			switch status {
 			case "success", "failure", "cancelled", "error":
+				changed, err := e.requeueActiveIfHeadChanged(ctx, a)
+				if err != nil {
+					return false, err
+				}
+				if changed {
+					return false, nil
+				}
+				debugURL := e.debugURL(ctx, a)
+				changed, err = e.requeueActiveIfHeadChanged(ctx, a)
+				if err != nil {
+					return false, err
+				}
+				if changed {
+					return false, nil
+				}
 				a.outcome = status
-				a.debugURL = e.debugURL(ctx, a)
+				a.debugURL = debugURL
 				e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
 			default: // "", running, waiting, blocked -> keep waiting
 				continue
@@ -293,11 +315,40 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				e.requeueStaleActives(ctx)
 			}
 		case "failure", "cancelled", "error":
-			if err := e.bisectOrBounce(ctx, a, a.outcome); err != nil {
+			resolved, err := e.bisectOrBounce(ctx, a, a.outcome)
+			if err != nil {
 				return false, err
+			}
+			if !resolved {
+				return false, nil
 			}
 		}
 		return true, nil
+	}
+	return false, nil
+}
+
+func (e *Engine) requeueActiveIfHeadChanged(ctx context.Context, a *activeBatch) (bool, error) {
+	changed, err := e.activeHeadChanged(ctx, a)
+	if err != nil || !changed {
+		return changed, err
+	}
+	e.requeueChangedActive(ctx, a)
+	return true, nil
+}
+
+func (e *Engine) activeHeadChanged(ctx context.Context, a *activeBatch) (bool, error) {
+	for _, staged := range a.prs {
+		current, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+		if err != nil {
+			return false, err
+		}
+		if current.State != "open" || current.Merged {
+			continue
+		}
+		if current.Head.Sha != staged.Head.Sha {
+			return true, nil
+		}
 	}
 	return false, nil
 }
@@ -394,13 +445,14 @@ func (e *Engine) requeueActiveRemainder(prs []forge.PullRequest) {
 	}
 }
 
-func (e *Engine) handleStagingConflict(ctx context.Context, nums []int, conflictPR int) error {
+func (e *Engine) handleStagingConflict(ctx context.Context, prs []forge.PullRequest, conflictPR int) error {
+	nums := numbersOf(prs)
 	idx := indexOfNum(nums, conflictPR)
 	if idx < 0 {
 		return fmt.Errorf("stager reported conflict on PR #%d outside candidate %v", conflictPR, nums)
 	}
 	if idx == 0 {
-		e.bounce(ctx, conflictPR, "merge conflict while staging the PR", "error", "")
+		e.bounce(ctx, conflictPR, prs[idx].Head.Sha, "merge conflict while staging the PR", "error", "")
 		if len(nums) > 1 {
 			rest := append([]int(nil), nums[1:]...)
 			e.enqueue(rest)
@@ -455,7 +507,7 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 // bisectOrBounce: a size-1 failing batch bounces the culprit; a larger batch is
 // split in half, with the first half tested next (the good half lands, the
 // recursion isolates the bad PR(s)).
-func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) error {
+func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) (bool, error) {
 	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
 		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
 	}
@@ -463,15 +515,15 @@ func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status stri
 	e.removeActive(a)
 
 	if len(nums) == 1 {
-		e.bounce(ctx, nums[0], fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
-		return nil
+		bounced := e.bounce(ctx, nums[0], a.prs[0].Head.Sha, fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
+		return bounced, nil
 	}
 	mid := len(nums) / 2
 	first := append([]int(nil), nums[:mid]...)
 	second := append([]int(nil), nums[mid:]...)
 	e.enqueue(first, second)
 	e.logger.Info("batch failed; bisecting", "prs", nums, "status", status, "first", first, "second", second)
-	return nil
+	return true, nil
 }
 
 func gateOutcomeStatus(status string) string {
@@ -481,16 +533,22 @@ func gateOutcomeStatus(status string) string {
 	return "error"
 }
 
-func (e *Engine) bounce(ctx context.Context, num int, reason, statusState, debugURL string) {
-	e.cfg.Metrics.IncBounce(e.metricLabels())
-	e.observeQueueExit(num, "bounced")
+func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, statusState, debugURL string) bool {
 	if pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, num); err == nil && pr.State == "open" && !pr.Merged {
+		if expectedHeadSHA != "" && pr.Head.Sha != expectedHeadSHA {
+			e.enqueue([]int{num})
+			e.logger.Info("PR requeued instead of bounced after head changed", "pr", num, "oldHead", short(expectedHeadSHA), "newHead", short(pr.Head.Sha))
+			return false
+		}
 		e.notifyPR(ctx, num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true)
 	}
+	e.cfg.Metrics.IncBounce(e.metricLabels())
+	e.observeQueueExit(num, "bounced")
 	if err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, num); err != nil {
 		e.logger.Warn("cancel auto-merge failed", "pr", num, "error", err)
 	}
 	e.logger.Info("PR bounced", "pr", num, "reason", reason)
+	return true
 }
 
 func (e *Engine) activeLimit() int {
@@ -569,6 +627,15 @@ func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
 	e.removeActive(a)
 	e.enqueue(numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
+}
+
+func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
+		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
+	}
+	e.removeActive(a)
+	e.enqueue(numbersOf(a.prs))
+	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))
 }
 
 func (e *Engine) requeueStaleActives(ctx context.Context) {

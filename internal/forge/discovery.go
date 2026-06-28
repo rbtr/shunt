@@ -65,6 +65,7 @@ type Hook struct {
 var shuntWebhookEvents = []string{
 	"auto_merge_pull_request",
 	"pull_request",
+	"pull_request_sync",
 	"pull_request_review_approved",
 	"pull_request_review_rejected",
 	"pull_request_review_comment",

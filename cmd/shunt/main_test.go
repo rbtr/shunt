@@ -57,19 +57,23 @@ func TestHTTPMuxServesHealthMetricsAndStatus(t *testing.T) {
 }
 
 func TestWebhookWakesForRelevantEvents(t *testing.T) {
-	wakes := 0
-	mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() { wakes++ }})
+	for _, event := range []string{"push", "pull_request", "pull_request_sync"} {
+		t.Run(event, func(t *testing.T) {
+			wakes := 0
+			mux := newHTTPMux(metrics.New(), webhookConfig{Wake: func() { wakes++ }})
 
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/webhook", strings.NewReader(`{"ref":"refs/heads/main"}`))
-	req.Header.Set("X-Gitea-Event", "push")
-	mux.ServeHTTP(resp, req)
+			resp := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/webhook", strings.NewReader(`{"ref":"refs/heads/main"}`))
+			req.Header.Set("X-Gitea-Event", event)
+			mux.ServeHTTP(resp, req)
 
-	if resp.Code != 202 {
-		t.Fatalf("/webhook status = %d, want 202", resp.Code)
-	}
-	if wakes != 1 {
-		t.Fatalf("wakes = %d, want 1", wakes)
+			if resp.Code != 202 {
+				t.Fatalf("/webhook status = %d, want 202", resp.Code)
+			}
+			if wakes != 1 {
+				t.Fatalf("wakes = %d, want 1", wakes)
+			}
+		})
 	}
 }
 

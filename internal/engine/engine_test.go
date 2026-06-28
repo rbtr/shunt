@@ -18,24 +18,27 @@ import (
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
 // contains badPR; merges/bounces are recorded.
 type mock struct {
-	prs            map[int]*forge.PullRequest
-	automerge      map[int]bool
-	batchOf        map[string][]int // staging sha -> PR numbers
-	badPR          int
-	failMerge      int
-	conflictPR     int
-	conflictBasePR int
-	conflictFirst  bool
-	statuses       []string
-	runStatus      string
-	staged         [][]int
-	merged         []int
-	bounced        map[int]bool
-	comments       map[int][]string
-	queueComments  map[int][]string
-	mergeHeads     map[int][]string
-	runURLs        map[string]string
-	beforeMerge    func(int)
+	prs             map[int]*forge.PullRequest
+	automerge       map[int]bool
+	batchOf         map[string][]int // staging sha -> PR numbers
+	badPR           int
+	failMerge       int
+	conflictPR      int
+	conflictBasePR  int
+	conflictFirst   bool
+	statuses        []string
+	runStatus       string
+	staged          [][]int
+	merged          []int
+	bounced         map[int]bool
+	comments        map[int][]string
+	queueComments   map[int][]string
+	mergeHeads      map[int][]string
+	runURLs         map[string]string
+	beforeMerge     func(int)
+	beforeGetPR     func(int)
+	beforeRunStatus func(string)
+	beforeRunURL    func(string)
 }
 
 func newMock(badPR int, prNums ...int) *mock {
@@ -68,6 +71,9 @@ func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullReque
 	return out, nil
 }
 func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, error) {
+	if m.beforeGetPR != nil {
+		m.beforeGetPR(n)
+	}
 	return *m.prs[n], nil
 }
 func (m *mock) AutomergeScheduled(_ context.Context, _, _ string, n int) (bool, error) {
@@ -88,6 +94,9 @@ func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, _, _, body s
 func (m *mock) DeleteBranch(_ context.Context, _, _, _ string) error { return nil }
 
 func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
+	if m.beforeRunStatus != nil {
+		m.beforeRunStatus(sha)
+	}
 	if m.runStatus != "" {
 		return m.runStatus, nil
 	}
@@ -99,6 +108,9 @@ func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error)
 	return "success", nil
 }
 func (m *mock) RunTargetURL(_ context.Context, _, _, sha, _ string) (string, error) {
+	if m.beforeRunURL != nil {
+		m.beforeRunURL(sha)
+	}
 	return m.runURLs[sha], nil
 }
 
@@ -581,26 +593,131 @@ func TestTerminalCommentsUseRunTargetURLWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestLandSkipsChangedHead(t *testing.T) {
+func TestActiveBatchRestacksChangedHeadImmediately(t *testing.T) {
 	m := newMock(-1, 1)
+	m.runStatus = "running"
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.prs[1].Head.Sha = "head-1-new"
+	m.runStatus = "failure"
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land batch: %v", err)
+		t.Fatalf("restack changed batch: %v", err)
 	}
 
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Errorf("merged = %s, want []", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1-new:error]" {
-		t.Errorf("statuses = %s, want error on current head", got)
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Errorf("statuses = %s, want none before retest", got)
 	}
-	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "head changed from head-1 to head-1-new") {
-		t.Errorf("comments = %s, want changed-head skip comment", got)
+	if got := strings.Join(m.comments[1], "\n"); got != "" {
+		t.Errorf("comments = %s, want none before retest", got)
+	}
+	if m.bounced[1] {
+		t.Fatal("stale failing batch must not bounce a PR whose head changed")
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want immediate restack", got)
+	}
+	if len(e.active) != 1 {
+		t.Fatalf("active batches = %d, want 1", len(e.active))
+	}
+	if got := e.active[0].prs[0].Head.Sha; got != "head-1-new" {
+		t.Fatalf("restacked head = %s, want head-1-new", got)
+	}
+}
+
+func TestTerminalFailureRestacksIfHeadChangesWhileReadingStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "failure"
+	m.beforeRunStatus = func(string) {
+		m.prs[1].Head.Sha = "head-1-new"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack changed batch: %v", err)
+	}
+
+	if m.bounced[1] {
+		t.Fatal("stale failure must not bounce a PR whose head changed while status was read")
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Errorf("statuses = %s, want none before retest", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want immediate restack", got)
+	}
+	if got := e.active[0].prs[0].Head.Sha; got != "head-1-new" {
+		t.Fatalf("restacked head = %s, want head-1-new", got)
+	}
+}
+
+func TestTerminalFailureRestacksIfHeadChangesWhileReadingRunURL(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "failure"
+	m.beforeRunURL = func(string) {
+		m.prs[1].Head.Sha = "head-1-new"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack changed batch: %v", err)
+	}
+
+	if m.bounced[1] {
+		t.Fatal("stale failure must not bounce a PR whose head changed while run URL was read")
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Errorf("statuses = %s, want none before retest", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want immediate restack", got)
+	}
+	if got := e.active[0].prs[0].Head.Sha; got != "head-1-new" {
+		t.Fatalf("restacked head = %s, want head-1-new", got)
+	}
+}
+
+func TestTerminalFailureRestacksIfHeadChangesDuringBounce(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "failure"
+	gets := 0
+	m.beforeGetPR = func(int) {
+		gets++
+		if gets == 4 {
+			m.prs[1].Head.Sha = "head-1-new"
+		}
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack changed batch: %v", err)
+	}
+
+	if m.bounced[1] {
+		t.Fatal("stale failure must not bounce a PR whose head changed during bounce")
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Errorf("statuses = %s, want none before retest", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want immediate restack", got)
+	}
+	if got := e.active[0].prs[0].Head.Sha; got != "head-1-new" {
+		t.Fatalf("restacked head = %s, want head-1-new", got)
 	}
 }
 
@@ -808,12 +925,14 @@ func TestStagingConflictKeepsChangedPrefixBeforeSuffix(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := fmt.Sprint(e.pending); got != "[[1] [2]]" {
-		t.Fatalf("pending after changed prefix = %s, want [[1] [2]]", got)
+	if got := fmt.Sprint(e.pending); got != "[[2]]" {
+		t.Fatalf("pending after changed prefix = %s, want suffix waiting behind active prefix", got)
 	}
-
-	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
+	if len(e.active) != 1 {
+		t.Fatalf("active batches = %d, want changed prefix restaged", len(e.active))
+	}
+	if got := fmt.Sprint(numbersOf(e.active[0].prs)); got != "[1]" {
+		t.Fatalf("active changed prefix = %s, want [1]", got)
 	}
 	if got := fmt.Sprint(m.staged); got != "[[1 2] [1] [1]]" {
 		t.Errorf("staged = %s, want changed prefix retried before suffix", got)
@@ -848,6 +967,37 @@ func TestStagingConflictOnFirstPRBouncesAndRequeuesRest(t *testing.T) {
 	}
 	if m.bounced[2] || m.bounced[3] {
 		t.Fatalf("rest of suffix should not bounce, bounced = %v", m.bounced)
+	}
+}
+
+func TestStagingConflictOnFirstPRRestacksIfHeadChangesDuringBounce(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.conflictPR = 1
+	m.conflictFirst = true
+	gets := 0
+	m.beforeGetPR = func(n int) {
+		if n != 1 {
+			return
+		}
+		gets++
+		if gets == 2 {
+			m.prs[1].Head.Sha = "head-1-new"
+		}
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.bounced[1] {
+		t.Fatal("stale first-PR staging conflict must not bounce a PR whose head changed")
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Errorf("statuses = %s, want none before retest", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1] [2]]" {
+		t.Fatalf("pending = %s, want changed PR before suffix", got)
 	}
 }
 
