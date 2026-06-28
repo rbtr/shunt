@@ -39,6 +39,10 @@ func TestEnsureWebhookCreatesMissingHook(t *testing.T) {
 	if config["url"] != "https://shunt.example.com/webhook" || config["secret"] != "secret" || config["content_type"] != "json" {
 		t.Fatalf("created config = %#v", config)
 	}
+	events := created["events"].([]any)
+	if !eventListContains(events, "pull_request_sync") {
+		t.Fatalf("created events = %#v, want pull_request_sync", events)
+	}
 }
 
 func TestEnsureWebhookUpdatesExistingManagedHook(t *testing.T) {
@@ -155,4 +159,13 @@ func TestEnsureWebhookTreatsRedactedSecretAsMatching(t *testing.T) {
 	if changed {
 		t.Fatal("changed = true, want false")
 	}
+}
+
+func eventListContains(events []any, want string) bool {
+	for _, event := range events {
+		if event == want {
+			return true
+		}
+	}
+	return false
 }

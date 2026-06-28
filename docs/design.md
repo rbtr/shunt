@@ -87,6 +87,8 @@ backstop so a missed webhook only delays progress:
 
 ```
 for active candidate whose earlier candidates are resolved:
+    if any active PR head changed:
+        delete staging branch; requeue active PR numbers; restage immediately
     status = RunStatus(active.staging_sha, staging_branch)
     success            -> land(active.prs); requeue later speculative runs if base advanced
     failure            -> bisectOrBounce(active)
@@ -152,6 +154,13 @@ Because candidates are just lists of PR numbers and staging is always rebuilt
 from the *current* base tip, a successful sub-batch that advances the base is
 handled safely: any later speculative staging run from the old base generation is
 deleted and re-queued, then re-staged before it can land.
+
+The same preflight protects active batches from PR updates. On each reconcile,
+before reading a staging run result, shunt rechecks the current head SHA for every
+open PR in active batches. If any head changed, that stale staging branch is
+deleted and the active PR numbers are re-queued so the next staging run tests the
+current heads. A pull-request webhook wakes this path promptly; polling remains
+the backstop for missed webhook deliveries.
 
 The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
 consumer-side store interface, and the concrete bbolt implementation lives in

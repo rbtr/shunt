@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Active staging batches are abandoned and re-staged as soon as a queued PR's
+  head changes, instead of waiting for the stale gate run to finish.
+
 ## [0.4.1] - 2026-06-26
 
 ### Fixed
