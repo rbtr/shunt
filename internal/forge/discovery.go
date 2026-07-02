@@ -46,11 +46,13 @@ func (c *Client) SearchReposByTopic(ctx context.Context, topic string) ([]RepoRe
 
 // BranchProtection is the subset of a Forgejo branch-protection rule we manage.
 type BranchProtection struct {
-	EnableStatusCheck      bool     `json:"enable_status_check"`
-	StatusCheckContexts    []string `json:"status_check_contexts"`
-	EnablePush             bool     `json:"enable_push"`
-	EnablePushWhitelist    bool     `json:"enable_push_whitelist"`
-	PushWhitelistUsernames []string `json:"push_whitelist_usernames"`
+	EnableStatusCheck       bool     `json:"enable_status_check"`
+	StatusCheckContexts     []string `json:"status_check_contexts"`
+	EnablePush              bool     `json:"enable_push"`
+	EnablePushWhitelist     bool     `json:"enable_push_whitelist"`
+	PushWhitelistUsernames  []string `json:"push_whitelist_usernames"`
+	PushWhitelistTeams      []string `json:"push_whitelist_teams"`
+	PushWhitelistDeployKeys bool     `json:"push_whitelist_deploy_keys"`
 }
 
 // Hook is the subset of a Forgejo/Gitea repository webhook we manage.
@@ -120,6 +122,50 @@ func (c *Client) EnsureBranchProtection(ctx context.Context, owner, repo, base, 
 		"push_whitelist_usernames": wl,
 	}
 	return true, c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), body, nil)
+}
+
+// EnsureStagingBranchProtection makes sure only botUser may push shunt-owned
+// staging branches for base.
+func (c *Client) EnsureStagingBranchProtection(ctx context.Context, owner, repo, base, botUser string) (changed bool, err error) {
+	rule := stagingBranchProtectionRule(base)
+	var bp BranchProtection
+	path := repoPath(owner, repo)
+	branch := url.PathEscape(rule)
+	getErr := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), nil, &bp)
+	if getErr != nil {
+		if !strings.Contains(getErr.Error(), "http 404") {
+			return false, getErr
+		}
+		return true, c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/branch_protections", path), stagingBranchProtectionBody(rule, botUser, true), nil)
+	}
+	if bp.EnablePush &&
+		bp.EnablePushWhitelist &&
+		sameStringSet(bp.PushWhitelistUsernames, []string{botUser}) &&
+		len(bp.PushWhitelistTeams) == 0 &&
+		!bp.PushWhitelistDeployKeys {
+		return false, nil
+	}
+	return true, c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/branch_protections/%s", path, branch), stagingBranchProtectionBody(rule, botUser, false), nil)
+}
+
+func stagingBranchProtectionRule(base string) string {
+	return "mq/" + base + "/staging*"
+}
+
+func stagingBranchProtectionBody(rule, botUser string, includeRule bool) map[string]any {
+	body := map[string]any{
+		"enable_push":                true,
+		"enable_push_whitelist":      true,
+		"push_whitelist_usernames":   []string{botUser},
+		"push_whitelist_teams":       []string{},
+		"push_whitelist_deploy_keys": false,
+		"required_approvals":         0,
+		"block_on_outdated_branch":   false,
+	}
+	if includeRule {
+		body["rule_name"] = rule
+	}
+	return body
 }
 
 // EnsureWebhook makes sure the repository has one active shunt webhook pointing

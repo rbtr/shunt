@@ -11,7 +11,7 @@ welcome.
   metrics, configurable batch linger, configurable bisection fan-out, and
   `merge`/`squash`/`rebase` landing support.
 - **v0.3 release train.** The next hardening pass added webhook wakeups,
-  per-repository configuration, startup staging-branch cleanup, opt-in sticky
+  per-repository configuration, opt-in sticky
   queue-status comments, operator gotchas, and correct aggregation of Forgejo
   Actions run statuses.
 - **Per-repository configuration.** Repos can add `.shunt.yml` to override safe
@@ -29,10 +29,9 @@ welcome.
   candidate, that PR is bounced and the remaining suffix is re-queued. This
   replaces the former coarse conflict handling that could bounce a PR which only
   conflicted with a batch-mate that ultimately did not land.
-- **Startup staging-branch garbage collection.** When a queue is first managed,
-  shunt deletes stale shunt-owned staging branches (`mq/<base>/staging` and
-  `mq/<base>/staging-N`) left behind by earlier processes before it starts
-  reconciling that `(repo, base)`.
+- **Protected immutable staging branches.** shunt creates a fresh
+  `mq/<base>/staging-*` branch for each staging attempt and protects the
+  `mq/<base>/staging*` pattern so only the bot can push those refs.
 - **Webhook wakeups.** Forgejo/Gitea webhooks now wake reconciliation promptly for
   auto-merge, pull-request, review, status, and push activity. The poll loop
   remains as a backstop for missed webhook deliveries.
@@ -146,9 +145,8 @@ welcome.
   where available.
 - Deeper observability: persisted metrics history and historical status views to
   preserve operational history across restarts.
-- ~~Staging-branch GC on startup.~~ Completed: stale shunt-owned staging branches
-  are pruned on startup or first discovery before reconciliation begins for a
-  managed `(repo, base)`.
+- ~~Protected immutable staging branches.~~ Completed: staging attempts use fresh
+  `mq/<base>/staging-*` refs protected with bot-only push access.
 - Optional leader-elected HA backed by a durable external lease/lock; same-host
   file-lock standby is not a supported HA mode.
 

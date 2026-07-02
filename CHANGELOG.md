@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- shunt now creates bot-only branch protection for its `mq/<base>/staging*`
+  staging refs.
+
+### Changed
+- Staging refs are immutable per attempt and retained for audit/debug links
+  instead of being force-pushed and deleted between queue runs.
+
 ### Fixed
 - Active staging batches are abandoned and re-staged as soon as a queued PR's
   head changes, instead of waiting for the stale gate run to finish.

@@ -34,9 +34,10 @@ type MergedRef struct {
 	Ref string // e.g. refs/pull/12/head
 }
 
-// BuildStaging creates stagingBranch from base, merges each ref in order, force
-// pushes it, and returns the resulting SHA. On a merge conflict it returns the
-// offending PR number (conflictPR > 0) with an error.
+// BuildStaging creates stagingBranch from base, merges each ref in order, pushes
+// it, and returns the resulting SHA. The caller must pass a fresh branch name for
+// each attempt. On a merge conflict it returns the offending PR number
+// (conflictPR > 0) with an error.
 func (s *Stager) BuildStaging(ctx context.Context, base, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error) {
 	parent, err := os.MkdirTemp("", "shunt-stage-")
 	if err != nil {
@@ -101,7 +102,7 @@ esac
 	if err != nil {
 		return "", 0, err
 	}
-	if out, err := run("push", "--force", "--quiet", "origin", stagingBranch); err != nil {
+	if out, err := run("push", "--quiet", "origin", stagingBranch); err != nil {
 		return "", 0, fmt.Errorf("push staging: %v: %s", err, out)
 	}
 	return sha, 0, nil

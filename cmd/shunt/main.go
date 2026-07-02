@@ -158,10 +158,10 @@ func main() {
 	}
 	base = settings.Base
 	queueLogger := logger.With("owner", owner, "repo", repo, "base", base)
-	if deleted, err := fc.PruneStagingBranches(ctx, owner, repo, base); err != nil {
-		queueLogger.Warn("staging branch GC failed", "error", err)
-	} else if len(deleted) > 0 {
-		queueLogger.Info("stale staging branches deleted", "branches", deleted)
+	if changed, err := fc.EnsureStagingBranchProtection(ctx, owner, repo, base, botUser); err != nil {
+		fatal(queueLogger, "ensure staging branch protection failed", "error", err)
+	} else if changed {
+		queueLogger.Info("staging branch protection configured")
 	}
 	if changed, err := fc.EnsureWebhook(ctx, owner, repo, webhookURL, webhookSecret); err != nil {
 		fatal(queueLogger, "ensure webhook failed", "error", err)

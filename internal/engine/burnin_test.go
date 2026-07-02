@@ -179,11 +179,6 @@ func (b *burnInForge) UpsertComment(_ context.Context, _, _ string, _ int, _, _,
 	return nil
 }
 
-func (b *burnInForge) DeleteBranch(_ context.Context, _, _, branch string) error {
-	_, _ = gitOutputErr(b.repoDir, "branch", "-D", branch)
-	return nil
-}
-
 func (b *burnInForge) stagedPRs(sha string) []int {
 	var out []int
 	for n, pr := range b.prs {

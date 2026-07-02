@@ -46,10 +46,6 @@ type PullRequest struct {
 	} `json:"base"`
 }
 
-type Branch struct {
-	Name string `json:"name"`
-}
-
 type IssueComment struct {
 	ID   int64  `json:"id"`
 	Body string `json:"body"`
@@ -92,7 +88,6 @@ type runsResponse struct {
 	WorkflowRuns []workflowRun `json:"workflow_runs"`
 }
 
-const branchPageLimit = 50
 const taskPageLimit = 100
 const runPageLimit = 50
 
@@ -402,39 +397,6 @@ func (c *Client) Comment(ctx context.Context, owner, repo string, index int, bod
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repoPath(owner, repo), index), map[string]string{"body": body}, nil)
 }
 
-func (c *Client) ListBranches(ctx context.Context, owner, repo string) ([]Branch, error) {
-	var out []Branch
-	for page := 1; ; page++ {
-		var branches []Branch
-		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branches?limit=%d&page=%d", repoPath(owner, repo), branchPageLimit, page), nil, &branches); err != nil {
-			return nil, err
-		}
-		out = append(out, branches...)
-		if len(branches) < branchPageLimit {
-			return out, nil
-		}
-	}
-}
-
-// PruneStagingBranches deletes stale shunt-owned staging branches for base.
-func (c *Client) PruneStagingBranches(ctx context.Context, owner, repo, base string) ([]string, error) {
-	branches, err := c.ListBranches(ctx, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	var deleted []string
-	for _, branch := range branches {
-		if !isShuntStagingBranch(base, branch.Name) {
-			continue
-		}
-		if err := c.DeleteBranch(ctx, owner, repo, branch.Name); err != nil {
-			return deleted, fmt.Errorf("delete branch %q: %w", branch.Name, err)
-		}
-		deleted = append(deleted, branch.Name)
-	}
-	return deleted, nil
-}
-
 func (c *Client) UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error {
 	var comments []IssueComment
 	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?limit=50", repoPath(owner, repo), index), nil, &comments); err != nil {
@@ -453,31 +415,6 @@ func (c *Client) UpsertComment(ctx context.Context, owner, repo string, index in
 		return c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), comment.ID), map[string]string{"body": body}, nil)
 	}
 	return c.Comment(ctx, owner, repo, index, body)
-}
-
-func (c *Client) DeleteBranch(ctx context.Context, owner, repo, branch string) error {
-	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil, nil)
-	if err != nil && strings.Contains(err.Error(), "http 404") {
-		return nil
-	}
-	return err
-}
-
-func isShuntStagingBranch(base, branch string) bool {
-	staging := "mq/" + base + "/staging"
-	if branch == staging {
-		return true
-	}
-	suffix, ok := strings.CutPrefix(branch, staging+"-")
-	if !ok || suffix == "" {
-		return false
-	}
-	for _, r := range suffix {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func repoPath(owner, repo string) string {
