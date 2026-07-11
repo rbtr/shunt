@@ -73,7 +73,7 @@ admin access even for read requests, so the bot must have that permission on
 managed repositories to keep the required `merge-queue` gate in place.
 
 ```sh
-go build -o shunt ./cmd/shunt
+make build
 
 SHUNT_INSTANCE=https://forge.example.com \
 SHUNT_TOKEN=<bot-token> \

@@ -12,7 +12,7 @@ SHUNT_FORGE_INSTANCE=https://forge.example.com \
 SHUNT_FORGE_TOKEN=<bot-token> \
 SHUNT_FORGE_OWNER=<owner> \
 SHUNT_FORGE_REPO=<repo> \
-go test ./internal/forge -run TestForgeIntegrationHarness -count=1 -v
+GOTOOLCHAIN=go1.25.12 go test ./internal/forge -run TestForgeIntegrationHarness -count=1 -v
 ```
 
 Required variables:

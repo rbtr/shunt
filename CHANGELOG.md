@@ -19,6 +19,8 @@ All notable changes to this project are documented here. The format is based on
 ### Fixed
 - Active staging batches are abandoned and re-staged as soon as a queued PR's
   head changes, instead of waiting for the stale gate run to finish.
+- Build and release toolchains now require Go 1.25.12, which includes the latest
+  standard-library security fixes for the supported Go 1.25 line.
 
 ## [0.4.1] - 2026-06-26
 
