@@ -24,8 +24,10 @@ make test    # unit tests — the bisection state machine is mock-driven
 make lint    # gofmt + go vet (the CI gate)
 ```
 
-Requires Go 1.25+. There are **no external dependencies** — please keep it that
-way unless there's a compelling reason.
+The Makefile defaults to the patched Go 1.25.12 toolchain. Override
+`GOTOOLCHAIN` only with another release that includes the same security fixes.
+There are **no external dependencies** — please keep it that way unless there's
+a compelling reason.
 
 ## Pull requests
 

@@ -73,7 +73,7 @@ admin access even for read requests, so the bot must have that permission on
 managed repositories to keep the required `merge-queue` gate in place.
 
 ```sh
-go build -o shunt ./cmd/shunt
+make build
 
 SHUNT_INSTANCE=https://forge.example.com \
 SHUNT_TOKEN=<bot-token> \
@@ -216,10 +216,10 @@ pure-Go git library so staging merges match real Git behavior.
 ```sh
 cp examples/.env.example .env
 $EDITOR .env
-docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.4.1
+docker run --rm --env-file .env ghcr.io/rbtr/shunt:0.5.0
 
 helm install shunt oci://ghcr.io/rbtr/charts/shunt \
-  --version 0.4.1 \
+  --version 0.5.0 \
   --set config.instance=https://forge.example.com \
   --set token.existingSecret=shunt-bot
 

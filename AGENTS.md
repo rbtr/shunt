@@ -55,8 +55,10 @@ Otherwise use a normal branch and pull request.
 make lint test build
 ```
 
-Use narrower commands while iterating (`go test ./internal/engine`, `go test
-./...`, `go vet ./...`), but finish with the full command above for code changes.
+Use narrower commands while iterating (`GOTOOLCHAIN=go1.25.12 go test
+./internal/engine`, `GOTOOLCHAIN=go1.25.12 go test ./...`,
+`GOTOOLCHAIN=go1.25.12 go vet ./...`), but finish with the full command above for
+code changes.
 
 ## Public-copy and security checklist
 
