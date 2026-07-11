@@ -45,9 +45,9 @@ interval as a backstop):
 
 1. **Find the queue** — open PRs with auto-merge enabled (detected from the PR
    timeline; Forgejo doesn't expose this on the PR object).
-2. **Stage** — create `mq/<base>/staging` from the base tip and merge each PR's
-   head into it. A staging conflict splits the candidate at the conflict point so
-   earlier PRs keep their place.
+2. **Stage** — create a fresh `mq/<base>/staging-*` branch from the base tip and
+   merge each PR's head into it. A staging conflict splits the candidate at the
+   conflict point so earlier PRs keep their place.
 3. **Gate** — pushing the staging branch triggers your `on: push: [mq/**]`
    workflow. shunt reads that run's status.
 4. **Resolve:**
@@ -57,9 +57,10 @@ interval as a backstop):
    - **fail, >1 PR** → split in half and test sub-batches, up to the configured
      bisection fan-out. Innocent PRs are **never** bounced.
 
-Branch protection requires the `merge-queue` status and restricts pushes to the
-bot, so nothing reaches the base branch except a batch shunt has tested. Full
-detail and the validated Forgejo mechanics are in
+Branch protection requires the `merge-queue` status on the base branch and
+restricts pushes to both the base and shunt-owned staging branches to the bot, so
+nothing reaches the base branch except a batch shunt has tested. Full detail and
+the validated Forgejo mechanics are in
 [`docs/design.md`](docs/design.md).
 
 ## Quickstart
@@ -128,6 +129,10 @@ Without that setting, configure a repository or
 organization webhook yourself. shunt wakes immediately for auto-merge,
 pull-request, review, status, and push events, but still polls on
 `SHUNT_POLL_INTERVAL` so missed webhooks only add latency.
+
+shunt also creates bot-only protection for its staging ref pattern
+`mq/<base>/staging*`. Staging refs are immutable per attempt and retained for
+audit/debug links; do not point unrelated workflows or branches at that prefix.
 
 Repos can override safe queue tunables with `.shunt.yml` in the repo root. In
 multi-repo mode, shunt reads it from the discovered default branch before
@@ -257,8 +262,8 @@ scope name:
   `SHUNT_WEBHOOK_URL` is set;
 - create commit statuses, merge pull requests, write PR comments, and cancel
   scheduled auto-merge when a PR lands, is bounced, or becomes stale;
-- use Git to fetch PR heads and push/delete only `mq/...` staging branches. Base
-  branch changes go through the forge merge API after the queue status passes.
+- use Git to fetch PR heads and push only `mq/...` staging branches. Base branch
+  changes go through the forge merge API after the queue status passes.
 
 Keep tokens in your runtime secret store, never in the repository. The examples
 use placeholders only; real tokens should be supplied through environment

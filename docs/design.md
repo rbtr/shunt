@@ -19,10 +19,10 @@ shunt needs API permission to read PR, timeline, commit-status, and workflow-run
 state; manage branch protection for opted-in repos; create or update the
 shunt-managed repository webhook when enabled; create source-head statuses; merge
 PRs; write outcome/queue comments; cancel scheduled auto-merge; and, via Git,
-fetch PR heads and push/delete only `mq/...` staging branches. Current
-Forgejo/Gitea branch-protection and repository-hook APIs require repository
-admin permission, so the admin grant is scoped by repository rather than avoided
-entirely. Store the token in the runtime secret store, not in this repository.
+fetch PR heads and push only `mq/...` staging branches. Current Forgejo/Gitea
+branch-protection and repository-hook APIs require repository admin permission,
+so the admin grant is scoped by repository rather than avoided entirely. Store
+the token in the runtime secret store, not in this repository.
 
 ## Forge mechanics (validated)
 
@@ -88,7 +88,7 @@ backstop so a missed webhook only delays progress:
 ```
 for active candidate whose earlier candidates are resolved:
     if any active PR head changed:
-        delete staging branch; requeue active PR numbers; restage immediately
+        abandon staging branch; requeue active PR numbers; restage immediately
     status = RunStatus(active.staging_sha, staging_branch)
     success            -> land(active.prs); requeue later speculative runs if base advanced
     failure            -> bisectOrBounce(active)
@@ -105,7 +105,8 @@ while active count < bisection fan-out:
         clear linger
     cand = pending.pop_front()
     prs  = resolve(cand)                 # drop closed / no-longer-auto-merge
-    sha, conflictPR = BuildStaging(base, "mq/<base>/staging", prs)
+    staging_branch = fresh "mq/<base>/staging-*" ref
+    sha, conflictPR = BuildStaging(base, staging_branch, prs)
     if conflictPR and conflictPR is first:
         bounce(conflictPR); requeue(items after conflictPR); return
     if conflictPR:
@@ -124,9 +125,9 @@ the window expires. These knobs have process-wide defaults and can be overridden
 per repository with `.shunt.yml`.
 
 `SHUNT_BISECT_FANOUT` caps concurrent bisection staging runs per queue. A value
-of `1` preserves serial bisection. Higher values use sibling staging branches
-such as `mq/main/staging-1`, `mq/main/staging-2`, so the gate workflow must keep
-matching `mq/**`.
+of `1` preserves serial bisection. Every staging attempt uses a fresh immutable
+branch such as `mq/main/staging-<timestamp>-<sequence>`, so the gate workflow must
+keep matching `mq/**`.
 
 `land` sets the source-head status and merges each PR in order. Terminal queue
 outcomes are also written back to source PRs:
@@ -153,22 +154,22 @@ else:               mid = len/2
 Because candidates are just lists of PR numbers and staging is always rebuilt
 from the *current* base tip, a successful sub-batch that advances the base is
 handled safely: any later speculative staging run from the old base generation is
-deleted and re-queued, then re-staged before it can land.
+abandoned and re-queued, then re-staged before it can land.
 
 The same preflight protects active batches from PR updates. On each reconcile,
 before reading a staging run result, shunt rechecks the current head SHA for every
 open PR in active batches. If any head changed, that stale staging branch is
-deleted and the active PR numbers are re-queued so the next staging run tests the
-current heads. A pull-request webhook wakes this path promptly; polling remains
-the backstop for missed webhook deliveries.
+abandoned and the active PR numbers are re-queued so the next staging run tests
+the current heads. A pull-request webhook wakes this path promptly; polling
+remains the backstop for missed webhook deliveries.
 
 The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
 consumer-side store interface, and the concrete bbolt implementation lives in
 the more specific `checkpoint/bolt` package. Restored active batches are
 conservatively re-queued for fresh staging instead of resuming an old staging
-branch/run, so startup staging-branch cleanup cannot delete a branch that the
-restored engine still expects to observe. The production command wires the
-default bbolt implementation when `SHUNT_STATE_PATH` is set. That store persists
+branch/run, so the engine never lands from a pre-restart result that may now be
+stale. The production command wires the default bbolt implementation when
+`SHUNT_STATE_PATH` is set. That store persists
 one snapshot per `(owner, repo, base)` and keeps the binary static/CGO-free;
 operators should place the database on persistent storage if they want queue
 state to survive pod replacement or host reboots.

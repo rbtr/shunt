@@ -25,7 +25,7 @@ type Config struct {
 	Base          string
 	StatusCtx     string // required commit-status context, e.g. "merge-queue"
 	MergeStyle    string // merge|rebase|squash
-	StagingBranch string // e.g. "mq/main/staging"
+	StagingBranch string // staging branch prefix, e.g. "mq/main/staging"
 	InstanceURL   string // used for API/git (may be an in-cluster URL)
 	PublicURL     string // used for user-facing links (defaults to InstanceURL)
 	MaxBatch      int    // cap the initial rollup size (0 = unlimited)
@@ -61,7 +61,6 @@ type ForgeAPI interface {
 	CancelAutomerge(ctx context.Context, owner, repo string, index int) error
 	Comment(ctx context.Context, owner, repo string, index int, body string) error
 	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
-	DeleteBranch(ctx context.Context, owner, repo, branch string) error
 }
 
 // Stager builds an integration ("staging") branch from a base + PR head refs.
@@ -431,9 +430,6 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (bool, error) {
 	if requeueFrom >= 0 {
 		e.requeueActiveRemainder(a.prs[requeueFrom:])
 	}
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
-	}
 	e.removeActive(a)
 	return merged > 0, nil
 }
@@ -508,9 +504,6 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 // split in half, with the first half tested next (the good half lands, the
 // recursion isolates the bad PR(s)).
 func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) (bool, error) {
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
-	}
 	nums := numbersOf(a.prs)
 	e.removeActive(a)
 
@@ -559,11 +552,8 @@ func (e *Engine) activeLimit() int {
 }
 
 func (e *Engine) stagingBranch() string {
-	if e.activeLimit() <= 1 {
-		return e.cfg.StagingBranch
-	}
 	e.stagingSeq++
-	return fmt.Sprintf("%s-%d", e.cfg.StagingBranch, e.stagingSeq)
+	return fmt.Sprintf("%s-%d-%d", e.cfg.StagingBranch, e.now().UnixNano(), e.stagingSeq)
 }
 
 func (e *Engine) enqueue(cands ...[]int) {
@@ -612,27 +602,18 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 		return
 	}
 	a := e.active[idx]
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
-	}
 	e.active = append(e.active[:idx], e.active[idx+1:]...)
 	e.enqueue(numbersOf(a.prs))
 	e.logger.Info("speculative batch requeued for earlier candidate", "prs", numbersOf(a.prs), "earlier", e.pending[0])
 }
 
 func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
-	}
 	e.removeActive(a)
 	e.enqueue(numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
 }
 
 func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("delete staging branch failed", "branch", a.stagingBranch, "error", err)
-	}
 	e.removeActive(a)
 	e.enqueue(numbersOf(a.prs))
 	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))

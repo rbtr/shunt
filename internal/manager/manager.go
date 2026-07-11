@@ -93,16 +93,17 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		} else if changed {
 			queueLogger.Info("branch protection configured")
 		}
+		if changed, err := m.fc.EnsureStagingBranchProtection(ctx, r.Owner, r.Name, settings.Base, m.cfg.BotUser); err != nil {
+			queueLogger.Warn("ensure staging branch protection failed", "error", err)
+			continue
+		} else if changed {
+			queueLogger.Info("staging branch protection configured")
+		}
 		if changed, err := m.fc.EnsureWebhook(ctx, r.Owner, r.Name, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
 			queueLogger.Warn("ensure webhook failed", "error", err)
 			continue
 		} else if changed {
 			queueLogger.Info("webhook configured")
-		}
-		if deleted, err := m.fc.PruneStagingBranches(ctx, r.Owner, r.Name, settings.Base); err != nil {
-			queueLogger.Warn("staging branch GC failed", "error", err)
-		} else if len(deleted) > 0 {
-			queueLogger.Info("stale staging branches deleted", "branches", deleted)
 		}
 		st := gitops.NewStager(cloneURL(m.cfg.InstanceURL, r.Owner, r.Name), m.cfg.BotUser, m.cfg.Token, m.cfg.BotUser, m.cfg.BotEmail)
 		m.engines[k] = &managedEngine{engine: engine.New(cfg, m.fc, st), cfg: cfg}

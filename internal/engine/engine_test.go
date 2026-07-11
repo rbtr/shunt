@@ -29,6 +29,7 @@ type mock struct {
 	statuses        []string
 	runStatus       string
 	staged          [][]int
+	stagingBranches []string
 	merged          []int
 	bounced         map[int]bool
 	comments        map[int][]string
@@ -91,7 +92,6 @@ func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, _, _, body s
 	m.queueComments[n] = append(m.queueComments[n], body)
 	return nil
 }
-func (m *mock) DeleteBranch(_ context.Context, _, _, _ string) error { return nil }
 
 func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
 	if m.beforeRunStatus != nil {
@@ -138,12 +138,13 @@ func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) error {
 	return nil
 }
 
-func (m *mock) BuildStaging(_ context.Context, _, _ string, refs []gitops.MergedRef) (string, int, error) {
+func (m *mock) BuildStaging(_ context.Context, _, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
 	var nums []int
 	for _, r := range refs {
 		nums = append(nums, r.PR)
 	}
 	m.staged = append(m.staged, append([]int(nil), nums...))
+	m.stagingBranches = append(m.stagingBranches, stagingBranch)
 	baseMerged := m.conflictBasePR > 0 && m.prs[m.conflictBasePR].Merged
 	if idx := indexOfNum(nums, m.conflictPR); idx > 0 || (idx == 0 && (m.conflictFirst || baseMerged)) {
 		return "", m.conflictPR, fmt.Errorf("staging conflict")
@@ -189,6 +190,33 @@ func TestQueueStatusCommentsDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestStagingBranchesAreUniquePerAttempt(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return time.Unix(100, 0) }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.prs[1].Head.Sha = "head-1-updated"
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack updated head: %v", err)
+	}
+
+	if got := len(m.stagingBranches); got != 2 {
+		t.Fatalf("staging branches = %d, want 2", got)
+	}
+	if m.stagingBranches[0] == m.stagingBranches[1] {
+		t.Fatalf("staging branch reused: %q", m.stagingBranches[0])
+	}
+	for _, branch := range m.stagingBranches {
+		if !strings.HasPrefix(branch, "mq/main/staging-") {
+			t.Fatalf("staging branch = %q, want shunt staging prefix", branch)
+		}
+	}
+}
+
 func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	m.runStatus = "running"
@@ -208,7 +236,7 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 		"Base: `main`",
 		"Position: 1/2",
 		"State: testing in active batch",
-		"Active batch: #1, #2 on `mq/main/staging`",
+		"Active batch: #1, #2 on `mq/main/staging-",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("queue comment missing %q in:\n%s", want, body)

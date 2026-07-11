@@ -15,6 +15,10 @@ import (
 func TestRefreshAppliesRepoConfigOverrides(t *testing.T) {
 	var rawRef, protectedBranch, protectedContext string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() == "/api/v1/repos/o/r/branch_protections/mq%2Ftrunk%2Fstaging%2A" {
+			writeSatisfiedStagingProtection(t, w, r)
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/repos/search":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
@@ -45,11 +49,6 @@ bisect_fanout: 2
 				EnablePushWhitelist:    true,
 				PushWhitelistUsernames: []string{"bot"},
 			})
-		case "/api/v1/repos/o/r/branches":
-			if r.Method != http.MethodGet {
-				t.Fatalf("branches method = %s, want GET", r.Method)
-			}
-			_ = json.NewEncoder(w).Encode([]forge.Branch{})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -102,6 +101,10 @@ bisect_fanout: 2
 
 func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() == "/api/v1/repos/o/r/branch_protections/mq%2Fmain%2Fstaging%2A" {
+			writeSatisfiedStagingProtection(t, w, r)
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/repos/search":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
@@ -122,11 +125,6 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 				EnablePushWhitelist:    true,
 				PushWhitelistUsernames: []string{"bot"},
 			})
-		case "/api/v1/repos/o/r/branches":
-			if r.Method != http.MethodGet {
-				t.Fatalf("branches method = %s, want GET", r.Method)
-			}
-			_ = json.NewEncoder(w).Encode([]forge.Branch{})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -160,6 +158,10 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 func TestRefreshEnsuresWebhookWhenConfigured(t *testing.T) {
 	var createdHook map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() == "/api/v1/repos/o/r/branch_protections/mq%2Fmain%2Fstaging%2A" {
+			writeSatisfiedStagingProtection(t, w, r)
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/repos/search":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
@@ -189,8 +191,6 @@ func TestRefreshEnsuresWebhookWhenConfigured(t *testing.T) {
 			default:
 				t.Fatalf("hook method = %s", r.Method)
 			}
-		case "/api/v1/repos/o/r/branches":
-			_ = json.NewEncoder(w).Encode([]forge.Branch{})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -258,4 +258,18 @@ func TestRefreshRejectsInvalidRepoConfig(t *testing.T) {
 	if len(m.engines) != 0 {
 		t.Fatalf("engines = %#v, want none", m.engines)
 	}
+}
+
+func writeSatisfiedStagingProtection(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Fatalf("staging branch protection method = %s, want GET", r.Method)
+	}
+	_ = json.NewEncoder(w).Encode(forge.BranchProtection{
+		EnablePush:              true,
+		EnablePushWhitelist:     true,
+		PushWhitelistUsernames:  []string{"bot"},
+		PushWhitelistTeams:      []string{},
+		PushWhitelistDeployKeys: false,
+	})
 }
