@@ -87,11 +87,13 @@ releases keep the historical process-local state.
 
 When Postgres is configured, each `(owner, repo, base)` must first acquire its
 durable queue lease before loading a checkpoint or calling the forge. The lease
-is renewed once per `Reconcile()` call. A replica that cannot acquire it does
-nothing for that queue; one that takes it over drops process-local queue and
-comment caches, then reloads the durable checkpoint. Restored active batches
-are re-staged, as on process restart. bbolt and in-memory state are
-single-process options and do not coordinate replicas.
+is renewed once per `Reconcile()` call, and that call receives a deadline at
+half the configured lease TTL so no holder keeps mutating after its lease can
+expire. A replica that cannot acquire it does nothing for that queue; one that
+takes it over drops process-local queue and comment caches, then reloads the
+durable checkpoint. Restored active batches are re-staged, as on process
+restart. bbolt and in-memory state are single-process options and do not
+coordinate replicas.
 
 Each `Reconcile()` tick advances one step. Ticks are driven by relevant
 Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the

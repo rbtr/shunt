@@ -53,6 +53,7 @@ type mock struct {
 	getPRErrors          map[int]int
 	listCalls            int
 	listErr              error
+	runStatusErr         error
 	upsertErr            error
 }
 
@@ -165,6 +166,9 @@ func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, marker, _, b
 func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
 	if m.beforeRunStatus != nil {
 		m.beforeRunStatus(sha)
+	}
+	if m.runStatusErr != nil {
+		return "", m.runStatusErr
 	}
 	if m.runStatus != "" {
 		return m.runStatus, nil
@@ -1768,22 +1772,56 @@ func TestLeasePreventsDuplicateEffectsUntilTakeover(t *testing.T) {
 
 func TestUnavailableForgeSkipsReconcileError(t *testing.T) {
 	m := newMock(-1, 1)
-	m.listErr = forge.ErrUnavailable
+	m.runStatusErr = forge.ErrUnavailable
 	c := metrics.New()
 	e := New(Config{
 		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Metrics: c,
 	}, m, m)
+	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingSHA: "stage-1"}}
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile returned unavailable error: %v", err)
 	}
-	if !errors.Is(m.listErr, forge.ErrUnavailable) {
+	if !errors.Is(m.runStatusErr, forge.ErrUnavailable) {
 		t.Fatal("test setup did not use forge unavailability")
+	}
+	status := c.StatusSnapshot()
+	if len(status.Queues) != 1 || status.Queues[0].QueueDepth != 1 || !status.Queues[0].ActiveBatch {
+		t.Fatalf("queue status after unavailable forge = %#v, want active queue", status)
 	}
 	var out strings.Builder
 	c.WritePrometheus(&out)
 	if strings.Contains(out.String(), `shunt_reconcile_errors_total{owner="o",repo="r",base="main"} 1`) {
 		t.Fatalf("unavailable forge recorded a reconcile error:\n%s", out.String())
+	}
+}
+
+func TestDurableLeaseBoundsReconcileContext(t *testing.T) {
+	m := newMock(-1, 1)
+	lease := &deadlineQueueLease{}
+	stager := &contextBlockingStager{}
+	store := &memoryCheckpointStore{}
+	const ttl = 40 * time.Millisecond
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: ttl,
+	}, m, stager)
+
+	err := e.Reconcile(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile error = %v, want context deadline exceeded", err)
+	}
+	if !lease.hasDeadline || !stager.hasDeadline {
+		t.Fatal("lease and stager must receive a deadline")
+	}
+	if got := lease.deadline.Sub(lease.acquiredAt); got <= 0 || got > ttl/2 {
+		t.Fatalf("lease context budget = %s, want (0, %s]", got, ttl/2)
+	}
+	if !lease.deadline.Equal(stager.deadline) {
+		t.Fatalf("lease deadline = %s, stager deadline = %s; want propagated deadline", lease.deadline, stager.deadline)
+	}
+	if store.saves != 0 {
+		t.Fatalf("checkpoint saves = %d, want none after deadline", store.saves)
 	}
 }
 
@@ -1807,6 +1845,29 @@ func (l *holderQueueLease) AcquireLease(_ context.Context, _ checkpoint.QueueKey
 		l.holder = holderID
 	}
 	return l.holder == holderID, nil
+}
+
+type deadlineQueueLease struct {
+	acquiredAt  time.Time
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (l *deadlineQueueLease) AcquireLease(ctx context.Context, _ checkpoint.QueueKey, _ string, _ time.Duration) (bool, error) {
+	l.acquiredAt = time.Now()
+	l.deadline, l.hasDeadline = ctx.Deadline()
+	return true, nil
+}
+
+type contextBlockingStager struct {
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (s *contextBlockingStager) BuildStaging(ctx context.Context, _ string, _ string, _ []gitops.MergedRef) (string, int, error) {
+	s.deadline, s.hasDeadline = ctx.Deadline()
+	<-ctx.Done()
+	return "", 0, ctx.Err()
 }
 
 type memoryCheckpointStore struct {

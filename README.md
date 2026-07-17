@@ -118,7 +118,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
 | `SHUNT_POSTGRES_DSN` | — | Optional Postgres DSN for durable queue checkpoints and replica coordination. Mutually exclusive with `SHUNT_STATE_PATH`; migrations are applied at startup. |
-| `SHUNT_QUEUE_LEASE_TTL` | `45s` | Positive duration for each Postgres queue-ownership lease; renewed once per reconciliation tick. |
+| `SHUNT_QUEUE_LEASE_TTL` | `45s` | Postgres queue-ownership lease duration (at least `1µs`); renewed once per reconciliation tick, whose work is bounded to half this duration. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, `/status`, and `/webhook` endpoints |

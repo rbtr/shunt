@@ -98,8 +98,8 @@ func queueLeaseTTLFromEnv() (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parse SHUNT_QUEUE_LEASE_TTL: %w", err)
 	}
-	if ttl <= 0 {
-		return 0, errors.New("SHUNT_QUEUE_LEASE_TTL must be positive")
+	if ttl < time.Microsecond {
+		return 0, errors.New("SHUNT_QUEUE_LEASE_TTL must be at least one microsecond")
 	}
 	return ttl, nil
 }

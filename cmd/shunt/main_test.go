@@ -66,6 +66,10 @@ func TestQueueLeaseTTLFromEnv(t *testing.T) {
 	if _, err := queueLeaseTTLFromEnv(); err == nil {
 		t.Fatal("queueLeaseTTLFromEnv accepted zero TTL")
 	}
+	t.Setenv("SHUNT_QUEUE_LEASE_TTL", "1ns")
+	if _, err := queueLeaseTTLFromEnv(); err == nil {
+		t.Fatal("queueLeaseTTLFromEnv accepted a TTL below one microsecond")
+	}
 }
 
 func TestNewLeaseHolderID(t *testing.T) {

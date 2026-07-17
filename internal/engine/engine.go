@@ -131,17 +131,32 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	if e.durableLease {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.cfg.LeaseTTL/2)
+		defer cancel()
+	}
+	if err := e.reconcileContextErr(ctx); err != nil {
+		return err
+	}
 	held, err := e.acquireLease(ctx)
 	if err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		e.observeQueue()
 		return err
 	}
 	if !held {
 		return nil
 	}
+	if err := e.reconcileContextErr(ctx); err != nil {
+		return err
+	}
 	if err := e.loadCheckpoint(ctx); err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
 		e.observeQueue()
+		return err
+	}
+	if err := e.reconcileContextErr(ctx); err != nil {
 		return err
 	}
 	resolved, err := e.checkActive(ctx)
@@ -155,6 +170,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			}
 		}
 	}
+	if err := e.reconcileContextErr(ctx); err != nil {
+		return err
+	}
 	if checkpointErr := e.saveCheckpoint(ctx); checkpointErr != nil {
 		if err != nil {
 			err = fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
@@ -162,7 +180,18 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			err = checkpointErr
 		}
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if err != nil && !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
+		} else {
+			err = ctxErr
+		}
+		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		e.observeQueue()
+		return err
+	}
 	if errors.Is(err, forge.ErrUnavailable) {
+		e.observeQueue()
 		return nil
 	}
 	if err != nil {
@@ -175,6 +204,15 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	}
 	e.observeQueue()
 	return err
+}
+
+func (e *Engine) reconcileContextErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		e.observeQueue()
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) acquireLease(ctx context.Context) (bool, error) {
