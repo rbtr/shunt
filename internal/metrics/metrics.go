@@ -170,7 +170,7 @@ func (c *Collector) IncBatchesStarted(labels Labels) {
 	c.ensureLocked(labels).BatchesStarted++
 }
 
-// IncPRMerge records a PR merged by shunt.
+// IncPRMerge records a PR landed through shunt's queue.
 func (c *Collector) IncPRMerge(labels Labels) {
 	if c == nil {
 		return
@@ -267,7 +267,7 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		"# TYPE shunt_queue_oldest_age_seconds gauge",
 		"# HELP shunt_batches_started_total Number of batches staged and sent to the gate.",
 		"# TYPE shunt_batches_started_total counter",
-		"# HELP shunt_pr_merges_total Number of pull requests merged by shunt.",
+		"# HELP shunt_pr_merges_total Number of pull requests landed through shunt's queue.",
 		"# TYPE shunt_pr_merges_total counter",
 		"# HELP shunt_bounces_total Number of pull requests bounced from the queue.",
 		"# TYPE shunt_bounces_total counter",

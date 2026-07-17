@@ -8,6 +8,106 @@ import (
 	"testing"
 )
 
+func TestEnsureBranchProtectionCreatesMissingRuleWithoutBotPushAccess(t *testing.T) {
+	var created map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/branch_protections/main":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/o/r/branch_protections":
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	changed, err := New(srv.URL, "token").EnsureBranchProtection(context.Background(), "o", "r", "main", "merge-queue", "bot")
+	if err != nil {
+		t.Fatalf("EnsureBranchProtection: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	if created["enable_status_check"] != true || created["enable_push"] != true || created["enable_push_whitelist"] != true {
+		t.Fatalf("created protection = %#v", created)
+	}
+	assertJSONStrings(t, created, "status_check_contexts", "merge-queue")
+	assertJSONStrings(t, created, "push_whitelist_usernames")
+	assertJSONStrings(t, created, "push_whitelist_teams")
+	if created["push_whitelist_deploy_keys"] != false {
+		t.Fatalf("push whitelist deploy keys = %#v, want false", created["push_whitelist_deploy_keys"])
+	}
+}
+
+func TestEnsureBranchProtectionRemovesOnlyBotFromBasePushWhitelist(t *testing.T) {
+	var patched map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/branch_protections/main":
+			_ = json.NewEncoder(w).Encode(BranchProtection{
+				EnableStatusCheck:       true,
+				StatusCheckContexts:     []string{"ci"},
+				EnablePush:              true,
+				EnablePushWhitelist:     true,
+				PushWhitelistUsernames:  []string{"maintainer", "bot"},
+				PushWhitelistTeams:      []string{"release"},
+				PushWhitelistDeployKeys: true,
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/repos/o/r/branch_protections/main":
+			if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+				t.Fatalf("decode patch body: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	changed, err := New(srv.URL, "token").EnsureBranchProtection(context.Background(), "o", "r", "main", "merge-queue", "bot")
+	if err != nil {
+		t.Fatalf("EnsureBranchProtection: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	assertJSONStrings(t, patched, "status_check_contexts", "ci", "merge-queue")
+	assertJSONStrings(t, patched, "push_whitelist_usernames", "maintainer")
+	if _, ok := patched["push_whitelist_teams"]; ok {
+		t.Fatalf("patch must preserve push whitelist teams by omission: %#v", patched)
+	}
+	if _, ok := patched["push_whitelist_deploy_keys"]; ok {
+		t.Fatalf("patch must preserve deploy-key access by omission: %#v", patched)
+	}
+}
+
+func TestEnsureBranchProtectionNoopWithoutBotBasePushAccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/o/r/branch_protections/main" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode(BranchProtection{
+			EnableStatusCheck:      true,
+			StatusCheckContexts:    []string{"merge-queue"},
+			EnablePush:             true,
+			EnablePushWhitelist:    true,
+			PushWhitelistUsernames: []string{"maintainer"},
+		})
+	}))
+	defer srv.Close()
+
+	changed, err := New(srv.URL, "token").EnsureBranchProtection(context.Background(), "o", "r", "main", "merge-queue", "bot")
+	if err != nil {
+		t.Fatalf("EnsureBranchProtection: %v", err)
+	}
+	if changed {
+		t.Fatal("changed = true, want false")
+	}
+}
+
 func TestEnsureStagingBranchProtectionCreatesMissingRule(t *testing.T) {
 	var created map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -81,16 +181,26 @@ func TestEnsureStagingBranchProtectionUpdatesExistingRule(t *testing.T) {
 
 func assertOnlyBotCanPush(t *testing.T, body map[string]any) {
 	t.Helper()
-	users := body["push_whitelist_usernames"].([]any)
-	if len(users) != 1 || users[0] != "bot" {
-		t.Fatalf("push whitelist users = %#v, want bot only", users)
-	}
-	teams := body["push_whitelist_teams"].([]any)
-	if len(teams) != 0 {
-		t.Fatalf("push whitelist teams = %#v, want none", teams)
-	}
+	assertJSONStrings(t, body, "push_whitelist_usernames", "bot")
+	assertJSONStrings(t, body, "push_whitelist_teams")
 	if body["push_whitelist_deploy_keys"] != false {
 		t.Fatalf("push whitelist deploy keys = %#v, want false", body["push_whitelist_deploy_keys"])
+	}
+}
+
+func assertJSONStrings(t *testing.T, body map[string]any, key string, want ...string) {
+	t.Helper()
+	got, ok := body[key].([]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want string array", key, body[key])
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s = %#v, want %v", key, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s = %#v, want %v", key, got, want)
+		}
 	}
 }
 

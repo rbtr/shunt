@@ -18,35 +18,47 @@ import (
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
 // contains badPR; merges/bounces are recorded.
 type mock struct {
-	prs             map[int]*forge.PullRequest
-	automerge       map[int]bool
-	batchOf         map[string][]int // staging sha -> PR numbers
-	badPR           int
-	failMerge       int
-	conflictPR      int
-	conflictBasePR  int
-	conflictFirst   bool
-	statuses        []string
-	runStatus       string
-	staged          [][]int
-	stagingBranches []string
-	merged          []int
-	bounced         map[int]bool
-	comments        map[int][]string
-	queueComments   map[int][]string
-	mergeHeads      map[int][]string
-	runURLs         map[string]string
-	beforeMerge     func(int)
-	beforeGetPR     func(int)
-	beforeRunStatus func(string)
-	beforeRunURL    func(string)
+	prs                  map[int]*forge.PullRequest
+	automerge            map[int]bool
+	scheduleLive         map[int]bool
+	automergeAt          map[int]time.Time
+	latestStatus         map[int]forge.CommitStatus
+	nativePending        map[int]string
+	batchOf              map[string][]int // staging sha -> PR numbers
+	badPR                int
+	failNativeMerge      int
+	conflictPR           int
+	conflictBasePR       int
+	conflictFirst        bool
+	statuses             []string
+	runStatus            string
+	staged               [][]int
+	stagingBranches      []string
+	merged               []int
+	bounced              map[int]bool
+	comments             map[int][]string
+	queueComments        map[int][]string
+	runURLs              map[string]string
+	scheduled            []int
+	calls                []string
+	eventSeq             int64
+	beforeNative         func(int)
+	beforeAutomergeState func(int)
+	beforeGetPR          func(int)
+	beforeRunStatus      func(string)
+	beforeRunURL         func(string)
+	failStatusState      string
+	failStatusCount      int
+	getPRErrors          map[int]int
 }
 
 func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
-		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{},
+		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{}, scheduleLive: map[int]bool{}, automergeAt: map[int]time.Time{},
+		latestStatus: map[int]forge.CommitStatus{}, nativePending: map[int]string{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
-		comments: map[int][]string{}, queueComments: map[int][]string{}, mergeHeads: map[int][]string{}, runURLs: map[string]string{},
+		comments: map[int][]string{}, queueComments: map[int][]string{}, runURLs: map[string]string{},
+		getPRErrors: map[int]int{}, eventSeq: 100,
 	}
 	for _, n := range prNums {
 		m.addPR(n)
@@ -60,6 +72,8 @@ func (m *mock) addPR(n int) {
 	pr.Base.Ref = "main"
 	m.prs[n] = pr
 	m.automerge[n] = true
+	m.scheduleLive[n] = true
+	m.automergeAt[n] = m.nextEventTime()
 }
 
 func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullRequest, error) {
@@ -75,20 +89,64 @@ func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, 
 	if m.beforeGetPR != nil {
 		m.beforeGetPR(n)
 	}
+	if m.getPRErrors[n] > 0 {
+		m.getPRErrors[n]--
+		return forge.PullRequest{}, fmt.Errorf("get PR #%d", n)
+	}
 	return *m.prs[n], nil
 }
-func (m *mock) AutomergeScheduled(_ context.Context, _, _ string, n int) (bool, error) {
-	return m.automerge[n], nil
+func (m *mock) AutomergeState(_ context.Context, _, _ string, n int) (forge.AutomergeState, error) {
+	if m.beforeAutomergeState != nil {
+		m.beforeAutomergeState(n)
+	}
+	return forge.AutomergeState{Scheduled: m.automerge[n], UpdatedAt: m.automergeAt[n]}, nil
 }
-func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, _, state, _, _ string) error {
+func (m *mock) LatestCommitStatus(_ context.Context, _, _, sha, statusContext string) (forge.CommitStatus, bool, error) {
+	for n, pr := range m.prs {
+		if pr.Head.Sha == sha {
+			status, ok := m.latestStatus[n]
+			if ok && status.Context == statusContext {
+				return status, true, nil
+			}
+		}
+	}
+	return forge.CommitStatus{}, false, nil
+}
+func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, statusContext, state, desc, _ string) error {
+	if state == m.failStatusState && m.failStatusCount > 0 {
+		m.failStatusCount--
+		return fmt.Errorf("set %s status", state)
+	}
 	m.statuses = append(m.statuses, sha+":"+state)
+	m.calls = append(m.calls, "status:"+state)
+	for n, pr := range m.prs {
+		if pr.Head.Sha == sha {
+			m.latestStatus[n] = forge.CommitStatus{
+				ID:          m.eventSeq,
+				Status:      state,
+				Description: desc,
+				Context:     statusContext,
+				CreatedAt:   m.nextEventTime(),
+			}
+			if state == "success" && m.scheduleLive[n] {
+				m.nativePending[n] = sha
+			}
+		}
+	}
 	return nil
 }
 func (m *mock) Comment(_ context.Context, _, _ string, n int, body string) error {
 	m.comments[n] = append(m.comments[n], body)
 	return nil
 }
-func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, _, _, body string) error {
+func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, marker, _, body string) error {
+	if marker == outcomeCommentMarker {
+		m.comments[n] = append(m.comments[n], body)
+		if strings.Contains(body, "Bounced from merge queue") {
+			m.bounced[n] = true
+		}
+		return nil
+	}
 	m.queueComments[n] = append(m.queueComments[n], body)
 	return nil
 }
@@ -114,28 +172,62 @@ func (m *mock) RunTargetURL(_ context.Context, _, _, sha, _ string) (string, err
 	return m.runURLs[sha], nil
 }
 
-func (m *mock) MergePR(_ context.Context, _, _ string, n int, _, headSHA string) error {
-	m.mergeHeads[n] = append(m.mergeHeads[n], headSHA)
-	if m.beforeMerge != nil {
-		m.beforeMerge(n)
+func (m *mock) ScheduleAutomerge(_ context.Context, _, _ string, n int, _, _ string) error {
+	m.calls = append(m.calls, fmt.Sprintf("schedule:%d", n))
+	if m.scheduleLive[n] {
+		return nil
 	}
-	if m.prs[n].Head.Sha != headSHA {
-		return fmt.Errorf("head changed: expected %s got %s", headSHA, m.prs[n].Head.Sha)
-	}
-	if n == m.failMerge {
-		return fmt.Errorf("merge failed")
-	}
-	m.merged = append(m.merged, n)
-	m.prs[n].State = "closed"
-	m.prs[n].Merged = true
-	m.automerge[n] = false
+	m.scheduled = append(m.scheduled, n)
+	m.automerge[n] = true
+	m.scheduleLive[n] = true
+	m.automergeAt[n] = m.nextEventTime()
 	return nil
 }
 
-func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) error {
-	m.bounced[n] = true
+func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) (bool, error) {
+	m.calls = append(m.calls, fmt.Sprintf("cancel:%d", n))
+	if !m.scheduleLive[n] {
+		return false, nil
+	}
+	m.scheduleLive[n] = false
 	m.automerge[n] = false
-	return nil
+	m.automergeAt[n] = m.nextEventTime()
+	return true, nil
+}
+
+func (m *mock) nextEventTime() time.Time {
+	m.eventSeq++
+	return time.Now().Add(time.Duration(m.eventSeq) * time.Nanosecond)
+}
+
+func (m *mock) advanceNative() {
+	nums := make([]int, 0, len(m.nativePending))
+	for n := range m.nativePending {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	for _, n := range nums {
+		headSHA := m.nativePending[n]
+		delete(m.nativePending, n)
+		if !m.scheduleLive[n] || m.prs[n].Head.Sha != headSHA {
+			continue
+		}
+		if m.beforeNative != nil {
+			m.beforeNative(n)
+		}
+		if m.prs[n].Merged {
+			m.scheduleLive[n] = false
+			continue
+		}
+		if n == m.failNativeMerge {
+			m.scheduleLive[n] = false
+			continue
+		}
+		m.scheduleLive[n] = false
+		m.merged = append(m.merged, n)
+		m.prs[n].State = "closed"
+		m.prs[n].Merged = true
+	}
 }
 
 func (m *mock) BuildStaging(_ context.Context, _, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
@@ -157,6 +249,9 @@ func (m *mock) BuildStaging(_ context.Context, _, stagingBranch string, refs []g
 func drive(e *Engine, n int) {
 	for i := 0; i < n; i++ {
 		_ = e.Reconcile(context.Background())
+		if m, ok := e.fc.(*mock); ok {
+			m.advanceNative()
+		}
 	}
 }
 
@@ -261,13 +356,17 @@ func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
 	}
 	m.runStatus = "success"
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land batch: %v", err)
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
 	}
 
-	if got := len(m.queueComments[1]); got != 2 {
-		t.Fatalf("PR 1 queue comment updates = %d, want 2", got)
+	if got := len(m.queueComments[1]); got != 3 {
+		t.Fatalf("PR 1 queue comment updates = %d, want 3", got)
 	}
-	if body := m.queueComments[1][1]; !strings.Contains(body, "State: Landed via merge queue") {
+	if body := m.queueComments[1][2]; !strings.Contains(body, "State: Landed via merge queue") {
 		t.Fatalf("final queue comment did not mark PR as landed:\n%s", body)
 	}
 }
@@ -360,7 +459,15 @@ func TestBatchLingerResetsAfterBatchStarts(t *testing.T) {
 		t.Fatal("linger state should reset when first batch starts")
 	}
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land first batch: %v", err)
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release second PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("finish first batch: %v", err)
 	}
 
 	m.addPR(3)
@@ -487,14 +594,39 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Fatalf("merged after restage = %s, want []", got)
 	}
-	if err := restarted.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land restaged batch: %v", err)
-	}
+	drive(restarted, 4)
 	if got := fmt.Sprint(m.merged); got != "[1 2]" {
 		t.Errorf("merged after restore = %s, want [1 2]", got)
 	}
 	if !store.deleted {
 		t.Error("empty queue should delete checkpoint after restored batch lands")
+	}
+}
+
+func TestCheckpointRestartRestagesRemainderAfterReleasedPRMerges(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore queue: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [2]]" {
+		t.Fatalf("staged = %s, want remaining PR restaged on the advanced base", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
+		t.Fatalf("statuses = %s, want second PR blocked until its fresh gate passes", got)
 	}
 }
 
@@ -547,60 +679,420 @@ func TestAllGreenBatchLandsInOneRun(t *testing.T) {
 	}
 }
 
-func TestFailedMergeClearsSuccessStatus(t *testing.T) {
+func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	m := newMock(-1, 1, 2)
-	m.failMerge = 2
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
-	drive(e, 2)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release first PR: %v", err)
+	}
+
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
+		t.Fatalf("statuses before first merge = %s, want only PR 1 released", got)
+	}
+	if got := fmt.Sprint(m.calls); got != "[status:pending status:success]" {
+		t.Fatalf("landing calls = %s, want status-only native release", got)
+	}
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged before native worker = %s, want []", got)
+	}
+
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe first merge and release second: %v", err)
+	}
 
 	if got := fmt.Sprint(m.merged); got != "[1]" {
-		t.Errorf("merged = %s, want [1]", got)
+		t.Fatalf("merged = %s, want [1]", got)
 	}
-	want := "head-2:error"
-	if got := m.statuses[len(m.statuses)-1]; got != want {
-		t.Errorf("last status = %s, want %s", got, want)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-2:pending head-2:success]" {
+		t.Fatalf("statuses after first merge = %s, want PR 2 released only after PR 1 merged", got)
+	}
+}
+
+func TestNativeMergeRequeuesSpeculativeBatchesFromOldBase(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	e := New(Config{
+		Owner:         "o",
+		Repo:          "r",
+		Base:          "main",
+		StatusCtx:     "merge-queue",
+		StagingBranch: "mq/main/staging",
+		BisectFanout:  2,
+	}, m, m)
+	first := &activeBatch{
+		prs:        []forge.PullRequest{*m.prs[1], *m.prs[2]},
+		stagingSHA: "stage-first",
+		outcome:    "success",
+	}
+	later := &activeBatch{
+		prs:        []forge.PullRequest{*m.prs[3]},
+		stagingSHA: "stage-later",
+		outcome:    "success",
+	}
+	e.active = []*activeBatch{first, later}
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
+	}
+
+	if got := e.baseGen; got != 1 {
+		t.Fatalf("base generation = %d, want 1", got)
+	}
+	if got := fmt.Sprint(numbersOf(first.prs)); got != "[2]" {
+		t.Fatalf("first active batch = %s, want remaining PR 2", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[3]]" {
+		t.Fatalf("pending = %s, want later speculative batch requeued", got)
+	}
+	if got := len(e.active); got != 1 || e.active[0] != first {
+		t.Fatalf("active batches = %#v, want only current landing batch", e.active)
+	}
+}
+
+func TestNativeMergeAdvancesBaseBeforeLaterLandingError(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	e := New(Config{
+		Owner:         "o",
+		Repo:          "r",
+		Base:          "main",
+		StatusCtx:     "merge-queue",
+		StagingBranch: "mq/main/staging",
+		BisectFanout:  2,
+	}, m, m)
+	first := &activeBatch{
+		prs:        []forge.PullRequest{*m.prs[1], *m.prs[2]},
+		stagingSHA: "stage-first",
+		outcome:    "success",
+	}
+	later := &activeBatch{
+		prs:        []forge.PullRequest{*m.prs[3]},
+		stagingSHA: "stage-later",
+		outcome:    "success",
+	}
+	e.active = []*activeBatch{first, later}
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+	m.getPRErrors[2] = 1
+	if err := e.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected later PR lookup failure")
+	}
+
+	if got := e.baseGen; got != 1 {
+		t.Fatalf("base generation = %d, want merge recorded before returning the later error", got)
+	}
+	if got := fmt.Sprint(numbersOf(first.prs)); got != "[2]" {
+		t.Fatalf("first active batch = %s, want unresolved PR 2 retained", got)
+	}
+	if first.baseGen != e.baseGen {
+		t.Fatalf("first batch base generation = %d, want %d", first.baseGen, e.baseGen)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[3]]" {
+		t.Fatalf("pending = %s, want stale speculative batch requeued", got)
 	}
 }
 
 func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
-	m := newMock(-1, 1)
-	m.failMerge = 1
-	m.beforeMerge = func(n int) {
-		m.prs[n].State = "closed"
-		m.prs[n].Merged = true
-		m.automerge[n] = false
-	}
-	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
-	drive(e, 2)
-
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
-		t.Errorf("statuses = %s, want only success", got)
-	}
-	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
-		t.Errorf("comments missing landed outcome:\n%s", got)
-	}
-}
-
-func TestLandRevalidatesHappyPath(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
+	}
+
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
+		t.Errorf("statuses = %s, want pending then success", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
+		t.Errorf("comments missing landed outcome:\n%s", got)
+	}
+}
+
+func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
+	m := newMock(-1, 1)
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "rebase", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
 
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land batch: %v", err)
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("recover timed-out native merge: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
-		t.Errorf("statuses = %s, want [head-1:success]", got)
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged = %s, want []", got)
 	}
-	if got := fmt.Sprint(m.merged); got != "[1]" {
-		t.Errorf("merged = %s, want [1]", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
+		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
-	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
-		t.Errorf("merge head SHA = %s, want [head-1]", got)
+	if got := fmt.Sprint(m.calls); got != "[status:pending status:success status:error schedule:1 status:pending]" {
+		t.Fatalf("recovery calls = %s, want error, schedule, pending", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[1]" {
+		t.Fatalf("restored schedules = %s, want [1]", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1]]" {
+		t.Fatalf("pending = %s, want timed-out PR requeued", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Merge did not complete") {
+		t.Fatalf("outcome comment = %q, want timeout outcome", got)
+	}
+}
+
+func TestNativeMergeTimeoutRequeuesBeforeRestoreStatusFailure(t *testing.T) {
+	m := newMock(-1, 1)
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	m.failStatusState = "pending"
+	m.failStatusCount = 1
+	if err := e.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected restored pending status failure")
+	}
+
+	if got := fmt.Sprint(e.pending); got != "[[1]]" {
+		t.Fatalf("pending = %s, want timed-out PR queued before restore completes", got)
+	}
+	if len(e.active) != 0 {
+		t.Fatalf("active batches = %d, want old passing batch discarded", len(e.active))
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+		t.Fatalf("statuses = %s, want no second success from the old batch", got)
+	}
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restage after partial recovery: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want a fresh run after partial recovery", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+		t.Fatalf("statuses after restage = %s, want no release before the fresh gate resolves", got)
+	}
+}
+
+func TestNativeMergeTimeoutDoesNotResurrectCancellation(t *testing.T) {
+	m := newMock(-1, 1)
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.scheduleLive[1] = false
+	m.automerge[1] = false
+	m.automergeAt[1] = m.nextEventTime()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe cancellation: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("drop cancelled requeue: %v", err)
+	}
+
+	if got := fmt.Sprint(m.scheduled); got != "[]" {
+		t.Fatalf("restored schedules = %s, want cancellation preserved", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want no fresh run after cancellation", got)
+	}
+}
+
+func TestNativeMergeTimeoutRechecksCancellationBeforeRestore(t *testing.T) {
+	m := newMock(-1, 1)
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	m.beforeAutomergeState = func(n int) {
+		status := m.latestStatus[n]
+		if status.Status != "error" || status.Description != statusDescription("Merge did not complete") {
+			return
+		}
+		m.beforeAutomergeState = nil
+		m.scheduleLive[n] = false
+		m.automerge[n] = false
+		m.automergeAt[n] = m.nextEventTime()
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe cancellation during recovery: %v", err)
+	}
+
+	if got := fmt.Sprint(m.scheduled); got != "[]" {
+		t.Fatalf("restored schedules = %s, want newer cancellation preserved", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+		t.Fatalf("statuses = %s, want timed-out success blocked without a duplicate status", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") {
+		t.Fatalf("outcome comment = %q, want cancellation outcome", got)
+	}
+}
+
+func TestCancellationBetweenClaimAndReleaseWins(t *testing.T) {
+	m := newMock(-1, 1)
+	m.beforeGetPR = func(n int) {
+		status, ok := m.latestStatus[n]
+		if !ok || status.Status != "pending" || status.Description != landingClaimDescription {
+			return
+		}
+		m.scheduleLive[n] = false
+		m.automerge[n] = false
+		m.automergeAt[n] = m.nextEventTime()
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe cancellation: %v", err)
+	}
+
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:error]" {
+		t.Fatalf("statuses = %s, want cancellation to prevent success", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[]" {
+		t.Fatalf("restored schedules = %s, want cancellation preserved", got)
+	}
+}
+
+func TestStaleLandingSuccessFromOlderVersionIsRecovered(t *testing.T) {
+	m := newMock(-1, 1)
+	m.scheduleLive[1] = false
+	releasedAt := time.Now().Add(-nativeMergeTimeout - time.Second)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "success",
+		Description: landingSuccessDescription,
+		Context:     "merge-queue",
+		CreatedAt:   releasedAt,
+	}
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "squash", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restage stale landing: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("recover stale landing: %v", err)
+	}
+
+	if got := fmt.Sprint(m.scheduled); got != "[1]" {
+		t.Fatalf("restored schedules = %s, want [1]", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:error head-1:pending]" {
+		t.Fatalf("statuses = %s, want stale success blocked before requeue", got)
+	}
+}
+
+func TestNewerTerminalStatusSuppressesOrphanedScheduleEvent(t *testing.T) {
+	m := newMock(-1, 1)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "error",
+		Description: "merge queue: PR rejected",
+		Context:     "merge-queue",
+		CreatedAt:   m.automergeAt[1].Add(time.Second),
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want orphaned schedule suppressed", got)
+	}
+}
+
+func TestNewerScheduleRestoresQueueAfterTerminalStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	statusTime := m.automergeAt[1].Add(time.Second)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "error",
+		Description: "merge queue: PR rejected",
+		Context:     "merge-queue",
+		CreatedAt:   statusTime,
+	}
+	m.automergeAt[1] = statusTime.Add(time.Second)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want newer schedule honored", got)
+	}
+}
+
+func TestCancellationAfterLandingClaimIsNotRecovered(t *testing.T) {
+	m := newMock(-1, 1)
+	m.automerge[1] = false
+	m.scheduleLive[1] = false
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "pending",
+		Description: landingClaimDescription,
+		Context:     "merge-queue",
+		CreatedAt:   m.automergeAt[1].Add(time.Second),
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want cancellation preserved", got)
 	}
 }
 
@@ -613,11 +1105,18 @@ func TestTerminalCommentsUseRunTargetURLWhenAvailable(t *testing.T) {
 	}
 	m.runURLs[e.active[0].stagingSHA] = "https://forge.example.com/o/r/actions/runs/7"
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land batch: %v", err)
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
 	}
 
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "https://forge.example.com/o/r/actions/runs/7") {
 		t.Fatalf("terminal comment did not use run target URL:\n%s", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, outcomeCommentMarker) {
+		t.Fatalf("terminal comment missing outcome marker:\n%s", got)
 	}
 }
 
@@ -802,35 +1301,33 @@ func TestLandSkipsClosedOrMergedPR(t *testing.T) {
 	}
 }
 
-func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
+func TestNativeLandingHandlesHeadChangeAfterRelease(t *testing.T) {
 	m := newMock(-1, 1)
-	changed := false
-	m.beforeMerge = func(n int) {
-		if n == 1 && !changed {
-			m.prs[1].Head.Sha = "head-1-new"
-			changed = true
-		}
-	}
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land batch: %v", err)
+		t.Fatalf("release PR: %v", err)
+	}
+	m.prs[1].Head.Sha = "head-1-new"
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("requeue changed PR: %v", err)
 	}
 
-	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
-		t.Errorf("merge head SHA = %s, want [head-1]", got)
-	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error head-1-new:error]" {
-		t.Errorf("statuses = %s, want success/error on tested head and error on current head", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1-new:error]" {
+		t.Errorf("statuses = %s, want success cleared on tested and current heads", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Errorf("merged = %s, want []", got)
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "head changed from head-1 to head-1-new") {
 		t.Errorf("comments = %s, want changed-head skip comment", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[]" {
+		t.Errorf("restored schedules = %s, want existing schedule preserved", got)
 	}
 }
 
@@ -863,16 +1360,21 @@ func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	m.advanceNative()
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	m.advanceNative()
 	if got := fmt.Sprint(m.merged); got != "[1]" {
 		t.Fatalf("merged after prefix = %s, want [1]", got)
 	}
 
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -889,6 +1391,10 @@ func TestStagingConflictAfterPrefixLandsBouncesConflicter(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.advanceNative()
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -923,6 +1429,14 @@ func TestStagingConflictAfterPrefixFailsCanLandConflicter(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.advanceNative()
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -986,9 +1500,15 @@ func TestStagingConflictOnFirstPRBouncesAndRequeuesRest(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	m.advanceNative()
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.advanceNative()
 	sort.Ints(m.merged)
 	if got := fmt.Sprint(m.merged); got != "[2 3]" {
 		t.Errorf("merged = %s, want [2 3]", got)
@@ -1061,7 +1581,15 @@ func TestMetricsTrackQueueActivity(t *testing.T) {
 	}
 
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land reconcile: %v", err)
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release second PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("finish landing: %v", err)
 	}
 	assertMetric(t, c, `shunt_queue_depth{owner="o",repo="r",base="main"} 0`)
 	assertMetric(t, c, `shunt_active_batch{owner="o",repo="r",base="main"} 0`)
@@ -1089,7 +1617,15 @@ func TestMetricsTrackQueueAgeAndTimeInQueue(t *testing.T) {
 
 	now = now.Add(15 * time.Second)
 	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatalf("land reconcile: %v", err)
+		t.Fatalf("release first PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release second PR: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("finish landing: %v", err)
 	}
 	assertMetric(t, c, `shunt_queue_oldest_age_seconds{owner="o",repo="r",base="main"} 0`)
 	assertMetric(t, c, `shunt_time_in_queue_seconds_bucket{owner="o",repo="r",base="main",outcome="merged",le="60"} 2`)

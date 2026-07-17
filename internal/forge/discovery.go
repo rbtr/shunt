@@ -75,8 +75,9 @@ var shuntWebhookEvents = []string{
 	"status",
 }
 
-// EnsureBranchProtection makes sure base requires statusCtx and that botUser may
-// push. It is additive: it never removes existing contexts or whitelist entries.
+// EnsureBranchProtection makes sure base requires statusCtx and that direct
+// pushes remain restricted. shunt only pushes staging branches, so any legacy
+// base-branch push grant for botUser is removed; other grants are preserved.
 func (c *Client) EnsureBranchProtection(ctx context.Context, owner, repo, base, statusCtx, botUser string) (changed bool, err error) {
 	var bp BranchProtection
 	path := repoPath(owner, repo)
@@ -87,25 +88,27 @@ func (c *Client) EnsureBranchProtection(ctx context.Context, owner, repo, base, 
 			return false, getErr
 		}
 		body := map[string]any{
-			"rule_name":                base,
-			"enable_status_check":      true,
-			"status_check_contexts":    []string{statusCtx},
-			"enable_push":              true,
-			"enable_push_whitelist":    true,
-			"push_whitelist_usernames": []string{botUser},
-			"required_approvals":       0,
-			"block_on_outdated_branch": false,
+			"rule_name":                  base,
+			"enable_status_check":        true,
+			"status_check_contexts":      []string{statusCtx},
+			"enable_push":                true,
+			"enable_push_whitelist":      true,
+			"push_whitelist_usernames":   []string{},
+			"push_whitelist_teams":       []string{},
+			"push_whitelist_deploy_keys": false,
+			"required_approvals":         0,
+			"block_on_outdated_branch":   false,
 		}
 		return true, c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/branch_protections", path), body, nil)
 	}
-	ctxs, wl := bp.StatusCheckContexts, bp.PushWhitelistUsernames
+	ctxs := append([]string(nil), bp.StatusCheckContexts...)
+	wl := withoutString(bp.PushWhitelistUsernames, botUser)
 	need := false
 	if !contains(ctxs, statusCtx) {
 		ctxs = append(ctxs, statusCtx)
 		need = true
 	}
-	if !contains(wl, botUser) {
-		wl = append(wl, botUser)
+	if len(wl) != len(bp.PushWhitelistUsernames) {
 		need = true
 	}
 	if !bp.EnableStatusCheck || !bp.EnablePush || !bp.EnablePushWhitelist {
@@ -229,6 +232,16 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func withoutString(s []string, v string) []string {
+	out := make([]string, 0, len(s))
+	for _, x := range s {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func sameStringSet(a, b []string) bool {

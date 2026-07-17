@@ -41,6 +41,7 @@ func TestBurnInBisectionWithRealGitStaging(t *testing.T) {
 		if err := eng.Reconcile(ctx); err != nil {
 			t.Fatalf("reconcile %d: %v", i, err)
 		}
+		burn.advanceNative()
 	}
 
 	if got := burn.merged; !equalInts(got, []int{1, 3}) {
@@ -67,6 +68,7 @@ type burnInForge struct {
 	repoDir   string
 	prs       map[int]*forge.PullRequest
 	automerge map[int]bool
+	native    map[int]string
 	merged    []int
 	bounced   map[int]bool
 	staged    [][]int
@@ -79,6 +81,7 @@ func newBurnInForge(t *testing.T, repoDir string, nums ...int) *burnInForge {
 		repoDir:   repoDir,
 		prs:       map[int]*forge.PullRequest{},
 		automerge: map[int]bool{},
+		native:    map[int]string{},
 		bounced:   map[int]bool{},
 	}
 	for _, n := range nums {
@@ -127,8 +130,12 @@ func (b *burnInForge) GetPR(_ context.Context, _, _ string, index int) (forge.Pu
 	return *b.prs[index], nil
 }
 
-func (b *burnInForge) AutomergeScheduled(_ context.Context, _, _ string, index int) (bool, error) {
-	return b.automerge[index], nil
+func (b *burnInForge) AutomergeState(_ context.Context, _, _ string, index int) (forge.AutomergeState, error) {
+	return forge.AutomergeState{Scheduled: b.automerge[index]}, nil
+}
+
+func (b *burnInForge) LatestCommitStatus(_ context.Context, _, _, _, _ string) (forge.CommitStatus, bool, error) {
+	return forge.CommitStatus{}, false, nil
 }
 
 func (b *burnInForge) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
@@ -147,36 +154,62 @@ func (b *burnInForge) RunTargetURL(_ context.Context, _, _, sha, _ string) (stri
 	return "file://" + sha, nil
 }
 
-func (b *burnInForge) SetCommitStatus(_ context.Context, _, _, _, _, _, _, _ string) error {
-	return nil
-}
-
-func (b *burnInForge) MergePR(_ context.Context, _, _ string, index int, _, headSHA string) error {
-	pr := b.prs[index]
-	if pr.Head.Sha != headSHA {
-		return fmt.Errorf("head mismatch: got %s want %s", headSHA, pr.Head.Sha)
+func (b *burnInForge) SetCommitStatus(_ context.Context, _, _, sha, _, state, _, _ string) error {
+	if state != "success" {
+		return nil
 	}
-	git(b.t, b.repoDir, "checkout", "main")
-	git(b.t, b.repoDir, "merge", "--no-ff", "-m", fmt.Sprintf("merge PR %d", index), fmt.Sprintf("refs/pull/%d/head", index))
-	pr.State = "closed"
-	pr.Merged = true
-	b.automerge[index] = false
-	b.merged = append(b.merged, index)
+	for n, pr := range b.prs {
+		if pr.Head.Sha == sha && b.automerge[n] {
+			b.native[n] = sha
+		}
+	}
 	return nil
 }
 
-func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int) error {
-	b.automerge[index] = false
-	b.bounced[index] = true
+func (b *burnInForge) ScheduleAutomerge(_ context.Context, _, _ string, index int, _, _ string) error {
+	b.automerge[index] = true
 	return nil
+}
+
+func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int) (bool, error) {
+	if !b.automerge[index] {
+		return false, nil
+	}
+	b.automerge[index] = false
+	return true, nil
 }
 
 func (b *burnInForge) Comment(_ context.Context, _, _ string, _ int, _ string) error {
 	return nil
 }
 
-func (b *burnInForge) UpsertComment(_ context.Context, _, _ string, _ int, _, _, _ string) error {
+func (b *burnInForge) UpsertComment(_ context.Context, _, _ string, index int, marker, _, body string) error {
+	if marker == outcomeCommentMarker && strings.Contains(body, "Bounced from merge queue") {
+		b.bounced[index] = true
+	}
 	return nil
+}
+
+func (b *burnInForge) advanceNative() {
+	nums := make([]int, 0, len(b.native))
+	for n := range b.native {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	for _, n := range nums {
+		headSHA := b.native[n]
+		delete(b.native, n)
+		pr := b.prs[n]
+		if !b.automerge[n] || pr.Head.Sha != headSHA {
+			continue
+		}
+		git(b.t, b.repoDir, "checkout", "main")
+		git(b.t, b.repoDir, "merge", "--no-ff", "-m", fmt.Sprintf("merge PR %d", n), fmt.Sprintf("refs/pull/%d/head", n))
+		pr.State = "closed"
+		pr.Merged = true
+		b.automerge[n] = false
+		b.merged = append(b.merged, n)
+	}
 }
 
 func (b *burnInForge) stagedPRs(sha string) []int {

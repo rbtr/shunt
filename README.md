@@ -51,26 +51,27 @@ interval as a backstop):
 3. **Gate** — pushing the staging branch triggers your `on: push: [mq/**]`
    workflow. shunt reads that run's status.
 4. **Resolve:**
-   - **pass** → set the required `merge-queue` status on each PR and merge it via
-     the API (Forgejo records a proper merge).
+   - **pass** → release one PR by setting its required `merge-queue` status,
+     wait for the forge's scheduled auto-merge to finish, then release the next.
    - **fail, 1 PR** → bounce it (cancel auto-merge + comment).
    - **fail, >1 PR** → split in half and test sub-batches, up to the configured
      bisection fan-out. Innocent PRs are **never** bounced.
 
-Branch protection requires the `merge-queue` status on the base branch and
-restricts pushes to both the base and shunt-owned staging branches to the bot, so
-nothing reaches the base branch except a batch shunt has tested. Full detail and
-the validated Forgejo mechanics are in
+Branch protection requires the `merge-queue` status on the base branch. shunt
+removes its bot from the base branch's direct-push allow-list and grants it
+direct-push access only to shunt-owned staging branches. Full detail and the
+validated Forgejo mechanics are in
 [`docs/design.md`](docs/design.md).
 
 ## Quickstart
 
 shunt needs a dedicated **bot account**, access only to the repositories it
 manages, a token with the repository permissions described in
-[Security posture](#security-posture), and a slot in each protected branch's
-push allow-list. Current Forgejo/Gitea branch-protection APIs require repository
-admin access even for read requests, so the bot must have that permission on
-managed repositories to keep the required `merge-queue` gate in place.
+[Security posture](#security-posture), and direct-push access to its `mq/...`
+staging branches. The bot does not need direct-push access to the base branch.
+Current Forgejo/Gitea branch-protection APIs require repository admin access
+even for read requests, so the bot must have that permission on managed
+repositories to keep the required `merge-queue` gate in place.
 
 ```sh
 make build
@@ -104,10 +105,10 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_TOPIC` | — | Manage every repo with this topic (multi-repo mode) |
 | `SHUNT_REPO` | — | `owner/repo` for single-repo mode (use this *or* `SHUNT_TOPIC`) |
 | `SHUNT_BASE` | `main` | Protected base branch (single-repo mode) |
-| `SHUNT_BOT_USER` | `mq-bot` | Bot username (for git auth + push allow-list) |
+| `SHUNT_BOT_USER` | `mq-bot` | Bot username (for git auth + staging-branch push allow-list) |
 | `SHUNT_BOT_EMAIL` | `<bot>@noreply.invalid` | Author email for staging commits |
 | `SHUNT_STATUS_CONTEXT` | `merge-queue` | Required commit-status context |
-| `SHUNT_MERGE_STYLE` | `merge` | Merge method passed to the forge: `merge`, `squash`, or `rebase`. Must be enabled in the repository settings; for squash-only repos, set this to `squash`. |
+| `SHUNT_MERGE_STYLE` | `merge` | Fallback method (`merge`, `squash`, or `rebase`) used only if shunt must restore a consumed auto-merge schedule. Normal landing keeps the method selected on the PR. |
 | `SHUNT_MAX_BATCH` | `0` | Cap the initial rollup size (0 = unlimited) |
 | `SHUNT_BATCH_LINGER` | `0` | Optional duration to wait before forming the first batch, allowing more ready PRs to accumulate (0 = disabled) |
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). |
@@ -200,12 +201,13 @@ off by default because it adds issue-comment API reads/writes on repositories th
 opt in.
 
 Terminal outcomes are always reported on the source PR, even when sticky queue
-comments are disabled. Landed PRs receive a durable landed comment. Rejected PRs
-receive a failed or errored source-head status, auto-merge is cancelled, and shunt
-posts a durable comment with the rejection reason and a staging run/commit link
-when one exists. PRs skipped before landing because their head changed, auto-merge
-was cancelled, or the forge merge API did not complete receive an error status
-and a requeue/skipped comment so the PR page explains what happened.
+comments are disabled. shunt maintains one durable outcome comment per PR and
+updates it when the outcome changes. Rejected PRs receive a failed or errored
+source-head status, auto-merge is cancelled, and the outcome comment includes the
+rejection reason and a staging run/commit link when one exists. PRs skipped
+before landing because their head changed, auto-merge was cancelled, or the
+forge did not complete its scheduled merge receive an error status and an
+explanatory outcome.
 
 ## Deploy
 
@@ -231,11 +233,12 @@ kubectl apply -k deploy/kustomize/base
 
 ## Compatibility
 
-- **Forgejo** — validated end to end on v15.x (Gitea 1.22-compatible API).
+- **Forgejo** — validated end to end on v15.x and Codeberg's v16 deployment.
+  Both versions use the same status-triggered scheduled-merge flow.
 - **Gitea** — shunt uses only the Gitea-compatible API surface (timeline
-  comment types, branch protection, commit statuses, the merge endpoint), so it
-  is **expected** to work on Gitea ≥ 1.22. Not yet validated there — reports
-  welcome.
+  comment types, branch protection, commit statuses, the scheduled-merge
+  endpoint), so it is **expected** to work on Gitea ≥ 1.22. Not yet validated
+  there — reports welcome.
 
 Runs entirely outside the forge via its REST API — Forgejo and Gitea have no
 in-process plugin system, so a sidecar bot like this is the idiomatic way to add
@@ -260,10 +263,11 @@ scope name:
 - manage branch protection for opted-in repositories;
 - create or update the shunt-managed repository webhook when
   `SHUNT_WEBHOOK_URL` is set;
-- create commit statuses, merge pull requests, write PR comments, and cancel
-  scheduled auto-merge when a PR lands, is bounced, or becomes stale;
+- create commit statuses, write PR comments, and restore or cancel scheduled
+  auto-merge during recovery and bounce handling;
 - use Git to fetch PR heads and push only `mq/...` staging branches. Base branch
-  changes go through the forge merge API after the queue status passes.
+  changes are made by the forge's scheduled auto-merge worker after the queue
+  status passes.
 
 Keep tokens in your runtime secret store, never in the repository. The examples
 use placeholders only; real tokens should be supplied through environment

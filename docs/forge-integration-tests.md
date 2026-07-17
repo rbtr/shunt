@@ -41,8 +41,8 @@ Optional flows:
 | `SHUNT_FORGE_ALLOW_BRANCH_PROTECTION_WRITE` | Set to `1` to allow the branch-protection subtest to mutate repo settings. |
 | `SHUNT_FORGE_BRANCH_PROTECTION_BRANCH` | Branch to pass to `EnsureBranchProtection` when writes are enabled. |
 | `SHUNT_FORGE_BRANCH_PROTECTION_STATUS_CONTEXT` | Required status context for branch protection; defaults to `merge-queue`. |
-| `SHUNT_FORGE_BRANCH_PROTECTION_BOT_USER` | Bot username to add to the push allow-list when writes are enabled. |
+| `SHUNT_FORGE_BRANCH_PROTECTION_BOT_USER` | Bot username to remove from the base push allow-list when writes are enabled. |
 
 Use a disposable repo for write-enabled subtests. The harness intentionally does
-not call the merge endpoint because that flow is destructive; merge request
-payloads are covered by unit tests.
+not schedule, cancel, or release auto-merge because those flows mutate PR state;
+their request payloads are covered by unit tests.

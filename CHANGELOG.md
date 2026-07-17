@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Delegated final landing to the forge's scheduled auto-merge worker and
+  released passing PRs one at a time.
+- Requeued PRs when native auto-merge consumed a schedule without completing
+  the merge.
+- Removed the shunt bot from managed base-branch push allow-lists; it now needs
+  direct-push access only to `mq/...` staging branches.
+- Stopped orphaned schedule events and repeated reconciles from creating
+  duplicate terminal comments.
+
 ## [0.5.0] - 2026-07-11
 
 ### Added

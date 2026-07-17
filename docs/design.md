@@ -1,9 +1,8 @@
 # Design
 
-shunt is a small external service that adds a merge queue to Forgejo (and
-Gitea-compatible forges) using only their REST API. This document explains the
-algorithm and — just as important — the forge mechanics it depends on, several
-of which are non-obvious and were established empirically against Forgejo 15.x.
+shunt is a small external service that adds a merge queue to Forgejo and
+Gitea-compatible forges using their REST APIs. This document describes the
+queue algorithm and the forge behavior it relies on.
 
 ## Why an external bot (and not a plugin)
 
@@ -17,12 +16,13 @@ native UI. That's a platform ceiling, not a design choice.
 The bot token should be limited to the repositories shunt manages. At minimum,
 shunt needs API permission to read PR, timeline, commit-status, and workflow-run
 state; manage branch protection for opted-in repos; create or update the
-shunt-managed repository webhook when enabled; create source-head statuses; merge
-PRs; write outcome/queue comments; cancel scheduled auto-merge; and, via Git,
-fetch PR heads and push only `mq/...` staging branches. Current Forgejo/Gitea
-branch-protection and repository-hook APIs require repository admin permission,
-so the admin grant is scoped by repository rather than avoided entirely. Store
-the token in the runtime secret store, not in this repository.
+shunt-managed repository webhook when enabled; create source-head statuses;
+write outcome/queue comments; restore or cancel scheduled auto-merge; and, via
+Git, fetch PR heads and push only `mq/...` staging branches. Current
+Forgejo/Gitea branch-protection and repository-hook APIs require repository
+admin permission, so the admin grant is scoped by repository rather than
+avoided entirely. Store the token in the runtime secret store, not in this
+repository.
 
 ## Forge mechanics (validated)
 
@@ -31,27 +31,31 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
 1. **Auto-merge is detected from the PR timeline, not the PR object.** The PR
    API object does not expose a pending "merge when checks succeed". Instead the
    issue timeline (`GET /repos/{o}/{r}/issues/{n}/timeline`) contains
-   `pull_scheduled_merge` / `pull_cancel_scheduled_merge` events. Scanning
-   newest-first, the first of those wins.
+   `pull_scheduled_merge` / `pull_cancel_scheduled_merge` events. shunt scans all
+   pages and uses the latest transition. A newer terminal `merge-queue` status
+   invalidates an orphaned schedule event left behind by a failed native merge.
 
 2. **A fast-forward does NOT auto-mark PRs merged.** Pushing the base branch to
    a tested staging commit (the classic bors trick) leaves the PRs *open* even
    though their heads are ancestors of the base. So shunt does not fast-forward.
-   Instead it lands each PR through the forge's own merge:
-   - set the required `merge-queue` commit status to `success` on the PR head
-     (`POST /repos/{o}/{r}/statuses/{sha}`), then
-   - `POST /repos/{o}/{r}/pulls/{n}/merge`.
-   The forge performs the configured merge method (`merge`, `squash`, or
-   `rebase`) and records the PR as properly merged.
+   After a passing batch, shunt sets `merge-queue` to `success` on the first PR.
+   The forge's scheduled auto-merge worker pins that head SHA, rechecks merge
+   requirements, uses the method selected when auto-merge was enabled, and
+   records the merge. shunt waits until the PR is reported merged before
+   releasing the next one.
+
+   Forgejo 15 and 16 use this same status-triggered worker. If the worker
+   consumes a schedule but leaves the PR open, shunt blocks the status, restores
+   the schedule, and requeues the PR for a fresh test.
 
 3. **The required status check is the gate.** With branch protection requiring
-   the `merge-queue` status and restricting pushes to the bot, a PR merge is
-   rejected (`405 "Not all required status checks successful"`) until shunt sets
-   that status — which it only does after a batch passes. Nothing lands
-   un-vetted, and humans can't bypass the queue. The bot must have repository
-   admin permission, not only write permission, because Forgejo/Gitea require
-   admin access for the branch-protection API shunt uses to read and reconcile
-   this rule.
+   the `merge-queue` status, a PR merge is rejected
+   (`405 "Not all required status checks successful"`) until shunt sets that
+   status — which it only does after a batch passes. Direct pushes are restricted
+   separately, and shunt is not granted direct-push access to the base branch.
+   The bot must have repository admin permission, not only write permission,
+   because Forgejo/Gitea require admin access for the branch-protection API shunt
+   uses to read and reconcile this rule.
 
 4. **CI result is the Actions run `status`.** Forgejo Actions don't publish a
    pollable commit *status*; shunt reads the newest matching workflow run from
@@ -90,7 +94,8 @@ for active candidate whose earlier candidates are resolved:
     if any active PR head changed:
         abandon staging branch; requeue active PR numbers; restage immediately
     status = RunStatus(active.staging_sha, staging_branch)
-    success            -> land(active.prs); requeue later speculative runs if base advanced
+    success            -> release/observe active.prs in order
+                          requeue later speculative runs when base advances
     failure            -> bisectOrBounce(active)
     running/unknown    -> wait
 
@@ -129,15 +134,20 @@ of `1` preserves serial bisection. Every staging attempt uses a fresh immutable
 branch such as `mq/main/staging-<timestamp>-<sequence>`, so the gate workflow must
 keep matching `mq/**`.
 
-`land` sets the source-head status and merges each PR in order. Terminal queue
-outcomes are also written back to source PRs:
+`land` releases only the first remaining PR. Once the forge reports it merged,
+shunt advances to the next PR. A later PR never receives a successful queue
+status while an earlier one is unresolved. Terminal outcomes are also written
+back to source PRs:
 
-- landed PRs get a durable comment with the staging commit/run link;
+- landed PRs get a durable outcome comment with the staging commit/run link;
 - bounced PRs get auto-merge cancelled, a source-head `failure` status for gate
-  failures or `error` for staging/infrastructure failures, and a durable
-  rejection comment;
+  failures or `error` for staging/infrastructure failures, and an updated
+  rejection outcome;
 - skipped/requeued PRs get an `error` status plus a comment explaining why they
   were not landed.
+
+Outcome comments use a separate hidden marker and are updated in place. Repeated
+reconciliation therefore changes one comment instead of adding another.
 
 If sticky queue comments are enabled, terminal outcomes update the sticky comment
 too. Intermediate multi-PR batch failures are not broadcast to every source PR;
@@ -156,21 +166,22 @@ from the *current* base tip, a successful sub-batch that advances the base is
 handled safely: any later speculative staging run from the old base generation is
 abandoned and re-queued, then re-staged before it can land.
 
-The same preflight protects active batches from PR updates. On each reconcile,
-before reading a staging run result, shunt rechecks the current head SHA for every
-open PR in active batches. If any head changed, that stale staging branch is
-abandoned and the active PR numbers are re-queued so the next staging run tests
-the current heads. A pull-request webhook wakes this path promptly; polling
-remains the backstop for missed webhook deliveries.
+The same preflight protects active batches from PR updates. While a gate is
+running, shunt rechecks every open PR head before accepting the result. During
+landing, it rechecks each PR immediately before release. A changed head is
+re-queued for fresh staging. A pull-request webhook wakes this path promptly;
+polling remains the backstop for missed webhook deliveries.
 
 The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
 consumer-side store interface, and the concrete bbolt implementation lives in
 the more specific `checkpoint/bolt` package. Restored active batches are
 conservatively re-queued for fresh staging instead of resuming an old staging
-branch/run, so the engine never lands from a pre-restart result that may now be
-stale. The production command wires the default bbolt implementation when
-`SHUNT_STATE_PATH` is set. That store persists
-one snapshot per `(owner, repo, base)` and keeps the binary static/CGO-free;
+branch/run, so shunt does not release additional PRs from a result that may now
+be stale. A PR released before the restart may still finish through the forge;
+it was released only after a passing batch, and the remaining PRs are re-staged
+on the resulting base. The production command wires the default bbolt
+implementation when `SHUNT_STATE_PATH` is set. That store persists one snapshot
+per `(owner, repo, base)` and keeps the binary static/CGO-free;
 operators should place the database on persistent storage if they want queue
 state to survive pod replacement or host reboots.
 
@@ -228,19 +239,20 @@ bad PR, bounce it, and land the good PRs.
   lower-numbered candidates. If an earlier successful candidate advances the base,
   later speculative branches are discarded and re-staged on the new base before
   any PR lands.
-- **Merge method is an API landing choice, not a staging shortcut.** shunt always
-  tests the integration tree on a staging branch first, then asks the forge to
-  land each PR with the configured `merge`, `squash`, or `rebase` method while
-  pinning the expected PR head SHA. The configured method must be allowed by the
-  repository; squash-only repositories need `SHUNT_MERGE_STYLE=squash`. Keep
+- **The forge owns the final merge.** shunt tests the integration tree, then
+  releases PRs to scheduled auto-merge one at a time. The worker pins the
+  released head SHA and preserves the method selected on the PR. If shunt must
+  recreate a consumed schedule after a failed native merge, it uses
+  `SHUNT_MERGE_STYLE` as the fallback. Keep
   "block on outdated branch" disabled so the queue, not per-PR freshness checks,
   decides when a tested PR can land.
 - **Crash safety.** By default, state is still in-memory; a restart re-derives
-  the queue from open auto-merge PRs. It may repeat a staging run, but never
-  double-merges and never loses a PR. With `SHUNT_STATE_PATH`, shunt persists the
-  pending frontier, linger state, bisection counters, and active batch metadata
-  in bbolt. Active batches are re-staged after restore so no PR lands from a
-  pre-restart staging result that may have been invalidated by a base change.
+  the queue from open auto-merge PRs. It may repeat a staging run; a PR already
+  released to the forge may finish while shunt restarts.
+  With `SHUNT_STATE_PATH`, shunt persists the pending frontier, linger state,
+  bisection counters, and active batch metadata in bbolt. Active batches are
+  re-staged after restore so no additional PR is released from a pre-restart
+  result that may have been invalidated by a base change.
 
 ## Observability
 
@@ -276,8 +288,9 @@ outcomes there.
 
 1. Create a disposable repo and a bot account with a token that has repository
    admin permission.
-2. Protect the base branch: require the `merge-queue` status, restrict pushes to
-   the bot, and turn **off** "block on outdated branch".
+2. Protect the base branch: require the `merge-queue` status, restrict direct
+   pushes, and turn **off** "block on outdated branch". Do not add the shunt bot
+   to the base branch's push allow-list.
 3. Optionally set `SHUNT_WEBHOOK_URL` so shunt configures the repository webhook
    itself.
 4. Add `examples/mq-gate.yml` as `.forgejo/workflows/mq-gate.yml`.
