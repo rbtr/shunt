@@ -47,7 +47,7 @@ bisect_fanout: 2
 				StatusCheckContexts:    []string{"shunt"},
 				EnablePush:             true,
 				EnablePushWhitelist:    true,
-				PushWhitelistUsernames: []string{"bot"},
+				PushWhitelistUsernames: []string{},
 			})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -123,7 +123,7 @@ func TestRefreshUsesDefaultsWhenRepoConfigMissing(t *testing.T) {
 				StatusCheckContexts:    []string{"merge-queue"},
 				EnablePush:             true,
 				EnablePushWhitelist:    true,
-				PushWhitelistUsernames: []string{"bot"},
+				PushWhitelistUsernames: []string{},
 			})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -177,7 +177,7 @@ func TestRefreshEnsuresWebhookWhenConfigured(t *testing.T) {
 				StatusCheckContexts:    []string{"merge-queue"},
 				EnablePush:             true,
 				EnablePushWhitelist:    true,
-				PushWhitelistUsernames: []string{"bot"},
+				PushWhitelistUsernames: []string{},
 			})
 		case "/api/v1/repos/o/r/hooks":
 			switch r.Method {

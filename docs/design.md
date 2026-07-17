@@ -49,13 +49,13 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
    the schedule, and requeues the PR for a fresh test.
 
 3. **The required status check is the gate.** With branch protection requiring
-   the `merge-queue` status and restricting pushes to the bot, a PR merge is
-   rejected (`405 "Not all required status checks successful"`) until shunt sets
-   that status — which it only does after a batch passes. Nothing lands
-   un-vetted, and humans can't bypass the queue. The bot must have repository
-   admin permission, not only write permission, because Forgejo/Gitea require
-   admin access for the branch-protection API shunt uses to read and reconcile
-   this rule.
+   the `merge-queue` status, a PR merge is rejected
+   (`405 "Not all required status checks successful"`) until shunt sets that
+   status — which it only does after a batch passes. Direct pushes are restricted
+   separately, and shunt is not granted direct-push access to the base branch.
+   The bot must have repository admin permission, not only write permission,
+   because Forgejo/Gitea require admin access for the branch-protection API shunt
+   uses to read and reconcile this rule.
 
 4. **CI result is the Actions run `status`.** Forgejo Actions don't publish a
    pollable commit *status*; shunt reads the newest matching workflow run from
@@ -288,8 +288,9 @@ outcomes there.
 
 1. Create a disposable repo and a bot account with a token that has repository
    admin permission.
-2. Protect the base branch: require the `merge-queue` status, restrict pushes to
-   the bot, and turn **off** "block on outdated branch".
+2. Protect the base branch: require the `merge-queue` status, restrict direct
+   pushes, and turn **off** "block on outdated branch". Do not add the shunt bot
+   to the base branch's push allow-list.
 3. Optionally set `SHUNT_WEBHOOK_URL` so shunt configures the repository webhook
    itself.
 4. Add `examples/mq-gate.yml` as `.forgejo/workflows/mq-gate.yml`.

@@ -57,20 +57,21 @@ interval as a backstop):
    - **fail, >1 PR** → split in half and test sub-batches, up to the configured
      bisection fan-out. Innocent PRs are **never** bounced.
 
-Branch protection requires the `merge-queue` status on the base branch and
-restricts pushes to both the base and shunt-owned staging branches to the bot, so
-nothing reaches the base branch except a batch shunt has tested. Full detail and
-the validated Forgejo mechanics are in
+Branch protection requires the `merge-queue` status on the base branch. shunt
+removes its bot from the base branch's direct-push allow-list and grants it
+direct-push access only to shunt-owned staging branches. Full detail and the
+validated Forgejo mechanics are in
 [`docs/design.md`](docs/design.md).
 
 ## Quickstart
 
 shunt needs a dedicated **bot account**, access only to the repositories it
 manages, a token with the repository permissions described in
-[Security posture](#security-posture), and a slot in each protected branch's
-push allow-list. Current Forgejo/Gitea branch-protection APIs require repository
-admin access even for read requests, so the bot must have that permission on
-managed repositories to keep the required `merge-queue` gate in place.
+[Security posture](#security-posture), and direct-push access to its `mq/...`
+staging branches. The bot does not need direct-push access to the base branch.
+Current Forgejo/Gitea branch-protection APIs require repository admin access
+even for read requests, so the bot must have that permission on managed
+repositories to keep the required `merge-queue` gate in place.
 
 ```sh
 make build
@@ -104,7 +105,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_TOPIC` | — | Manage every repo with this topic (multi-repo mode) |
 | `SHUNT_REPO` | — | `owner/repo` for single-repo mode (use this *or* `SHUNT_TOPIC`) |
 | `SHUNT_BASE` | `main` | Protected base branch (single-repo mode) |
-| `SHUNT_BOT_USER` | `mq-bot` | Bot username (for git auth + push allow-list) |
+| `SHUNT_BOT_USER` | `mq-bot` | Bot username (for git auth + staging-branch push allow-list) |
 | `SHUNT_BOT_EMAIL` | `<bot>@noreply.invalid` | Author email for staging commits |
 | `SHUNT_STATUS_CONTEXT` | `merge-queue` | Required commit-status context |
 | `SHUNT_MERGE_STYLE` | `merge` | Fallback method (`merge`, `squash`, or `rebase`) used only if shunt must restore a consumed auto-merge schedule. Normal landing keeps the method selected on the PR. |
