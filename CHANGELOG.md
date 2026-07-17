@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-17
+
 ### Added
 - Postgres-backed queue ownership leases, renewed at each reconciliation tick,
   to coordinate a queue across replicas. A takeover reloads durable state and
