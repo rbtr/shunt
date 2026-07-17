@@ -1777,7 +1777,7 @@ func TestUnavailableForgeSkipsReconcileError(t *testing.T) {
 	e := New(Config{
 		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Metrics: c,
 	}, m, m)
-	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingSHA: "stage-1"}}
+	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingBranch: "mq/main/staging-1", stagingSHA: "stage-1"}}
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile returned unavailable error: %v", err)
@@ -1825,6 +1825,32 @@ func TestDurableLeaseBoundsReconcileContext(t *testing.T) {
 	}
 }
 
+func TestDeadlinePreservesEarlierReconcileError(t *testing.T) {
+	m := newMock(-1)
+	lease := &deadlineQueueLease{}
+	store := &deadlineSaveCheckpointStore{}
+	const ttl = 40 * time.Millisecond
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: ttl,
+	}, m, m)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial Reconcile: %v", err)
+	}
+
+	earlier := errors.New("run status failed")
+	m.addPR(1)
+	m.runStatusErr = earlier
+	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingBranch: "mq/main/staging-1", stagingSHA: "stage-1"}}
+	err := e.Reconcile(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), earlier.Error()) {
+		t.Fatalf("Reconcile error = %v, want earlier error %q preserved", err, earlier)
+	}
+}
+
 type testQueueLease struct {
 	held  []bool
 	calls int
@@ -1868,6 +1894,21 @@ func (s *contextBlockingStager) BuildStaging(ctx context.Context, _ string, _ st
 	s.deadline, s.hasDeadline = ctx.Deadline()
 	<-ctx.Done()
 	return "", 0, ctx.Err()
+}
+
+type deadlineSaveCheckpointStore struct{}
+
+func (*deadlineSaveCheckpointStore) LoadQueue(context.Context, checkpoint.QueueKey) (checkpoint.QueueSnapshot, bool, error) {
+	return checkpoint.QueueSnapshot{}, false, nil
+}
+
+func (*deadlineSaveCheckpointStore) SaveQueue(ctx context.Context, _ checkpoint.QueueSnapshot) error {
+	<-ctx.Done()
+	return fmt.Errorf("write checkpoint: %w", ctx.Err())
+}
+
+func (*deadlineSaveCheckpointStore) DeleteQueue(context.Context, checkpoint.QueueKey) error {
+	return nil
 }
 
 type memoryCheckpointStore struct {

@@ -181,10 +181,10 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		if err != nil && !errors.Is(err, ctxErr) {
-			err = errors.Join(err, ctxErr)
-		} else {
+		if err == nil {
 			err = ctxErr
+		} else if !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
 		}
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
 		e.observeQueue()
