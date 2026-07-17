@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/rbtr/shunt/internal/checkpoint"
 )
@@ -16,6 +17,11 @@ import (
 //
 //go:embed migrations/001_queue_state.sql
 var PostgresMigrationV1 string
+
+// PostgresMigrationV2 creates the queue-lease table used to coordinate replicas.
+//
+//go:embed migrations/002_queue_leases.sql
+var PostgresMigrationV2 string
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -66,16 +72,54 @@ func New(db *sql.DB) *Store {
 	return &Store{db: stdDB{db: db}}
 }
 
-// ApplyMigrations ensures the backing table and indexes exist.
+// ApplyMigrations ensures the backing tables and indexes exist.
 func (p *Store) ApplyMigrations(ctx context.Context) error {
 	if err := p.ready(); err != nil {
 		return err
 	}
-	_, err := p.db.ExecContext(ctx, PostgresMigrationV1)
-	if err != nil {
-		return fmt.Errorf("state: apply postgres migrations: %w", err)
+	for _, migration := range []string{PostgresMigrationV1, PostgresMigrationV2} {
+		if _, err := p.db.ExecContext(ctx, migration); err != nil {
+			return fmt.Errorf("state: apply postgres migrations: %w", err)
+		}
 	}
 	return nil
+}
+
+// AcquireLease atomically acquires or renews a lease for key. It returns false,
+// nil when another holder has an unexpired lease. A holder can renew its own
+// lease, and a different holder can take over after expiry.
+func (p *Store) AcquireLease(ctx context.Context, key checkpoint.QueueKey, holderID string, ttl time.Duration) (bool, error) {
+	if err := p.ready(); err != nil {
+		return false, err
+	}
+	if err := key.Validate(); err != nil {
+		return false, err
+	}
+	if holderID == "" {
+		return false, errors.New("state: queue lease holder ID is required")
+	}
+	if ttl < time.Microsecond {
+		return false, errors.New("state: queue lease TTL must be at least one microsecond")
+	}
+
+	var expiresAt time.Time
+	err := p.db.QueryRowContext(ctx, `
+INSERT INTO shunt_queue_leases (owner, repo, base, holder_id, expires_at)
+VALUES ($1, $2, $3, $4, now() + $5 * interval '1 microsecond')
+ON CONFLICT (owner, repo, base) DO UPDATE SET
+    holder_id = EXCLUDED.holder_id,
+    expires_at = EXCLUDED.expires_at
+WHERE shunt_queue_leases.holder_id = EXCLUDED.holder_id
+   OR shunt_queue_leases.expires_at <= now()
+RETURNING expires_at
+`, key.Owner, key.Repo, key.Base, holderID, ttl.Microseconds()).Scan(&expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("state: acquire queue lease %s/%s@%s: %w", key.Owner, key.Repo, key.Base, err)
+	}
+	return true, nil
 }
 
 // SaveQueue upserts a complete queue snapshot.
