@@ -200,12 +200,13 @@ off by default because it adds issue-comment API reads/writes on repositories th
 opt in.
 
 Terminal outcomes are always reported on the source PR, even when sticky queue
-comments are disabled. Landed PRs receive a durable landed comment. Rejected PRs
-receive a failed or errored source-head status, auto-merge is cancelled, and shunt
-posts a durable comment with the rejection reason and a staging run/commit link
-when one exists. PRs skipped before landing because their head changed, auto-merge
-was cancelled, or the forge merge API did not complete receive an error status
-and a requeue/skipped comment so the PR page explains what happened.
+comments are disabled. shunt maintains one durable outcome comment per PR and
+updates it when the outcome changes. Rejected PRs receive a failed or errored
+source-head status, auto-merge is cancelled, and the outcome comment includes the
+rejection reason and a staging run/commit link when one exists. PRs skipped
+before landing because their head changed, auto-merge was cancelled, or the
+forge merge API did not complete receive an error status and an explanatory
+outcome.
 
 ## Deploy
 

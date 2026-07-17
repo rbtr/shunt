@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -20,9 +21,13 @@ import (
 type mock struct {
 	prs             map[int]*forge.PullRequest
 	automerge       map[int]bool
+	automergeAt     map[int]time.Time
+	latestStatus    map[int]forge.CommitStatus
 	batchOf         map[string][]int // staging sha -> PR numbers
 	badPR           int
 	failMerge       int
+	noopMerge       int
+	cancelErr       error
 	conflictPR      int
 	conflictBasePR  int
 	conflictFirst   bool
@@ -36,6 +41,9 @@ type mock struct {
 	queueComments   map[int][]string
 	mergeHeads      map[int][]string
 	runURLs         map[string]string
+	scheduled       []int
+	calls           []string
+	eventSeq        int64
 	beforeMerge     func(int)
 	beforeGetPR     func(int)
 	beforeRunStatus func(string)
@@ -44,9 +52,10 @@ type mock struct {
 
 func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
-		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{},
+		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{}, automergeAt: map[int]time.Time{}, latestStatus: map[int]forge.CommitStatus{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
 		comments: map[int][]string{}, queueComments: map[int][]string{}, mergeHeads: map[int][]string{}, runURLs: map[string]string{},
+		eventSeq: 100,
 	}
 	for _, n := range prNums {
 		m.addPR(n)
@@ -60,6 +69,7 @@ func (m *mock) addPR(n int) {
 	pr.Base.Ref = "main"
 	m.prs[n] = pr
 	m.automerge[n] = true
+	m.automergeAt[n] = m.nextEventTime()
 }
 
 func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullRequest, error) {
@@ -77,18 +87,48 @@ func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, 
 	}
 	return *m.prs[n], nil
 }
-func (m *mock) AutomergeScheduled(_ context.Context, _, _ string, n int) (bool, error) {
-	return m.automerge[n], nil
+func (m *mock) AutomergeState(_ context.Context, _, _ string, n int) (forge.AutomergeState, error) {
+	return forge.AutomergeState{Scheduled: m.automerge[n], UpdatedAt: m.automergeAt[n]}, nil
 }
-func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, _, state, _, _ string) error {
+func (m *mock) LatestCommitStatus(_ context.Context, _, _, sha, statusContext string) (forge.CommitStatus, bool, error) {
+	for n, pr := range m.prs {
+		if pr.Head.Sha == sha {
+			status, ok := m.latestStatus[n]
+			if ok && status.Context == statusContext {
+				return status, true, nil
+			}
+		}
+	}
+	return forge.CommitStatus{}, false, nil
+}
+func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, statusContext, state, desc, _ string) error {
 	m.statuses = append(m.statuses, sha+":"+state)
+	m.calls = append(m.calls, "status:"+state)
+	for n, pr := range m.prs {
+		if pr.Head.Sha == sha {
+			m.latestStatus[n] = forge.CommitStatus{
+				ID:          m.eventSeq,
+				Status:      state,
+				Description: desc,
+				Context:     statusContext,
+				CreatedAt:   m.nextEventTime(),
+			}
+		}
+	}
 	return nil
 }
 func (m *mock) Comment(_ context.Context, _, _ string, n int, body string) error {
 	m.comments[n] = append(m.comments[n], body)
 	return nil
 }
-func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, _, _, body string) error {
+func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, marker, _, body string) error {
+	if marker == outcomeCommentMarker {
+		m.comments[n] = append(m.comments[n], body)
+		if strings.Contains(body, "Bounced from merge queue") {
+			m.bounced[n] = true
+		}
+		return nil
+	}
 	m.queueComments[n] = append(m.queueComments[n], body)
 	return nil
 }
@@ -116,6 +156,7 @@ func (m *mock) RunTargetURL(_ context.Context, _, _, sha, _ string) (string, err
 
 func (m *mock) MergePR(_ context.Context, _, _ string, n int, _, headSHA string) error {
 	m.mergeHeads[n] = append(m.mergeHeads[n], headSHA)
+	m.calls = append(m.calls, fmt.Sprintf("merge:%d", n))
 	if m.beforeMerge != nil {
 		m.beforeMerge(n)
 	}
@@ -125,6 +166,9 @@ func (m *mock) MergePR(_ context.Context, _, _ string, n int, _, headSHA string)
 	if n == m.failMerge {
 		return fmt.Errorf("merge failed")
 	}
+	if n == m.noopMerge {
+		return nil
+	}
 	m.merged = append(m.merged, n)
 	m.prs[n].State = "closed"
 	m.prs[n].Merged = true
@@ -132,10 +176,30 @@ func (m *mock) MergePR(_ context.Context, _, _ string, n int, _, headSHA string)
 	return nil
 }
 
-func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) error {
-	m.bounced[n] = true
-	m.automerge[n] = false
+func (m *mock) ScheduleAutomerge(_ context.Context, _, _ string, n int, _, _ string) error {
+	m.calls = append(m.calls, fmt.Sprintf("schedule:%d", n))
+	m.scheduled = append(m.scheduled, n)
+	m.automerge[n] = true
+	m.automergeAt[n] = m.nextEventTime()
 	return nil
+}
+
+func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) (bool, error) {
+	m.calls = append(m.calls, fmt.Sprintf("cancel:%d", n))
+	if m.cancelErr != nil {
+		return false, m.cancelErr
+	}
+	if !m.automerge[n] {
+		return false, nil
+	}
+	m.automerge[n] = false
+	m.automergeAt[n] = m.nextEventTime()
+	return true, nil
+}
+
+func (m *mock) nextEventTime() time.Time {
+	m.eventSeq++
+	return time.Unix(m.eventSeq, 0)
 }
 
 func (m *mock) BuildStaging(_ context.Context, _, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
@@ -560,6 +624,9 @@ func TestFailedMergeClearsSuccessStatus(t *testing.T) {
 	if got := m.statuses[len(m.statuses)-1]; got != want {
 		t.Errorf("last status = %s, want %s", got, want)
 	}
+	if got := fmt.Sprint(m.scheduled); got != "[2]" {
+		t.Errorf("rescheduled = %s, want [2]", got)
+	}
 }
 
 func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
@@ -573,8 +640,8 @@ func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 	drive(e, 2)
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
-		t.Errorf("statuses = %s, want only success", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:pending head-1:success]" {
+		t.Errorf("statuses = %s, want claim confirmation then success", got)
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
 		t.Errorf("comments missing landed outcome:\n%s", got)
@@ -593,14 +660,159 @@ func TestLandRevalidatesHappyPath(t *testing.T) {
 		t.Fatalf("land batch: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
-		t.Errorf("statuses = %s, want [head-1:success]", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:pending head-1:success]" {
+		t.Errorf("statuses = %s, want claim confirmation then success", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[1]" {
 		t.Errorf("merged = %s, want [1]", got)
 	}
 	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
 		t.Errorf("merge head SHA = %s, want [head-1]", got)
+	}
+}
+
+func TestLandCancelsNativeAutomergeBeforeSuccessAndMerge(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("land batch: %v", err)
+	}
+
+	want := "[status:pending cancel:1 status:pending status:success merge:1]"
+	if got := fmt.Sprint(m.calls); got != want {
+		t.Fatalf("landing calls = %s, want %s", got, want)
+	}
+}
+
+func TestLandStopsIfNativeAutomergeCancellationFails(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.cancelErr = errors.New("cancel unavailable")
+	if err := e.Reconcile(context.Background()); err == nil {
+		t.Fatal("land batch succeeded despite cancellation failure")
+	}
+
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "status:success") || strings.Contains(got, "merge:1") {
+		t.Fatalf("landing continued after cancellation failure: %s", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[1]" {
+		t.Fatalf("deferred queue restoration = %s, want [1]", got)
+	}
+}
+
+func TestMergeAPISuccessWithoutMergedStateIsRequeued(t *testing.T) {
+	m := newMock(-1, 1)
+	m.noopMerge = 1
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	drive(e, 2)
+
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged = %s, want []", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); strings.Contains(got, "Landed via merge queue") || !strings.Contains(got, "Merge did not complete") {
+		t.Fatalf("outcome comment = %q, want only merge-failure outcome", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[1]" {
+		t.Fatalf("rescheduled = %s, want [1]", got)
+	}
+}
+
+func TestNewerTerminalStatusSuppressesOrphanedScheduleEvent(t *testing.T) {
+	m := newMock(-1, 1)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "error",
+		Description: "merge queue: PR rejected",
+		Context:     "merge-queue",
+		CreatedAt:   m.automergeAt[1].Add(time.Second),
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want orphaned schedule suppressed", got)
+	}
+}
+
+func TestNewerScheduleRestoresQueueAfterTerminalStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	statusTime := m.automergeAt[1].Add(time.Second)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "error",
+		Description: "merge queue: PR rejected",
+		Context:     "merge-queue",
+		CreatedAt:   statusTime,
+	}
+	m.automergeAt[1] = statusTime.Add(time.Second)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want newer schedule honored", got)
+	}
+}
+
+func TestInterruptedLandingStatusRecoversMissingSchedule(t *testing.T) {
+	m := newMock(-1, 1)
+	m.automerge[1] = false
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "pending",
+		Description: landingClaimDescription,
+		Context:     "merge-queue",
+		CreatedAt:   m.automergeAt[1].Add(time.Second),
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restage interrupted landing: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want interrupted landing recovered", got)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("land interrupted claim: %v", err)
+	}
+	if got := fmt.Sprint(m.merged); got != "[1]" {
+		t.Fatalf("merged = %s, want [1]", got)
+	}
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "cancel:1") {
+		t.Fatalf("recovered claim redundantly cancelled missing schedule: %s", got)
+	}
+}
+
+func TestCancellationAfterLandingClaimIsNotRecovered(t *testing.T) {
+	m := newMock(-1, 1)
+	claimTime := m.automergeAt[1].Add(time.Second)
+	m.automerge[1] = false
+	m.automergeAt[1] = claimTime.Add(time.Second)
+	m.latestStatus[1] = forge.CommitStatus{
+		ID:          200,
+		Status:      "pending",
+		Description: landingClaimDescription,
+		Context:     "merge-queue",
+		CreatedAt:   claimTime,
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want cancellation after claim respected", got)
 	}
 }
 
@@ -618,6 +830,9 @@ func TestTerminalCommentsUseRunTargetURLWhenAvailable(t *testing.T) {
 
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "https://forge.example.com/o/r/actions/runs/7") {
 		t.Fatalf("terminal comment did not use run target URL:\n%s", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, outcomeCommentMarker) {
+		t.Fatalf("terminal comment missing outcome marker:\n%s", got)
 	}
 }
 
@@ -823,14 +1038,17 @@ func TestLandHandlesHeadChangeBetweenRevalidationAndMerge(t *testing.T) {
 	if got := fmt.Sprint(m.mergeHeads[1]); got != "[head-1]" {
 		t.Errorf("merge head SHA = %s, want [head-1]", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error head-1-new:error]" {
-		t.Errorf("statuses = %s, want success/error on tested head and error on current head", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:pending head-1:success head-1:error head-1-new:error]" {
+		t.Errorf("statuses = %s, want claim/success/error on tested head and error on current head", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Errorf("merged = %s, want []", got)
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "head changed from head-1 to head-1-new") {
 		t.Errorf("comments = %s, want changed-head skip comment", got)
+	}
+	if got := fmt.Sprint(m.scheduled); got != "[1]" {
+		t.Errorf("rescheduled = %s, want [1]", got)
 	}
 }
 

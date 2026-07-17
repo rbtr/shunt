@@ -127,8 +127,12 @@ func (b *burnInForge) GetPR(_ context.Context, _, _ string, index int) (forge.Pu
 	return *b.prs[index], nil
 }
 
-func (b *burnInForge) AutomergeScheduled(_ context.Context, _, _ string, index int) (bool, error) {
-	return b.automerge[index], nil
+func (b *burnInForge) AutomergeState(_ context.Context, _, _ string, index int) (forge.AutomergeState, error) {
+	return forge.AutomergeState{Scheduled: b.automerge[index]}, nil
+}
+
+func (b *burnInForge) LatestCommitStatus(_ context.Context, _, _, _, _ string) (forge.CommitStatus, bool, error) {
+	return forge.CommitStatus{}, false, nil
 }
 
 func (b *burnInForge) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
@@ -165,17 +169,27 @@ func (b *burnInForge) MergePR(_ context.Context, _, _ string, index int, _, head
 	return nil
 }
 
-func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int) error {
-	b.automerge[index] = false
-	b.bounced[index] = true
+func (b *burnInForge) ScheduleAutomerge(_ context.Context, _, _ string, index int, _, _ string) error {
+	b.automerge[index] = true
 	return nil
+}
+
+func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int) (bool, error) {
+	if !b.automerge[index] {
+		return false, nil
+	}
+	b.automerge[index] = false
+	return true, nil
 }
 
 func (b *burnInForge) Comment(_ context.Context, _, _ string, _ int, _ string) error {
 	return nil
 }
 
-func (b *burnInForge) UpsertComment(_ context.Context, _, _ string, _ int, _, _, _ string) error {
+func (b *burnInForge) UpsertComment(_ context.Context, _, _ string, index int, marker, _, body string) error {
+	if marker == outcomeCommentMarker && strings.Contains(body, "Bounced from merge queue") {
+		b.bounced[index] = true
+	}
 	return nil
 }
 

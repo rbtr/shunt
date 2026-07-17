@@ -53,15 +53,22 @@ type activeBatch struct {
 type ForgeAPI interface {
 	ListOpenPRs(ctx context.Context, owner, repo, base string) ([]forge.PullRequest, error)
 	GetPR(ctx context.Context, owner, repo string, index int) (forge.PullRequest, error)
-	AutomergeScheduled(ctx context.Context, owner, repo string, index int) (bool, error)
+	AutomergeState(ctx context.Context, owner, repo string, index int) (forge.AutomergeState, error)
+	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (forge.CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	SetCommitStatus(ctx context.Context, owner, repo, sha, context, state, desc, targetURL string) error
 	MergePR(ctx context.Context, owner, repo string, index int, style, headSHA string) error
-	CancelAutomerge(ctx context.Context, owner, repo string, index int) error
-	Comment(ctx context.Context, owner, repo string, index int, body string) error
+	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error
+	CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error)
 	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
 }
+
+const (
+	landingClaimDescription   = "merge queue: preparing passed batch to land"
+	landingSuccessDescription = "merge queue: batch passed"
+	queueRestoreDescription   = "merge queue: restoring interrupted landing"
+)
 
 // Stager builds an integration ("staging") branch from a base + PR head refs.
 type Stager interface {
@@ -150,7 +157,7 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	}
 	var nums []int
 	for _, p := range prs {
-		ok, err := e.fc.AutomergeScheduled(ctx, e.cfg.Owner, e.cfg.Repo, p.Number)
+		ok, err := e.queued(ctx, p)
 		if err != nil {
 			return nil, err
 		}
@@ -178,7 +185,7 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 			e.observeQueueExit(n, "dropped")
 			continue
 		}
-		ok, err := e.fc.AutomergeScheduled(ctx, e.cfg.Owner, e.cfg.Repo, n)
+		ok, err := e.queued(ctx, pr)
 		if err != nil {
 			return nil, err
 		}
@@ -189,6 +196,48 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 		}
 	}
 	return out, nil
+}
+
+func (e *Engine) queued(ctx context.Context, pr forge.PullRequest) (bool, error) {
+	queued, _, err := e.queueEligibility(ctx, pr)
+	return queued, err
+}
+
+func (e *Engine) queueEligibility(ctx context.Context, pr forge.PullRequest) (queued, liveSchedule bool, err error) {
+	state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number)
+	if err != nil {
+		return false, false, err
+	}
+	if e.cfg.StatusCtx == "" || pr.Head.Sha == "" {
+		return state.Scheduled, state.Scheduled, nil
+	}
+	status, ok, err := e.fc.LatestCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx)
+	if err != nil {
+		return false, false, err
+	}
+	if state.Scheduled {
+		if ok &&
+			(status.Status == "error" || status.Status == "failure") &&
+			!status.CreatedAt.IsZero() &&
+			!state.UpdatedAt.IsZero() &&
+			status.CreatedAt.After(state.UpdatedAt) {
+			return false, false, nil
+		}
+		return true, true, nil
+	}
+	if !ok {
+		return false, false, nil
+	}
+	recovering := (status.Status == "pending" &&
+		(status.Description == landingClaimDescription || status.Description == queueRestoreDescription)) ||
+		(status.Status == "success" && status.Description == landingSuccessDescription)
+	if recovering &&
+		!status.CreatedAt.IsZero() &&
+		!state.UpdatedAt.IsZero() &&
+		status.CreatedAt.Before(state.UpdatedAt) {
+		return false, false, nil
+	}
+	return recovering, false, nil
 }
 
 func (e *Engine) startNext(ctx context.Context) (bool, error) {
@@ -358,80 +407,191 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (bool, error) {
 	requeueFrom := -1
 	merged := 0
 	for i, pr := range a.prs {
-		ok, reason, current, err := e.readyToLand(ctx, pr)
+		landed, requeue, err := e.landOne(ctx, a, pr, i < len(a.prs)-1)
 		if err != nil {
 			return false, err
 		}
-		if !ok {
-			e.skipLand(ctx, pr, current, reason, i < len(a.prs)-1, a.debugURL)
+		if requeue {
 			requeueFrom = i
 			break
 		}
-		if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "success", "merge queue: batch passed", e.commitURL(a.stagingSHA)); err != nil {
-			return false, err
+		if landed {
+			e.cfg.Metrics.IncPRMerge(e.metricLabels())
+			e.observeQueueExit(pr.Number, "merged")
+			merged++
 		}
-		// Forgejo can return a transient 405 ("Please try again later") while it
-		// is still finishing the previous merge; retry briefly before giving up
-		// and re-queuing the remainder.
-		var mErr error
-		drifted := false
-		for attempt := 0; attempt < 5; attempt++ {
-			if mErr = e.fc.MergePR(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha); mErr == nil {
-				break
-			}
-			ok, reason, current, err := e.readyToLand(ctx, pr)
-			if err != nil {
-				return false, fmt.Errorf("merge #%d failed: %v; also failed to revalidate after merge error: %w", pr.Number, mErr, err)
-			}
-			if !ok {
-				if current.Merged {
-					mErr = nil
-					break
-				}
-				if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", a.debugURL); err != nil {
-					return false, fmt.Errorf("merge #%d failed after PR changed: %v; also failed to reset status: %w", pr.Number, mErr, err)
-				}
-				e.skipLand(ctx, pr, current, reason, i < len(a.prs)-1, a.debugURL)
-				drifted = true
-				requeueFrom = i
-				break
-			}
-			timer := time.NewTimer(2 * time.Second)
-			select {
-			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				return false, ctx.Err()
-			case <-timer.C:
-			}
-		}
-		if drifted {
-			break
-		}
-		if mErr != nil {
-			if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: merge did not complete; re-queued", a.debugURL); err != nil {
-				return false, fmt.Errorf("merge #%d failed: %v; also failed to reset status: %w", pr.Number, mErr, err)
-			}
-			e.notifyPR(ctx, pr.Number, pr.Head.Sha, "error", "Merge did not complete", "shunt re-queued this PR after the forge merge API did not complete.", a.debugURL, true)
-			e.logger.Error("merge failed", "pr", pr.Number, "error", mErr)
-			requeueFrom = i
-			break
-		}
-		e.cfg.Metrics.IncPRMerge(e.metricLabels())
-		e.observeQueueExit(pr.Number, "merged")
-		e.notifyPR(ctx, pr.Number, pr.Head.Sha, "", "Landed via merge queue", "shunt tested this PR in a staging batch and merged it after the gate passed.", a.debugURL, true)
-		e.logger.Info("PR merged", "pr", pr.Number)
-		merged++
 	}
 	if requeueFrom >= 0 {
 		e.requeueActiveRemainder(a.prs[requeueFrom:])
 	}
 	e.removeActive(a)
 	return merged > 0, nil
+}
+
+func (e *Engine) landOne(ctx context.Context, a *activeBatch, staged forge.PullRequest, hasRemainder bool) (landed, requeue bool, err error) {
+	ok, liveSchedule, reason, current, err := e.readyToLand(ctx, staged)
+	if err != nil {
+		return false, false, err
+	}
+	if !ok {
+		e.skipLand(ctx, staged, current, reason, hasRemainder, a.debugURL)
+		return false, true, nil
+	}
+	if err := e.fc.SetCommitStatus(
+		ctx,
+		e.cfg.Owner,
+		e.cfg.Repo,
+		staged.Head.Sha,
+		e.cfg.StatusCtx,
+		"pending",
+		landingClaimDescription,
+		e.commitURL(a.stagingSHA),
+	); err != nil {
+		return false, false, err
+	}
+
+	claimed := true
+	restored := false
+	defer func() {
+		if !claimed || landed || restored {
+			return
+		}
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if restoreErr := e.restoreAutomerge(restoreCtx, staged); restoreErr != nil {
+			e.logger.Error("restore auto-merge after interrupted landing failed", "pr", staged.Number, "error", restoreErr)
+			if err == nil {
+				err = fmt.Errorf("restore auto-merge for PR #%d: %w", staged.Number, restoreErr)
+			}
+		}
+	}()
+
+	if liveSchedule {
+		cancelled, err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+		if err != nil {
+			return false, false, fmt.Errorf("cancel auto-merge before landing PR #%d: %w", staged.Number, err)
+		}
+		if !cancelled {
+			state, stateErr := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+			if stateErr != nil {
+				return false, false, fmt.Errorf("recheck auto-merge before landing PR #%d: %w", staged.Number, stateErr)
+			}
+			if !state.Scheduled {
+				claimed = false
+				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", hasRemainder, a.debugURL)
+				return false, true, nil
+			}
+		}
+		if err := e.fc.SetCommitStatus(
+			ctx,
+			e.cfg.Owner,
+			e.cfg.Repo,
+			staged.Head.Sha,
+			e.cfg.StatusCtx,
+			"pending",
+			landingClaimDescription,
+			e.commitURL(a.stagingSHA),
+		); err != nil {
+			return false, false, err
+		}
+	}
+	if err := e.fc.SetCommitStatus(
+		ctx,
+		e.cfg.Owner,
+		e.cfg.Repo,
+		staged.Head.Sha,
+		e.cfg.StatusCtx,
+		"success",
+		landingSuccessDescription,
+		e.commitURL(a.stagingSHA),
+	); err != nil {
+		return false, false, err
+	}
+
+	var mergeErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		mergeErr = e.fc.MergePR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number, e.cfg.MergeStyle, staged.Head.Sha)
+		_, reason, current, err = e.validateStagedPR(ctx, staged)
+		if err != nil {
+			if mergeErr != nil {
+				return false, false, fmt.Errorf("merge PR #%d: %v; verify result: %w", staged.Number, mergeErr, err)
+			}
+			return false, false, fmt.Errorf("verify merged PR #%d: %w", staged.Number, err)
+		}
+		if current.Merged {
+			claimed = false
+			landed = true
+			e.notifyPR(ctx, staged.Number, staged.Head.Sha, "", "Landed via merge queue", "shunt tested this PR in a staging batch and merged it after the gate passed.", a.debugURL, true)
+			e.logger.Info("PR merged", "pr", staged.Number)
+			return true, false, nil
+		}
+		if reason != "" {
+			if current.Head.Sha != staged.Head.Sha {
+				if statusErr := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, staged.Head.Sha, e.cfg.StatusCtx, "error", "merge queue: PR changed before merge; re-queued", a.debugURL); statusErr != nil {
+					return false, false, fmt.Errorf("merge PR #%d after head changed: %v; reset tested status: %w", staged.Number, mergeErr, statusErr)
+				}
+			}
+			e.skipLand(ctx, staged, current, reason, hasRemainder, a.debugURL)
+			if current.State == "open" && !current.Merged {
+				if scheduleErr := e.scheduleAutomerge(ctx, current); scheduleErr != nil {
+					return false, false, fmt.Errorf("restore auto-merge for changed PR #%d: %w", staged.Number, scheduleErr)
+				}
+			}
+			restored = true
+			return false, true, nil
+		}
+		if mergeErr == nil {
+			mergeErr = fmt.Errorf("forge merge API returned success but PR remained open")
+		}
+		if attempt == 4 {
+			break
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return false, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	e.notifyPR(ctx, staged.Number, staged.Head.Sha, "error", "Merge did not complete", "shunt re-queued this PR after the forge merge API did not complete.", a.debugURL, true)
+	if err := e.scheduleAutomerge(ctx, current); err != nil {
+		return false, false, fmt.Errorf("merge PR #%d: %v; restore auto-merge: %w", staged.Number, mergeErr, err)
+	}
+	restored = true
+	e.logger.Error("merge failed", "pr", staged.Number, "error", mergeErr)
+	return false, true, nil
+}
+
+func (e *Engine) scheduleAutomerge(ctx context.Context, pr forge.PullRequest) error {
+	if pr.State != "open" || pr.Merged {
+		return nil
+	}
+	return e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
+}
+
+func (e *Engine) restoreAutomerge(ctx context.Context, staged forge.PullRequest) error {
+	current, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+	if err != nil {
+		return err
+	}
+	if current.State != "open" || current.Merged {
+		return nil
+	}
+	sha := current.Head.Sha
+	if sha == "" {
+		sha = staged.Head.Sha
+	}
+	if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, sha, e.cfg.StatusCtx, "pending", queueRestoreDescription, ""); err != nil {
+		return err
+	}
+	return e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, current.Number, e.cfg.MergeStyle, sha)
 }
 
 func (e *Engine) requeueActiveRemainder(prs []forge.PullRequest) {
@@ -464,7 +624,22 @@ func (e *Engine) handleStagingConflict(ctx context.Context, prs []forge.PullRequ
 	return nil
 }
 
-func (e *Engine) readyToLand(ctx context.Context, staged forge.PullRequest) (bool, string, forge.PullRequest, error) {
+func (e *Engine) readyToLand(ctx context.Context, staged forge.PullRequest) (bool, bool, string, forge.PullRequest, error) {
+	ok, reason, current, err := e.validateStagedPR(ctx, staged)
+	if err != nil || !ok {
+		return ok, false, reason, current, err
+	}
+	ok, liveSchedule, err := e.queueEligibility(ctx, current)
+	if err != nil {
+		return false, false, "", current, err
+	}
+	if !ok {
+		return false, false, "auto-merge is no longer scheduled", current, nil
+	}
+	return true, liveSchedule, "", current, nil
+}
+
+func (e *Engine) validateStagedPR(ctx context.Context, staged forge.PullRequest) (bool, string, forge.PullRequest, error) {
 	current, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
 	if err != nil {
 		return false, "", current, err
@@ -474,13 +649,6 @@ func (e *Engine) readyToLand(ctx context.Context, staged forge.PullRequest) (boo
 	}
 	if current.State != "open" {
 		return false, fmt.Sprintf("state changed to %q", current.State), current, nil
-	}
-	ok, err := e.fc.AutomergeScheduled(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
-	if err != nil {
-		return false, "", current, err
-	}
-	if !ok {
-		return false, "auto-merge is no longer scheduled", current, nil
 	}
 	if current.Head.Sha != staged.Head.Sha {
 		return false, fmt.Sprintf("head changed from %s to %s", short(staged.Head.Sha), short(current.Head.Sha)), current, nil
@@ -537,7 +705,7 @@ func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, s
 	}
 	e.cfg.Metrics.IncBounce(e.metricLabels())
 	e.observeQueueExit(num, "bounced")
-	if err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, num); err != nil {
+	if _, err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, num); err != nil {
 		e.logger.Warn("cancel auto-merge failed", "pr", num, "error", err)
 	}
 	e.logger.Info("PR bounced", "pr", num, "reason", reason)
@@ -657,6 +825,7 @@ func (e *Engine) observeQueue() {
 }
 
 const queueCommentMarker = "<!-- shunt:queue-status -->"
+const outcomeCommentMarker = "<!-- shunt:outcome -->"
 
 type queueCommentStatus struct {
 	number        int
@@ -834,14 +1003,15 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 		}
 	}
 	if durableComment {
-		if err := e.fc.Comment(ctx, e.cfg.Owner, e.cfg.Repo, num, body); err != nil {
-			e.logger.Warn("create durable PR comment failed", "pr", num, "error", err)
+		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, outcomeCommentMarker, e.cfg.BotUser, body); err != nil {
+			e.logger.Warn("update durable PR comment failed", "pr", num, "error", err)
 		}
 	}
 }
 
 func terminalCommentBody(title, detail, debugURL string) string {
 	var b strings.Builder
+	fmt.Fprintln(&b, outcomeCommentMarker)
 	fmt.Fprintf(&b, "**%s**\n", title)
 	if detail != "" {
 		fmt.Fprintf(&b, "\n%s\n", detail)

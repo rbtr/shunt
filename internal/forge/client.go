@@ -56,8 +56,23 @@ type IssueComment struct {
 	} `json:"user"`
 }
 
+type AutomergeState struct {
+	Scheduled bool
+	UpdatedAt time.Time
+}
+
+type CommitStatus struct {
+	ID          int64     `json:"id"`
+	Status      string    `json:"status"`
+	Description string    `json:"description"`
+	Context     string    `json:"context"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type timelineComment struct {
-	Type string `json:"type"`
+	ID        int64     `json:"id"`
+	Type      string    `json:"type"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type workflowTask struct {
@@ -90,6 +105,7 @@ type runsResponse struct {
 
 const taskPageLimit = 100
 const runPageLimit = 50
+const issuePageLimit = 50
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader
@@ -194,22 +210,69 @@ func (c *Client) ReadFile(ctx context.Context, owner, repo, ref, path string) ([
 	return c.doRaw(ctx, http.MethodGet, u, nil)
 }
 
-// AutomergeScheduled scans the PR timeline newest-first for the canonical
-// auto-merge signals (Forgejo does not expose this on the PR object).
-func (c *Client) AutomergeScheduled(ctx context.Context, owner, repo string, index int) (bool, error) {
-	var tl []timelineComment
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/timeline", repoPath(owner, repo), index), nil, &tl); err != nil {
-		return false, err
-	}
-	for i := len(tl) - 1; i >= 0; i-- {
-		switch tl[i].Type {
-		case "pull_scheduled_merge":
-			return true, nil
-		case "pull_cancel_scheduled_merge":
-			return false, nil
+// AutomergeState returns the latest scheduled-auto-merge transition recorded in
+// the PR timeline. Forgejo does not expose the live state on the PR object.
+func (c *Client) AutomergeState(ctx context.Context, owner, repo string, index int) (AutomergeState, error) {
+	var latest timelineComment
+	for page := 1; ; page++ {
+		var comments []timelineComment
+		path := fmt.Sprintf("/repos/%s/issues/%d/timeline?limit=%d&page=%d", repoPath(owner, repo), index, issuePageLimit, page)
+		if err := c.do(ctx, http.MethodGet, path, nil, &comments); err != nil {
+			return AutomergeState{}, err
+		}
+		for _, comment := range comments {
+			if comment.Type != "pull_scheduled_merge" && comment.Type != "pull_cancel_scheduled_merge" {
+				continue
+			}
+			if later(comment.ID, comment.CreatedAt, latest.ID, latest.CreatedAt) {
+				latest = comment
+			}
+		}
+		if len(comments) < issuePageLimit {
+			break
 		}
 	}
-	return false, nil
+	return AutomergeState{
+		Scheduled: latest.Type == "pull_scheduled_merge",
+		UpdatedAt: latest.CreatedAt,
+	}, nil
+}
+
+func (c *Client) AutomergeScheduled(ctx context.Context, owner, repo string, index int) (bool, error) {
+	state, err := c.AutomergeState(ctx, owner, repo, index)
+	return state.Scheduled, err
+}
+
+func (c *Client) LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (CommitStatus, bool, error) {
+	for page := 1; ; page++ {
+		var statuses []CommitStatus
+		path := fmt.Sprintf(
+			"/repos/%s/commits/%s/statuses?limit=%d&page=%d",
+			repoPath(owner, repo),
+			url.PathEscape(sha),
+			issuePageLimit,
+			page,
+		)
+		if err := c.do(ctx, http.MethodGet, path, nil, &statuses); err != nil {
+			return CommitStatus{}, false, err
+		}
+		var latest CommitStatus
+		for _, status := range statuses {
+			if status.Context != statusContext {
+				continue
+			}
+			if latest.ID == 0 || later(status.ID, status.CreatedAt, latest.ID, latest.CreatedAt) {
+				latest = status
+			}
+		}
+		if latest.ID != 0 {
+			return latest, true, nil
+		}
+		if len(statuses) < issuePageLimit {
+			break
+		}
+	}
+	return CommitStatus{}, false, nil
 }
 
 // RunStatus returns the aggregate gate workflow status for (sha, branch), or ""
@@ -384,13 +447,27 @@ func (c *Client) MergePR(ctx context.Context, owner, repo string, index int, sty
 	}, nil)
 }
 
-// CancelAutomerge removes a scheduled auto-merge; a 404 (none scheduled) is ok.
-func (c *Client) CancelAutomerge(ctx context.Context, owner, repo string, index int) error {
-	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), nil, nil)
-	if err != nil && strings.Contains(err.Error(), "http 404") {
+func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error {
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
+		"Do":                        style,
+		"head_commit_id":            headSHA,
+		"merge_when_checks_succeed": true,
+	}, nil)
+	if err != nil &&
+		strings.Contains(err.Error(), "http 409") &&
+		strings.Contains(strings.ToLower(err.Error()), "already scheduled") {
 		return nil
 	}
 	return err
+}
+
+// CancelAutomerge reports whether a live scheduled merge was removed.
+func (c *Client) CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error) {
+	_, err := c.doRaw(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), nil)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (c *Client) Comment(ctx context.Context, owner, repo string, index int, body string) error {
@@ -398,10 +475,11 @@ func (c *Client) Comment(ctx context.Context, owner, repo string, index int, bod
 }
 
 func (c *Client) UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error {
-	var comments []IssueComment
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?limit=50", repoPath(owner, repo), index), nil, &comments); err != nil {
+	comments, err := c.listIssueComments(ctx, owner, repo, index)
+	if err != nil {
 		return err
 	}
+	var existing IssueComment
 	for _, comment := range comments {
 		if !strings.Contains(comment.Body, marker) {
 			continue
@@ -409,12 +487,32 @@ func (c *Client) UpsertComment(ctx context.Context, owner, repo string, index in
 		if botUser != "" && !commentByUser(comment, botUser) {
 			continue
 		}
-		if comment.Body == body {
-			return nil
+		if comment.ID > existing.ID {
+			existing = comment
 		}
-		return c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), comment.ID), map[string]string{"body": body}, nil)
 	}
-	return c.Comment(ctx, owner, repo, index, body)
+	if existing.ID == 0 {
+		return c.Comment(ctx, owner, repo, index, body)
+	}
+	if existing.Body == body {
+		return nil
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", repoPath(owner, repo), existing.ID), map[string]string{"body": body}, nil)
+}
+
+func (c *Client) listIssueComments(ctx context.Context, owner, repo string, index int) ([]IssueComment, error) {
+	var out []IssueComment
+	for page := 1; ; page++ {
+		var comments []IssueComment
+		path := fmt.Sprintf("/repos/%s/issues/%d/comments?limit=%d&page=%d", repoPath(owner, repo), index, issuePageLimit, page)
+		if err := c.do(ctx, http.MethodGet, path, nil, &comments); err != nil {
+			return nil, err
+		}
+		out = append(out, comments...)
+		if len(comments) < issuePageLimit {
+			return out, nil
+		}
+	}
 }
 
 func repoPath(owner, repo string) string {
@@ -423,4 +521,8 @@ func repoPath(owner, repo string) string {
 
 func commentByUser(comment IssueComment, botUser string) bool {
 	return comment.User.UserName == botUser || comment.User.Login == botUser || comment.User.LoginName == botUser
+}
+
+func later(id int64, createdAt time.Time, otherID int64, otherCreatedAt time.Time) bool {
+	return createdAt.After(otherCreatedAt) || (createdAt.Equal(otherCreatedAt) && id > otherID)
 }

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Prevented Forgejo's native scheduled-merge worker from racing shunt's explicit
+  merge after a batch passes.
+- Stopped orphaned schedule events and repeated reconciles from creating
+  duplicate terminal comments.
+
 ## [0.5.0] - 2026-07-11
 
 ### Added

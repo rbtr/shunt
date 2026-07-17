@@ -31,18 +31,23 @@ These are the facts shunt is built on. Several differ from how GitHub behaves.
 1. **Auto-merge is detected from the PR timeline, not the PR object.** The PR
    API object does not expose a pending "merge when checks succeed". Instead the
    issue timeline (`GET /repos/{o}/{r}/issues/{n}/timeline`) contains
-   `pull_scheduled_merge` / `pull_cancel_scheduled_merge` events. Scanning
-   newest-first, the first of those wins.
+   `pull_scheduled_merge` / `pull_cancel_scheduled_merge` events. shunt scans all
+   pages and uses the latest transition. A newer terminal `merge-queue` status
+   invalidates an orphaned schedule event left behind by a failed native merge.
 
 2. **A fast-forward does NOT auto-mark PRs merged.** Pushing the base branch to
    a tested staging commit (the classic bors trick) leaves the PRs *open* even
    though their heads are ancestors of the base. So shunt does not fast-forward.
    Instead it lands each PR through the forge's own merge:
-   - set the required `merge-queue` commit status to `success` on the PR head
-     (`POST /repos/{o}/{r}/statuses/{sha}`), then
-   - `POST /repos/{o}/{r}/pulls/{n}/merge`.
+   - mark the PR as being claimed for landing;
+   - cancel Forgejo's native scheduled merge;
+   - set the required `merge-queue` status to `success`;
+   - `POST /repos/{o}/{r}/pulls/{n}/merge`; and
+   - re-fetch the PR and require it to be recorded as merged.
    The forge performs the configured merge method (`merge`, `squash`, or
-   `rebase`) and records the PR as properly merged.
+   `rebase`) and records the PR as properly merged. If the explicit merge does
+   not complete, shunt restores the scheduled merge while keeping its status
+   non-successful so the native worker cannot bypass a fresh queue test.
 
 3. **The required status check is the gate.** With branch protection requiring
    the `merge-queue` status and restricting pushes to the bot, a PR merge is
@@ -129,15 +134,19 @@ of `1` preserves serial bisection. Every staging attempt uses a fresh immutable
 branch such as `mq/main/staging-<timestamp>-<sequence>`, so the gate workflow must
 keep matching `mq/**`.
 
-`land` sets the source-head status and merges each PR in order. Terminal queue
-outcomes are also written back to source PRs:
+`land` claims each PR, cancels its native scheduled merge, sets the source-head
+status, and merges in order. Terminal queue outcomes are also written back to
+source PRs:
 
-- landed PRs get a durable comment with the staging commit/run link;
+- landed PRs get a durable outcome comment with the staging commit/run link;
 - bounced PRs get auto-merge cancelled, a source-head `failure` status for gate
-  failures or `error` for staging/infrastructure failures, and a durable
-  rejection comment;
+  failures or `error` for staging/infrastructure failures, and an updated
+  rejection outcome;
 - skipped/requeued PRs get an `error` status plus a comment explaining why they
   were not landed.
+
+Outcome comments use a separate hidden marker and are updated in place. Repeated
+reconciliation therefore changes one comment instead of adding another.
 
 If sticky queue comments are enabled, terminal outcomes update the sticky comment
 too. Intermediate multi-PR batch failures are not broadcast to every source PR;
@@ -236,11 +245,12 @@ bad PR, bounce it, and land the good PRs.
   "block on outdated branch" disabled so the queue, not per-PR freshness checks,
   decides when a tested PR can land.
 - **Crash safety.** By default, state is still in-memory; a restart re-derives
-  the queue from open auto-merge PRs. It may repeat a staging run, but never
-  double-merges and never loses a PR. With `SHUNT_STATE_PATH`, shunt persists the
-  pending frontier, linger state, bisection counters, and active batch metadata
-  in bbolt. Active batches are re-staged after restore so no PR lands from a
-  pre-restart staging result that may have been invalidated by a base change.
+  the queue from open auto-merge PRs and interrupted landing statuses. It may
+  repeat a staging run, but never double-merges and never loses a claimed PR.
+  With `SHUNT_STATE_PATH`, shunt persists the pending frontier, linger state,
+  bisection counters, and active batch metadata in bbolt. Active batches are
+  re-staged after restore so no PR lands from a pre-restart staging result that
+  may have been invalidated by a base change.
 
 ## Observability
 
