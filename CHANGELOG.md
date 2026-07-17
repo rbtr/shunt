@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format is based on
   the merge.
 - Removed the shunt bot from managed base-branch push allow-lists; it now needs
   direct-push access only to `mq/...` staging branches.
+- Kept Git's askpass helper available when inherited credential configuration
+  disables interactive credentials.
 - Stopped orphaned schedule events and repeated reconciles from creating
   duplicate terminal comments.
 

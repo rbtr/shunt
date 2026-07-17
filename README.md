@@ -89,11 +89,13 @@ is discovered and managed automatically. For a single repo, set
 ## Opting a repo in
 
 1. Add the **`merge-queue` topic** to the repo. shunt configures its branch
-   protection on first sight (require the `merge-queue` status, restrict pushes
-   to the bot).
+   protection on first sight (require the `merge-queue` status, restrict direct
+   pushes, and allow the bot to push only staging branches).
 2. Add a gate workflow scoped to the staging branches —
    [`examples/mq-gate.yml`](examples/mq-gate.yml) (`on: push: [mq/**]`). This is
-   where your full suite runs, once per batch.
+   where your full suite runs, once per batch. On Codeberg's hosted Actions
+   runners, set `runs-on` to `codeberg-tiny`, `codeberg-small`, or
+   `codeberg-medium`; otherwise use a matching self-hosted runner.
 3. Enable **"Merge when checks succeed"** on an approved PR.
 
 ## Configuration
