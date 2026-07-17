@@ -11,8 +11,36 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/metrics"
 )
+
+func TestForgeConfigFromEnv(t *testing.T) {
+	for _, name := range []string{
+		"SHUNT_FORGE_RATE_PER_SECOND",
+		"SHUNT_FORGE_RATE_BURST",
+		"SHUNT_FORGE_RETRY_INITIAL",
+		"SHUNT_FORGE_RETRY_MAX",
+		"SHUNT_FORGE_RETRY_ATTEMPTS",
+		"SHUNT_FORGE_OUTAGE_INITIAL",
+		"SHUNT_FORGE_OUTAGE_MAX",
+	} {
+		t.Setenv(name, "")
+	}
+
+	cfg, err := forgeConfigFromEnv()
+	if err != nil {
+		t.Fatalf("forgeConfigFromEnv defaults: %v", err)
+	}
+	if cfg != forge.DefaultConfig() {
+		t.Fatalf("default config = %#v, want %#v", cfg, forge.DefaultConfig())
+	}
+
+	t.Setenv("SHUNT_FORGE_OUTAGE_MAX", "10s")
+	if _, err := forgeConfigFromEnv(); err == nil {
+		t.Fatal("forgeConfigFromEnv accepted an outage maximum below its initial duration")
+	}
+}
 
 func TestHTTPMuxServesHealthMetricsAndStatus(t *testing.T) {
 	c := metrics.New()

@@ -4,31 +4,122 @@
 package forge
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
-var ErrNotFound = errors.New("forge: not found")
+var (
+	ErrNotFound    = errors.New("forge: not found")
+	ErrUnavailable = errors.New("forge: unavailable")
+	ErrRateLimited = errors.New("forge: rate limited")
+)
+
+// UnavailableError reports that the client is temporarily quieting requests
+// after an outage or rate-limit response.
+type UnavailableError struct {
+	Cause   error
+	RetryAt time.Time
+}
+
+func (e *UnavailableError) Error() string {
+	if e.RetryAt.IsZero() {
+		return ErrUnavailable.Error()
+	}
+	return fmt.Sprintf("%s until %s", ErrUnavailable, e.RetryAt.Format(time.RFC3339Nano))
+}
+
+func (e *UnavailableError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{ErrUnavailable}
+	}
+	return []error{ErrUnavailable, e.Cause}
+}
+
+// Config controls process-wide request limiting and per-client resilience.
+type Config struct {
+	RatePerSecond float64
+	RateBurst     int
+	RetryInitial  time.Duration
+	RetryMax      time.Duration
+	RetryAttempts int
+	OutageInitial time.Duration
+	OutageMax     time.Duration
+}
+
+// DefaultConfig returns the forge client runtime defaults.
+func DefaultConfig() Config {
+	return Config{
+		RatePerSecond: 2,
+		RateBurst:     4,
+		RetryInitial:  250 * time.Millisecond,
+		RetryMax:      2 * time.Second,
+		RetryAttempts: 3,
+		OutageInitial: 15 * time.Second,
+		OutageMax:     5 * time.Minute,
+	}
+}
+
+// Validate reports whether c has usable resilience settings.
+func (c Config) Validate() error {
+	if c.RatePerSecond <= 0 || math.IsNaN(c.RatePerSecond) || math.IsInf(c.RatePerSecond, 0) {
+		return errors.New("forge rate per second must be positive")
+	}
+	if c.RateBurst < 1 {
+		return errors.New("forge rate burst must be at least one")
+	}
+	if c.RetryInitial <= 0 || c.RetryMax <= 0 || c.RetryInitial > c.RetryMax {
+		return errors.New("forge retry durations must be positive and ordered")
+	}
+	if c.RetryAttempts < 0 {
+		return errors.New("forge retry attempts must not be negative")
+	}
+	if c.OutageInitial <= 0 || c.OutageMax <= 0 || c.OutageInitial > c.OutageMax {
+		return errors.New("forge outage durations must be positive and ordered")
+	}
+	return nil
+}
 
 type Client struct {
-	apiBase string
-	token   string
-	http    *http.Client
+	apiBase      string
+	instanceBase string
+	token        string
+	http         *http.Client
+	cfg          Config
+	limiter      *tokenBucket
+	outage       outageCircuit
 }
 
 func New(instanceURL, token string) *Client {
+	return newClient(instanceURL, token, DefaultConfig())
+}
+
+// NewWithConfig creates a client with cfg.
+func NewWithConfig(instanceURL, token string, cfg Config) (*Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return newClient(instanceURL, token, cfg), nil
+}
+
+func newClient(instanceURL, token string, cfg Config) *Client {
+	instanceBase := strings.TrimRight(instanceURL, "/")
 	return &Client{
-		apiBase: strings.TrimRight(instanceURL, "/") + "/api/v1",
-		token:   token,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		apiBase:      instanceBase + "/api/v1",
+		instanceBase: instanceBase,
+		token:        token,
+		http:         &http.Client{Timeout: 30 * time.Second},
+		cfg:          cfg,
+		limiter:      sharedLimiter(cfg),
+		outage: outageCircuit{
+			backoff: cfg.OutageInitial,
+		},
 	}
 }
 
@@ -108,33 +199,9 @@ const runPageLimit = 50
 const issuePageLimit = 50
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		rdr = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, rdr)
+	data, _, err := c.request(ctx, method, path, body)
 	if err != nil {
 		return err
-	}
-	req.Header.Set("Authorization", "token "+c.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: http %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
@@ -143,36 +210,12 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 }
 
 func (c *Client) doRaw(ctx context.Context, method, path string, body any) ([]byte, error) {
-	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		rdr = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "token "+c.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusNotFound {
+	data, status, err := c.request(ctx, method, path, body)
+	if status == http.StatusNotFound {
 		return nil, fmt.Errorf("%w: %s %s", ErrNotFound, method, path)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: http %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, err
 	}
 	return data, nil
 }
