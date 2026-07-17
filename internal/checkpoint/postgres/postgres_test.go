@@ -132,18 +132,86 @@ func TestPostgresApplyMigrationsAndDelete(t *testing.T) {
 	if err := store.DeleteQueue(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}); err != nil {
 		t.Fatalf("DeleteQueue: %v", err)
 	}
-	if len(db.execs) != 2 {
-		t.Fatalf("execs = %d, want 2", len(db.execs))
+	if len(db.execs) != 3 {
+		t.Fatalf("execs = %d, want 3", len(db.execs))
 	}
 	if !strings.Contains(db.execs[0].query, "CREATE TABLE IF NOT EXISTS shunt_queue_state") {
-		t.Fatalf("migration query = %q", db.execs[0].query)
+		t.Fatalf("first migration query = %q", db.execs[0].query)
 	}
-	if !strings.Contains(db.execs[1].query, "DELETE FROM shunt_queue_state") {
-		t.Fatalf("delete query = %q", db.execs[1].query)
+	if !strings.Contains(db.execs[1].query, "CREATE TABLE IF NOT EXISTS shunt_queue_leases") {
+		t.Fatalf("second migration query = %q", db.execs[1].query)
 	}
-	if got := db.execs[1].args; !reflect.DeepEqual(got, []any{"octo", "app", "main"}) {
+	if !strings.Contains(db.execs[2].query, "DELETE FROM shunt_queue_state") {
+		t.Fatalf("delete query = %q", db.execs[2].query)
+	}
+	if got := db.execs[2].args; !reflect.DeepEqual(got, []any{"octo", "app", "main"}) {
 		t.Fatalf("delete args = %#v", got)
 	}
+}
+
+func TestPostgresAcquireLeaseAcquiresAndRenews(t *testing.T) {
+	db := &fakeDB{rows: []fakeRow{leaseRow(), leaseRow()}}
+	store := &Store{db: db}
+	key := checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}
+
+	for _, holderID := range []string{"holder-a", "holder-a"} {
+		acquired, err := store.AcquireLease(context.Background(), key, holderID, 30*time.Second)
+		if err != nil {
+			t.Fatalf("AcquireLease(%q): %v", holderID, err)
+		}
+		if !acquired {
+			t.Fatalf("AcquireLease(%q) acquired = false, want true", holderID)
+		}
+	}
+
+	if len(db.queries) != 2 {
+		t.Fatalf("queries = %d, want 2", len(db.queries))
+	}
+	for _, query := range db.queries {
+		if !strings.Contains(query.query, "INSERT INTO shunt_queue_leases") ||
+			!strings.Contains(query.query, "shunt_queue_leases.holder_id = EXCLUDED.holder_id") {
+			t.Fatalf("query does not acquire or renew a queue lease:\n%s", query.query)
+		}
+		if got := query.args; !reflect.DeepEqual(got, []any{"octo", "app", "main", "holder-a", int64(30_000_000)}) {
+			t.Fatalf("lease args = %#v", got)
+		}
+	}
+}
+
+func TestPostgresAcquireLeaseActiveContentionReturnsFalse(t *testing.T) {
+	db := &fakeDB{rows: []fakeRow{{err: sql.ErrNoRows}}}
+	store := &Store{db: db}
+
+	acquired, err := store.AcquireLease(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}, "holder-b", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	if acquired {
+		t.Fatal("AcquireLease acquired = true, want false for active foreign holder")
+	}
+}
+
+func TestPostgresAcquireLeaseExpiredHolderCanBeTakenOver(t *testing.T) {
+	db := &fakeDB{rows: []fakeRow{leaseRow()}}
+	store := &Store{db: db}
+
+	acquired, err := store.AcquireLease(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}, "holder-b", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	if !acquired {
+		t.Fatal("AcquireLease acquired = false, want true after foreign lease expiry")
+	}
+	if len(db.queries) != 1 || !strings.Contains(db.queries[0].query, "shunt_queue_leases.expires_at <= now()") {
+		t.Fatalf("query does not permit expired lease takeover: %#v", db.queries)
+	}
+}
+
+func leaseRow() fakeRow {
+	return fakeRow{scan: func(dest ...any) error {
+		*dest[0].(*time.Time) = time.Date(2026, 6, 22, 21, 30, 0, 0, time.UTC)
+		return nil
+	}}
 }
 
 func TestSnapshotValidation(t *testing.T) {
