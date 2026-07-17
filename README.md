@@ -123,6 +123,13 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, `/status`, and `/webhook` endpoints |
 | `SHUNT_WEBHOOK_URL` | — | Public URL Forgejo/Gitea should call, usually `https://shunt.example.com/webhook`. When set, shunt creates/updates a repository webhook for each managed repo. |
 | `SHUNT_WEBHOOK_SECRET` | — | Optional shared secret for Forgejo/Gitea HMAC-SHA256 webhook signature validation |
+| `SHUNT_FORGE_RATE_PER_SECOND` | `2` | Process-wide Forge API request rate |
+| `SHUNT_FORGE_RATE_BURST` | `4` | Process-wide Forge API request burst |
+| `SHUNT_FORGE_RETRY_INITIAL` | `250ms` | Initial backoff for safe Forge API reads |
+| `SHUNT_FORGE_RETRY_MAX` | `2s` | Maximum backoff for safe Forge API reads |
+| `SHUNT_FORGE_RETRY_ATTEMPTS` | `3` | Retries after the initial attempt for safe Forge API reads |
+| `SHUNT_FORGE_OUTAGE_INITIAL` | `15s` | Initial quiet period after an unavailable Forge API |
+| `SHUNT_FORGE_OUTAGE_MAX` | `5m` | Maximum Forge API outage quiet period |
 
 If `SHUNT_WEBHOOK_URL` is set, shunt uses the same admin token it already needs
 for branch protection to create or update a repository webhook for each managed
@@ -132,6 +139,15 @@ Without that setting, configure a repository or
 organization webhook yourself. shunt wakes immediately for auto-merge,
 pull-request, review, status, and push events, but still polls on
 `SHUNT_POLL_INTERVAL` so missed webhooks only add latency.
+
+The Forge client shares its rate limit across the process. It retries only
+`GET` and `HEAD` requests after transport failures or 5xx responses; writes are
+never retried automatically. After retries are exhausted, the client quiets
+normal requests until its outage backoff expires, then sends one health probe to
+`/api/healthz` (falling back to authenticated `/api/v1/version` only when the
+health endpoint returns 404). A 429 response starts a separate cooldown, which
+a successful health probe does not clear; its `Retry-After` value is honored
+when present.
 
 shunt also creates bot-only protection for its staging ref pattern
 `mq/<base>/staging*`. Staging refs are immutable per attempt and retained for

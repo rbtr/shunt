@@ -54,6 +54,44 @@ func envBool(k string, def bool) (bool, error) {
 	}
 }
 
+func forgeConfigFromEnv() (forge.Config, error) {
+	cfg := forge.DefaultConfig()
+	var err error
+
+	cfg.RatePerSecond, err = strconv.ParseFloat(env("SHUNT_FORGE_RATE_PER_SECOND", strconv.FormatFloat(cfg.RatePerSecond, 'f', -1, 64)), 64)
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_RATE_PER_SECOND: %w", err)
+	}
+	cfg.RateBurst, err = strconv.Atoi(env("SHUNT_FORGE_RATE_BURST", strconv.Itoa(cfg.RateBurst)))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_RATE_BURST: %w", err)
+	}
+	cfg.RetryInitial, err = time.ParseDuration(env("SHUNT_FORGE_RETRY_INITIAL", cfg.RetryInitial.String()))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_RETRY_INITIAL: %w", err)
+	}
+	cfg.RetryMax, err = time.ParseDuration(env("SHUNT_FORGE_RETRY_MAX", cfg.RetryMax.String()))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_RETRY_MAX: %w", err)
+	}
+	cfg.RetryAttempts, err = strconv.Atoi(env("SHUNT_FORGE_RETRY_ATTEMPTS", strconv.Itoa(cfg.RetryAttempts)))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_RETRY_ATTEMPTS: %w", err)
+	}
+	cfg.OutageInitial, err = time.ParseDuration(env("SHUNT_FORGE_OUTAGE_INITIAL", cfg.OutageInitial.String()))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_OUTAGE_INITIAL: %w", err)
+	}
+	cfg.OutageMax, err = time.ParseDuration(env("SHUNT_FORGE_OUTAGE_MAX", cfg.OutageMax.String()))
+	if err != nil {
+		return cfg, fmt.Errorf("parse SHUNT_FORGE_OUTAGE_MAX: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	baseLogger := slog.Default()
@@ -100,6 +138,10 @@ func main() {
 	if err != nil || batchLinger < 0 {
 		fatal(logger, "bad SHUNT_BATCH_LINGER")
 	}
+	forgeCfg, err := forgeConfigFromEnv()
+	if err != nil {
+		fatal(logger, "forge client config error", "error", err)
+	}
 
 	metricsCollector := metrics.New()
 	checkpointStore, err := openCheckpointStore(ctx, logger)
@@ -116,7 +158,10 @@ func main() {
 		Logger: baseLogger.With("component", "webhook"),
 	}
 
-	fc := forge.New(instance, token)
+	fc, err := forge.NewWithConfig(instance, token, forgeCfg)
+	if err != nil {
+		fatal(logger, "forge client config error", "error", err)
+	}
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
