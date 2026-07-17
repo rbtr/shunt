@@ -10,6 +10,14 @@ import (
 	"strings"
 )
 
+const askpassScript = `#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$SHUNT_GIT_USER" ;;
+*Password*) cat "$SHUNT_GIT_TOKEN_FILE" ;;
+*) exit 1 ;;
+esac
+`
+
 type Stager struct {
 	remoteURL   string // credential-free HTTPS clone URL
 	gitUser     string
@@ -34,6 +42,12 @@ type MergedRef struct {
 	Ref string // e.g. refs/pull/12/head
 }
 
+type gitAuth struct {
+	askpass   string
+	user      string
+	tokenFile string
+}
+
 // BuildStaging creates stagingBranch from base, merges each ref in order, pushes
 // it, and returns the resulting SHA. The caller must pass a fresh branch name for
 // each attempt. On a merge conflict it returns the offending PR number
@@ -51,28 +65,21 @@ func (s *Stager) BuildStaging(ctx context.Context, base, stagingBranch string, r
 	if err := os.WriteFile(tokenFile, []byte(s.gitToken), 0600); err != nil {
 		return "", 0, err
 	}
-	if err := os.WriteFile(askpass, []byte(`#!/bin/sh
-case "$1" in
-*Username*) printf '%s\n' "$SHUNT_GIT_USER" ;;
-*Password*) cat "$SHUNT_GIT_TOKEN_FILE" ;;
-*) exit 1 ;;
-esac
-`), 0700); err != nil {
+	if err := os.WriteFile(askpass, []byte(askpassScript), 0700); err != nil {
 		return "", 0, err
 	}
 
+	auth := gitAuth{
+		askpass:   askpass,
+		user:      s.gitUser,
+		tokenFile: tokenFile,
+	}
 	run := func(args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = parent
-		if len(args) > 0 && args[0] != "clone" {
-			cmd.Dir = dir
+		workDir := dir
+		if len(args) > 0 && args[0] == "clone" {
+			workDir = parent
 		}
-		cmd.Env = append(filteredEnv(),
-			"GIT_ASKPASS="+askpass,
-			"GIT_TERMINAL_PROMPT=0",
-			"SHUNT_GIT_USER="+s.gitUser,
-			"SHUNT_GIT_TOKEN_FILE="+tokenFile,
-		)
+		cmd := gitCommand(ctx, workDir, auth, args...)
 		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err
 	}
@@ -106,6 +113,23 @@ esac
 		return "", 0, fmt.Errorf("push staging: %v: %s", err, out)
 	}
 	return sha, 0, nil
+}
+
+func gitCommand(ctx context.Context, dir string, auth gitAuth, args ...string) *exec.Cmd {
+	// Keep shunt's askpass helper usable when inherited config disables prompts.
+	gitArgs := make([]string, 0, len(args)+2)
+	gitArgs = append(gitArgs, "-c", "credential.interactive=true")
+	gitArgs = append(gitArgs, args...)
+
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Dir = dir
+	cmd.Env = append(filteredEnv(),
+		"GIT_ASKPASS="+auth.askpass,
+		"GIT_TERMINAL_PROMPT=0",
+		"SHUNT_GIT_USER="+auth.user,
+		"SHUNT_GIT_TOKEN_FILE="+auth.tokenFile,
+	)
+	return cmd
 }
 
 func filteredEnv() []string {
