@@ -1,8 +1,10 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +13,47 @@ import (
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/metrics"
 )
+
+func TestRefreshQuietlySkipsUnavailableForge(t *testing.T) {
+	var logs bytes.Buffer
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/repos/search" {
+			t.Fatalf("unexpected request while forge is unavailable: %s %s", r.Method, r.URL.Path)
+		}
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	resilience := forge.DefaultConfig()
+	resilience.RatePerSecond = 1000
+	resilience.RateBurst = 100
+	resilience.RetryInitial = time.Millisecond
+	resilience.RetryMax = time.Millisecond
+	resilience.RetryAttempts = 0
+	client, err := forge.NewWithConfig(srv.URL, "token", resilience)
+	if err != nil {
+		t.Fatalf("NewWithConfig: %v", err)
+	}
+	m := New(client, Config{
+		Topic: "merge-queue", Metrics: metrics.New(),
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh returned unavailable error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one discovery read", requests)
+	}
+	if len(m.engines) != 0 {
+		t.Fatalf("engines = %#v, want none", m.engines)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("unavailable forge logged unexpectedly: %s", logs.String())
+	}
+}
 
 func TestRefreshAppliesRepoConfigOverrides(t *testing.T) {
 	var rawRef, protectedBranch, protectedContext string

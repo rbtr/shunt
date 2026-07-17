@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/metrics"
@@ -39,6 +40,51 @@ func TestForgeConfigFromEnv(t *testing.T) {
 	t.Setenv("SHUNT_FORGE_OUTAGE_MAX", "10s")
 	if _, err := forgeConfigFromEnv(); err == nil {
 		t.Fatal("forgeConfigFromEnv accepted an outage maximum below its initial duration")
+	}
+}
+
+func TestQueueLeaseTTLFromEnv(t *testing.T) {
+	t.Setenv("SHUNT_QUEUE_LEASE_TTL", "")
+	ttl, err := queueLeaseTTLFromEnv()
+	if err != nil {
+		t.Fatalf("queueLeaseTTLFromEnv default: %v", err)
+	}
+	if ttl != 45*time.Second {
+		t.Fatalf("default lease TTL = %s, want 45s", ttl)
+	}
+
+	t.Setenv("SHUNT_QUEUE_LEASE_TTL", "90s")
+	ttl, err = queueLeaseTTLFromEnv()
+	if err != nil {
+		t.Fatalf("queueLeaseTTLFromEnv configured: %v", err)
+	}
+	if ttl != 90*time.Second {
+		t.Fatalf("configured lease TTL = %s, want 90s", ttl)
+	}
+
+	t.Setenv("SHUNT_QUEUE_LEASE_TTL", "0s")
+	if _, err := queueLeaseTTLFromEnv(); err == nil {
+		t.Fatal("queueLeaseTTLFromEnv accepted zero TTL")
+	}
+}
+
+func TestNewLeaseHolderID(t *testing.T) {
+	first, err := newLeaseHolderID()
+	if err != nil {
+		t.Fatalf("newLeaseHolderID: %v", err)
+	}
+	second, err := newLeaseHolderID()
+	if err != nil {
+		t.Fatalf("newLeaseHolderID: %v", err)
+	}
+	if len(first) != 32 {
+		t.Fatalf("holder ID length = %d, want 32", len(first))
+	}
+	if _, err := hex.DecodeString(first); err != nil {
+		t.Fatalf("holder ID is not hexadecimal: %v", err)
+	}
+	if first == second {
+		t.Fatal("holder IDs must differ")
 	}
 }
 

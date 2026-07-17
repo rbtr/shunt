@@ -34,6 +34,9 @@ type Config struct {
 	BotEmail      string
 	Metrics       *metrics.Collector
 	Checkpoint    engine.CheckpointStore
+	Lease         engine.QueueLease
+	LeaseHolderID string
+	LeaseTTL      time.Duration
 	Logger        *slog.Logger
 	EngineLogger  *slog.Logger
 }
@@ -70,12 +73,19 @@ func keyOf(owner, repo, base string) string { return owner + "/" + repo + "@" + 
 func (m *Manager) Refresh(ctx context.Context) error {
 	repos, err := m.fc.SearchReposByTopic(ctx, m.cfg.Topic)
 	if err != nil {
+		if errors.Is(err, forge.ErrUnavailable) {
+			return nil
+		}
 		return err
 	}
 	seen := make(map[string]bool, len(repos))
 	for _, r := range repos {
 		settings, err := m.repoSettings(ctx, r)
 		if err != nil {
+			if errors.Is(err, forge.ErrUnavailable) {
+				m.keepExistingRepo(seen, r.Owner, r.Name)
+				continue
+			}
 			m.logger.Warn("repo config skipped", "owner", r.Owner, "repo", r.Name, "path", repoconfig.FileName, "error", err)
 			m.keepExistingRepo(seen, r.Owner, r.Name)
 			continue
@@ -88,19 +98,25 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		}
 		queueLogger := m.logger.With("owner", r.Owner, "repo", r.Name, "base", settings.Base)
 		if changed, err := m.fc.EnsureBranchProtection(ctx, r.Owner, r.Name, settings.Base, settings.StatusCtx, m.cfg.BotUser); err != nil {
-			queueLogger.Warn("ensure branch protection failed", "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				queueLogger.Warn("ensure branch protection failed", "error", err)
+			}
 			continue
 		} else if changed {
 			queueLogger.Info("branch protection configured")
 		}
 		if changed, err := m.fc.EnsureStagingBranchProtection(ctx, r.Owner, r.Name, settings.Base, m.cfg.BotUser); err != nil {
-			queueLogger.Warn("ensure staging branch protection failed", "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				queueLogger.Warn("ensure staging branch protection failed", "error", err)
+			}
 			continue
 		} else if changed {
 			queueLogger.Info("staging branch protection configured")
 		}
 		if changed, err := m.fc.EnsureWebhook(ctx, r.Owner, r.Name, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
-			queueLogger.Warn("ensure webhook failed", "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				queueLogger.Warn("ensure webhook failed", "error", err)
+			}
 			continue
 		} else if changed {
 			queueLogger.Info("webhook configured")
@@ -123,7 +139,9 @@ func (m *Manager) Refresh(ctx context.Context) error {
 func (m *Manager) Tick(ctx context.Context) {
 	for k, e := range m.engines {
 		if err := e.engine.Reconcile(ctx); err != nil {
-			m.logger.Error("reconcile failed", "queue", k, "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				m.logger.Error("reconcile failed", "queue", k, "error", err)
+			}
 		}
 	}
 }
@@ -170,6 +188,9 @@ func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) en
 		BotUser:       m.cfg.BotUser,
 		Metrics:       m.cfg.Metrics,
 		Checkpoint:    m.cfg.Checkpoint,
+		Lease:         m.cfg.Lease,
+		LeaseHolderID: m.cfg.LeaseHolderID,
+		LeaseTTL:      m.cfg.LeaseTTL,
 		Logger:        m.engineLogger,
 	}
 }

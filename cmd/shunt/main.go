@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -92,6 +93,25 @@ func forgeConfigFromEnv() (forge.Config, error) {
 	return cfg, nil
 }
 
+func queueLeaseTTLFromEnv() (time.Duration, error) {
+	ttl, err := time.ParseDuration(env("SHUNT_QUEUE_LEASE_TTL", "45s"))
+	if err != nil {
+		return 0, fmt.Errorf("parse SHUNT_QUEUE_LEASE_TTL: %w", err)
+	}
+	if ttl <= 0 {
+		return 0, errors.New("SHUNT_QUEUE_LEASE_TTL must be positive")
+	}
+	return ttl, nil
+}
+
+func newLeaseHolderID() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate queue lease holder ID: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	baseLogger := slog.Default()
@@ -142,6 +162,14 @@ func main() {
 	if err != nil {
 		fatal(logger, "forge client config error", "error", err)
 	}
+	leaseTTL, err := queueLeaseTTLFromEnv()
+	if err != nil {
+		fatal(logger, "config error", "error", err)
+	}
+	leaseHolderID, err := newLeaseHolderID()
+	if err != nil {
+		fatal(logger, "queue lease setup error", "error", err)
+	}
 
 	metricsCollector := metrics.New()
 	checkpointStore, err := openCheckpointStore(ctx, logger)
@@ -150,6 +178,10 @@ func main() {
 	}
 	if checkpointStore != nil {
 		defer checkpointStore.Close()
+	}
+	var queueLease engine.QueueLease
+	if checkpointStore != nil {
+		queueLease, _ = checkpointStore.(engine.QueueLease)
 	}
 	wake := make(chan struct{}, 1)
 	webhook := webhookConfig{
@@ -168,13 +200,13 @@ func main() {
 			Topic: topic, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout, QueueComments: queueComments,
 			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
-			Metrics: metricsCollector, Checkpoint: checkpointStore,
+			Metrics: metricsCollector, Checkpoint: checkpointStore, Lease: queueLease, LeaseHolderID: leaseHolderID, LeaseTTL: leaseTTL,
 			Logger:       baseLogger.With("component", "manager"),
 			EngineLogger: baseLogger.With("component", "engine"),
 		})
 		logger.Info("multi-repo mode", "topic", topic, "interval", interval)
 		if err := runDaemon(ctx, baseLogger, env("SHUNT_LISTEN", ":8080"), metricsCollector, webhook, interval, wake, func(ctx context.Context) {
-			if err := mgr.Refresh(ctx); err != nil {
+			if err := mgr.Refresh(ctx); err != nil && !errors.Is(err, forge.ErrUnavailable) {
 				logger.Error("discovery failed", "error", err)
 			}
 			mgr.Tick(ctx)
@@ -218,11 +250,11 @@ func main() {
 		Owner: owner, Repo: repo, Base: base,
 		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
-		Metrics: metricsCollector, Checkpoint: checkpointStore, Logger: baseLogger.With("component", "engine"),
+		Metrics: metricsCollector, Checkpoint: checkpointStore, Lease: queueLease, LeaseHolderID: leaseHolderID, LeaseTTL: leaseTTL, Logger: baseLogger.With("component", "engine"),
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))
 	queueLogger.Info("single-repo mode", "interval", interval)
 	if err := runDaemon(ctx, baseLogger, env("SHUNT_LISTEN", ":8080"), metricsCollector, webhook, interval, wake, func(ctx context.Context) {
-		if err := eng.Reconcile(ctx); err != nil {
+		if err := eng.Reconcile(ctx); err != nil && !errors.Is(err, forge.ErrUnavailable) {
 			queueLogger.Error("reconcile failed", "error", err)
 		}
 	}); err != nil {

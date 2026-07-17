@@ -81,9 +81,17 @@ State, per `(repo, base)`:
 The engine has a checkpoint boundary around that state: when configured with its
 consumer-side `CheckpointStore`, it loads one queue snapshot before the first
 reconcile tick, saves after each tick that leaves queue work in progress, and
-deletes the snapshot once the queue is idle. The production command wires the
-default bbolt store when `SHUNT_STATE_PATH` is set; otherwise releases keep the
-historical process-local state.
+deletes the snapshot once the queue is idle. The production command can use
+bbolt with `SHUNT_STATE_PATH` or Postgres with `SHUNT_POSTGRES_DSN`; otherwise
+releases keep the historical process-local state.
+
+When Postgres is configured, each `(owner, repo, base)` must first acquire its
+durable queue lease before loading a checkpoint or calling the forge. The lease
+is renewed once per `Reconcile()` call. A replica that cannot acquire it does
+nothing for that queue; one that takes it over drops process-local queue and
+comment caches, then reloads the durable checkpoint. Restored active batches
+are re-staged, as on process restart. bbolt and in-memory state are
+single-process options and do not coordinate replicas.
 
 Each `Reconcile()` tick advances one step. Ticks are driven by relevant
 Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the

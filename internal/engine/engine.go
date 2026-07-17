@@ -8,6 +8,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -36,6 +37,9 @@ type Config struct {
 	BotUser       string
 	Metrics       *metrics.Collector
 	Checkpoint    CheckpointStore
+	Lease         QueueLease
+	LeaseHolderID string
+	LeaseTTL      time.Duration
 	Logger        *slog.Logger
 }
 
@@ -95,9 +99,18 @@ type Engine struct {
 	terminalQueueComments map[int]string
 	checkpointLoaded      bool
 	checkpointExists      bool
+	leaseHeld             bool
+	durableLease          bool
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
+	durableLease := cfg.Lease != nil
+	if cfg.Lease == nil {
+		cfg.Lease = alwaysHeldLease{}
+	}
+	if cfg.LeaseTTL <= 0 {
+		cfg.LeaseTTL = 45 * time.Second
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default().With("component", "engine")
@@ -112,11 +125,20 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		queueFirstSeen:        map[int]time.Time{},
 		queueComments:         map[int]string{},
 		terminalQueueComments: map[int]string{},
+		durableLease:          durableLease,
 	}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	held, err := e.acquireLease(ctx)
+	if err != nil {
+		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		return err
+	}
+	if !held {
+		return nil
+	}
 	if err := e.loadCheckpoint(ctx); err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
 		e.observeQueue()
@@ -140,14 +162,45 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			err = checkpointErr
 		}
 	}
+	if errors.Is(err, forge.ErrUnavailable) {
+		return nil
+	}
 	if err != nil {
 		e.cfg.Metrics.IncReconcileError(e.metricLabels())
 	}
 	if commentErr := e.syncQueueComments(ctx); commentErr != nil {
-		e.logger.Error("queue status comment sync failed", "error", commentErr)
+		if !errors.Is(commentErr, forge.ErrUnavailable) {
+			e.logger.Error("queue status comment sync failed", "error", commentErr)
+		}
 	}
 	e.observeQueue()
 	return err
+}
+
+func (e *Engine) acquireLease(ctx context.Context) (bool, error) {
+	held, err := e.cfg.Lease.AcquireLease(ctx, e.queueKey(), e.cfg.LeaseHolderID, e.cfg.LeaseTTL)
+	if err != nil || !held {
+		e.leaseHeld = false
+		return held, err
+	}
+	if !e.leaseHeld && e.durableLease {
+		e.resetVolatileQueueState()
+	}
+	e.leaseHeld = true
+	return true, nil
+}
+
+func (e *Engine) resetVolatileQueueState() {
+	e.pending = nil
+	e.active = nil
+	e.lingerSince = time.Time{}
+	e.queueFirstSeen = map[int]time.Time{}
+	e.baseGen = 0
+	e.stagingSeq = 0
+	e.queueComments = map[int]string{}
+	e.terminalQueueComments = map[int]string{}
+	e.checkpointLoaded = false
+	e.checkpointExists = false
 }
 
 // readyNumbers lists open PRs targeting base that currently have auto-merge
@@ -726,7 +779,9 @@ func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, s
 	e.cfg.Metrics.IncBounce(e.metricLabels())
 	e.observeQueueExit(num, "bounced")
 	if _, err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, num); err != nil {
-		e.logger.Warn("cancel auto-merge failed", "pr", num, "error", err)
+		if !errors.Is(err, forge.ErrUnavailable) {
+			e.logger.Warn("cancel auto-merge failed", "pr", num, "error", err)
+		}
 	}
 	e.logger.Info("PR bounced", "pr", num, "reason", reason)
 	return true
@@ -1011,14 +1066,18 @@ func (e *Engine) queueCommentTerminalBody(title, detail, debugURL string) string
 func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title, detail, debugURL string, durableComment bool) {
 	if statusState != "" && sha != "" {
 		if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, sha, e.cfg.StatusCtx, statusState, statusDescription(title), debugURL); err != nil {
-			e.logger.Warn("set source PR status failed", "pr", num, "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				e.logger.Warn("set source PR status failed", "pr", num, "error", err)
+			}
 		}
 	}
 	body := terminalCommentBody(title, detail, debugURL)
 	if e.cfg.QueueComments {
 		sticky := e.queueCommentTerminalBody(title, detail, debugURL)
 		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, sticky); err != nil {
-			e.logger.Warn("update sticky PR comment failed", "pr", num, "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				e.logger.Warn("update sticky PR comment failed", "pr", num, "error", err)
+			}
 		} else {
 			e.queueComments[num] = sticky
 			e.terminalQueueComments[num] = sticky
@@ -1026,7 +1085,9 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 	}
 	if durableComment {
 		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, outcomeCommentMarker, e.cfg.BotUser, body); err != nil {
-			e.logger.Warn("update durable PR comment failed", "pr", num, "error", err)
+			if !errors.Is(err, forge.ErrUnavailable) {
+				e.logger.Warn("update durable PR comment failed", "pr", num, "error", err)
+			}
 		}
 	}
 }
@@ -1143,7 +1204,9 @@ func (e *Engine) commitURL(sha string) string {
 func (e *Engine) debugURL(ctx context.Context, a *activeBatch) string {
 	targetURL, err := e.fc.RunTargetURL(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingSHA, a.stagingBranch)
 	if err != nil {
-		e.logger.Warn("run target lookup failed", "sha", short(a.stagingSHA), "error", err)
+		if !errors.Is(err, forge.ErrUnavailable) {
+			e.logger.Warn("run target lookup failed", "sha", short(a.stagingSHA), "error", err)
+		}
 	}
 	if targetURL != "" {
 		return targetURL
