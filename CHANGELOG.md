@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-17
+
 ### Fixed
 - Delegated final landing to the forge's scheduled auto-merge worker and
   released passing PRs one at a time.
@@ -148,7 +150,8 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/rbtr/shunt/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rbtr/shunt/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rbtr/shunt/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rbtr/shunt/compare/v0.3.0...v0.4.0
