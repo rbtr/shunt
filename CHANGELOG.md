@@ -7,8 +7,10 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Fixed
-- Prevented Forgejo's native scheduled-merge worker from racing shunt's explicit
-  merge after a batch passes.
+- Delegated final landing to the forge's scheduled auto-merge worker and
+  released passing PRs one at a time.
+- Requeued PRs when native auto-merge consumed a schedule without completing
+  the merge.
 - Stopped orphaned schedule events and repeated reconciles from creating
   duplicate terminal comments.
 

@@ -44,5 +44,5 @@ Optional flows:
 | `SHUNT_FORGE_BRANCH_PROTECTION_BOT_USER` | Bot username to add to the push allow-list when writes are enabled. |
 
 Use a disposable repo for write-enabled subtests. The harness intentionally does
-not call the merge endpoint because that flow is destructive; merge request
-payloads are covered by unit tests.
+not schedule, cancel, or release auto-merge because those flows mutate PR state;
+their request payloads are covered by unit tests.

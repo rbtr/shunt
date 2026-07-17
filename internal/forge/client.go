@@ -441,12 +441,6 @@ func (c *Client) SetCommitStatus(ctx context.Context, owner, repo, sha, statusCo
 	}, nil)
 }
 
-func (c *Client) MergePR(ctx context.Context, owner, repo string, index int, style, headSHA string) error {
-	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
-		"Do": style, "head_commit_id": headSHA,
-	}, nil)
-}
-
 func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error {
 	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
 		"Do":                        style,
