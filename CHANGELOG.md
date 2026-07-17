@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- Postgres-backed queue ownership leases, renewed at each reconciliation tick,
+  to coordinate a queue across replicas. A takeover reloads durable state and
+  re-stages active work.
+
+### Changed
+- Forge outage and rate-limit cooldowns now quietly defer queue work and
+  multi-repository discovery until the process-local Forge client recovers.
+
 ## [0.6.0] - 2026-07-17
 
 ### Fixed

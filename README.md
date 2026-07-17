@@ -117,7 +117,8 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
-| `SHUNT_POSTGRES_DSN` | — | Optional Postgres DSN for durable queue checkpoints. Mutually exclusive with `SHUNT_STATE_PATH`; migrations are applied at startup. |
+| `SHUNT_POSTGRES_DSN` | — | Optional Postgres DSN for durable queue checkpoints and replica coordination. Mutually exclusive with `SHUNT_STATE_PATH`; migrations are applied at startup. |
+| `SHUNT_QUEUE_LEASE_TTL` | `45s` | Postgres queue-ownership lease duration (at least `1µs`); renewed once per reconciliation tick, whose work is bounded to half this duration. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
 | `SHUNT_LISTEN` | `:8080` | Address for the `/healthz`, `/metrics`, `/status`, and `/webhook` endpoints |
@@ -166,7 +167,10 @@ metadata, linger state, and bisection counters across restarts. Active batches
 are re-staged after restore rather than landed from pre-restart CI results. In
 Kubernetes, mount a bbolt path on a persistent volume; an `emptyDir` path only
 survives container restarts within the same pod lifetime. Keep Postgres DSNs in a
-runtime secret store.
+runtime secret store. Only Postgres coordinates queue ownership across replicas:
+each `(owner, repo, base)` has one lease holder, and a new holder reloads its
+checkpoint before acting. bbolt and in-memory state are single-process options;
+they do not provide cross-replica coordination.
 
 ```yaml
 base: trunk
@@ -180,6 +184,7 @@ bisect_fanout: 2
 
 ## Observability
 
+`GET /healthz` is process liveness only; it does not report Forge availability.
 `GET /metrics` on `SHUNT_LISTEN` exposes dependency-free Prometheus text metrics
 for each managed `(owner, repo, base)` queue. `POST /webhook` accepts
 Forgejo/Gitea events and wakes reconciliation promptly.
@@ -202,7 +207,8 @@ Logs are structured JSON on stdout, with stable fields such as `component`,
 `owner`, `repo`, and `base` where they apply. Metrics are process-local and
 intentionally minimal in v0.4: queue-age and time-in-queue observations restart
 from when the current process first sees a PR, and metrics do not include
-persisted history.
+persisted history. Forge API rate limiting and health circuits are also
+process-local, including when queue ownership is coordinated through Postgres.
 
 `GET /status` exposes the process-local queue membership as JSON for lightweight
 ops surfaces that need more detail than counters. `GET /status.html` serves the

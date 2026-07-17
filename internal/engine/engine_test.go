@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -50,6 +51,10 @@ type mock struct {
 	failStatusState      string
 	failStatusCount      int
 	getPRErrors          map[int]int
+	listCalls            int
+	listErr              error
+	runStatusErr         error
+	upsertErr            error
 }
 
 func newMock(badPR int, prNums ...int) *mock {
@@ -77,6 +82,10 @@ func (m *mock) addPR(n int) {
 }
 
 func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullRequest, error) {
+	m.listCalls++
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	var out []forge.PullRequest
 	for _, pr := range m.prs {
 		if pr.State == "open" {
@@ -140,6 +149,9 @@ func (m *mock) Comment(_ context.Context, _, _ string, n int, body string) error
 	return nil
 }
 func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, marker, _, body string) error {
+	if m.upsertErr != nil {
+		return m.upsertErr
+	}
 	if marker == outcomeCommentMarker {
 		m.comments[n] = append(m.comments[n], body)
 		if strings.Contains(body, "Bounced from merge queue") {
@@ -154,6 +166,9 @@ func (m *mock) UpsertComment(_ context.Context, _, _ string, n int, marker, _, b
 func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error) {
 	if m.beforeRunStatus != nil {
 		m.beforeRunStatus(sha)
+	}
+	if m.runStatusErr != nil {
+		return "", m.runStatusErr
 	}
 	if m.runStatus != "" {
 		return m.runStatus, nil
@@ -1662,12 +1677,250 @@ func assertMetric(t *testing.T, c *metrics.Collector, want string) {
 	}
 }
 
+func TestLeaseContentionSkipsQueueActions(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{}
+	lease := &testQueueLease{held: []bool{false}}
+	c := metrics.New()
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: time.Minute, Metrics: c,
+	}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if lease.calls != 1 {
+		t.Fatalf("lease calls = %d, want 1", lease.calls)
+	}
+	if m.listCalls != 0 || len(m.staged) != 0 {
+		t.Fatalf("forge actions = list %d, staged %v; want none", m.listCalls, m.staged)
+	}
+	if store.loads != 0 || store.saves != 0 || store.deletes != 0 {
+		t.Fatalf("checkpoint actions = loads %d saves %d deletes %d; want none", store.loads, store.saves, store.deletes)
+	}
+	var out strings.Builder
+	c.WritePrometheus(&out)
+	if strings.Contains(out.String(), `shunt_reconcile_errors_total{owner="o",repo="r",base="main"} 1`) {
+		t.Fatalf("contention recorded a reconcile error:\n%s", out.String())
+	}
+}
+
+func TestLeaseReacquisitionResetsVolatileStateAndReloadsCheckpoint(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		Key:     checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Pending: [][]int{{1}},
+	}}
+	lease := &testQueueLease{held: []bool{false, true}}
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true,
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: time.Minute,
+	}, m, m)
+	e.pending = [][]int{{2}}
+	e.queueComments[2] = "stale"
+	e.terminalQueueComments[2] = "stale"
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("contended Reconcile: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reacquired Reconcile: %v", err)
+	}
+	if store.loads != 1 {
+		t.Fatalf("checkpoint loads = %d, want 1 after reacquisition", store.loads)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want only durable candidate [1]", got)
+	}
+	if got := len(m.queueComments[2]); got != 0 {
+		t.Fatalf("stale queue comment updates = %d, want 0", got)
+	}
+}
+
+func TestLeasePreventsDuplicateEffectsUntilTakeover(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{}
+	lease := &holderQueueLease{holder: "first"}
+	first := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "first", LeaseTTL: time.Minute,
+	}, m, m)
+	second := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "second", LeaseTTL: time.Minute,
+	}, m, m)
+
+	if err := first.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if err := second.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want one staging action while first holder owns lease", got)
+	}
+
+	lease.holder = ""
+	if err := second.Reconcile(context.Background()); err != nil {
+		t.Fatalf("takeover Reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want durable active batch re-staged after takeover", got)
+	}
+}
+
+func TestUnavailableForgeSkipsReconcileError(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatusErr = forge.ErrUnavailable
+	c := metrics.New()
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Metrics: c,
+	}, m, m)
+	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingBranch: "mq/main/staging-1", stagingSHA: "stage-1"}}
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile returned unavailable error: %v", err)
+	}
+	if !errors.Is(m.runStatusErr, forge.ErrUnavailable) {
+		t.Fatal("test setup did not use forge unavailability")
+	}
+	status := c.StatusSnapshot()
+	if len(status.Queues) != 1 || status.Queues[0].QueueDepth != 1 || !status.Queues[0].ActiveBatch {
+		t.Fatalf("queue status after unavailable forge = %#v, want active queue", status)
+	}
+	var out strings.Builder
+	c.WritePrometheus(&out)
+	if strings.Contains(out.String(), `shunt_reconcile_errors_total{owner="o",repo="r",base="main"} 1`) {
+		t.Fatalf("unavailable forge recorded a reconcile error:\n%s", out.String())
+	}
+}
+
+func TestDurableLeaseBoundsReconcileContext(t *testing.T) {
+	m := newMock(-1, 1)
+	lease := &deadlineQueueLease{}
+	stager := &contextBlockingStager{}
+	store := &memoryCheckpointStore{}
+	const ttl = 40 * time.Millisecond
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: ttl,
+	}, m, stager)
+
+	err := e.Reconcile(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile error = %v, want context deadline exceeded", err)
+	}
+	if !lease.hasDeadline || !stager.hasDeadline {
+		t.Fatal("lease and stager must receive a deadline")
+	}
+	if got := lease.deadline.Sub(lease.acquiredAt); got <= 0 || got > ttl/2 {
+		t.Fatalf("lease context budget = %s, want (0, %s]", got, ttl/2)
+	}
+	if !lease.deadline.Equal(stager.deadline) {
+		t.Fatalf("lease deadline = %s, stager deadline = %s; want propagated deadline", lease.deadline, stager.deadline)
+	}
+	if store.saves != 0 {
+		t.Fatalf("checkpoint saves = %d, want none after deadline", store.saves)
+	}
+}
+
+func TestDeadlinePreservesEarlierReconcileError(t *testing.T) {
+	m := newMock(-1)
+	lease := &deadlineQueueLease{}
+	store := &deadlineSaveCheckpointStore{}
+	const ttl = 40 * time.Millisecond
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging",
+		Checkpoint: store, Lease: lease, LeaseHolderID: "holder", LeaseTTL: ttl,
+	}, m, m)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial Reconcile: %v", err)
+	}
+
+	earlier := errors.New("run status failed")
+	m.addPR(1)
+	m.runStatusErr = earlier
+	e.active = []*activeBatch{{prs: []forge.PullRequest{*m.prs[1]}, stagingBranch: "mq/main/staging-1", stagingSHA: "stage-1"}}
+	err := e.Reconcile(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), earlier.Error()) {
+		t.Fatalf("Reconcile error = %v, want earlier error %q preserved", err, earlier)
+	}
+}
+
+type testQueueLease struct {
+	held  []bool
+	calls int
+}
+
+func (l *testQueueLease) AcquireLease(_ context.Context, _ checkpoint.QueueKey, _ string, _ time.Duration) (bool, error) {
+	held := l.held[l.calls]
+	l.calls++
+	return held, nil
+}
+
+type holderQueueLease struct {
+	holder string
+}
+
+func (l *holderQueueLease) AcquireLease(_ context.Context, _ checkpoint.QueueKey, holderID string, _ time.Duration) (bool, error) {
+	if l.holder == "" {
+		l.holder = holderID
+	}
+	return l.holder == holderID, nil
+}
+
+type deadlineQueueLease struct {
+	acquiredAt  time.Time
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (l *deadlineQueueLease) AcquireLease(ctx context.Context, _ checkpoint.QueueKey, _ string, _ time.Duration) (bool, error) {
+	l.acquiredAt = time.Now()
+	l.deadline, l.hasDeadline = ctx.Deadline()
+	return true, nil
+}
+
+type contextBlockingStager struct {
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (s *contextBlockingStager) BuildStaging(ctx context.Context, _ string, _ string, _ []gitops.MergedRef) (string, int, error) {
+	s.deadline, s.hasDeadline = ctx.Deadline()
+	<-ctx.Done()
+	return "", 0, ctx.Err()
+}
+
+type deadlineSaveCheckpointStore struct{}
+
+func (*deadlineSaveCheckpointStore) LoadQueue(context.Context, checkpoint.QueueKey) (checkpoint.QueueSnapshot, bool, error) {
+	return checkpoint.QueueSnapshot{}, false, nil
+}
+
+func (*deadlineSaveCheckpointStore) SaveQueue(ctx context.Context, _ checkpoint.QueueSnapshot) error {
+	<-ctx.Done()
+	return fmt.Errorf("write checkpoint: %w", ctx.Err())
+}
+
+func (*deadlineSaveCheckpointStore) DeleteQueue(context.Context, checkpoint.QueueKey) error {
+	return nil
+}
+
 type memoryCheckpointStore struct {
 	saved   *checkpoint.QueueSnapshot
 	deleted bool
+	loads   int
+	saves   int
+	deletes int
 }
 
 func (s *memoryCheckpointStore) LoadQueue(_ context.Context, _ checkpoint.QueueKey) (checkpoint.QueueSnapshot, bool, error) {
+	s.loads++
 	if s.saved == nil {
 		return checkpoint.QueueSnapshot{}, false, nil
 	}
@@ -1675,6 +1928,7 @@ func (s *memoryCheckpointStore) LoadQueue(_ context.Context, _ checkpoint.QueueK
 }
 
 func (s *memoryCheckpointStore) SaveQueue(_ context.Context, snapshot checkpoint.QueueSnapshot) error {
+	s.saves++
 	clone := snapshot.Clone()
 	s.saved = &clone
 	s.deleted = false
@@ -1682,6 +1936,7 @@ func (s *memoryCheckpointStore) SaveQueue(_ context.Context, snapshot checkpoint
 }
 
 func (s *memoryCheckpointStore) DeleteQueue(_ context.Context, _ checkpoint.QueueKey) error {
+	s.deletes++
 	s.saved = nil
 	s.deleted = true
 	return nil
