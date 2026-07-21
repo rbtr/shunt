@@ -347,6 +347,7 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 		"Position: 1/2",
 		"State: testing in active batch",
 		"Active batch: #1, #2 on `mq/main/staging-",
+		"separate durable outcome comment",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("queue comment missing %q in:\n%s", want, body)
@@ -381,23 +382,98 @@ func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
 	if got := len(m.queueComments[1]); got != 3 {
 		t.Fatalf("PR 1 queue comment updates = %d, want 3", got)
 	}
-	if body := m.queueComments[1][2]; !strings.Contains(body, "State: Landed via merge queue") {
+	if body := m.queueComments[1][2]; !strings.Contains(body, "State: Landed via merge queue") || !strings.Contains(body, "Outcome: terminal") {
 		t.Fatalf("final queue comment did not mark PR as landed:\n%s", body)
+	}
+}
+
+func TestQueueStatusCommentsMarkBisectionAsRetrying(t *testing.T) {
+	m := newMock(2, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("split failed batch: %v", err)
+	}
+
+	body := m.queueComments[1][len(m.queueComments[1])-1]
+	if !strings.Contains(body, "State: retrying after gate failure; isolating the batch") {
+		t.Fatalf("retry queue comment missing state:\n%s", body)
+	}
+}
+
+func TestQueueStatusCommentsMarkTerminalOutcomes(t *testing.T) {
+	m := newMock(1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start failing batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("bounce failing batch: %v", err)
+	}
+
+	sticky := m.queueComments[1][len(m.queueComments[1])-1]
+	if !strings.Contains(sticky, "Outcome: terminal") {
+		t.Fatalf("terminal sticky comment missing outcome:\n%s", sticky)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, outcomeCommentMarker) {
+		t.Fatalf("durable outcome comment missing marker:\n%s", got)
+	}
+}
+
+func TestQueueStatusCommentsMarkCancelledAutomergeRequeued(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", QueueComments: true}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	before := len(m.queueComments[1])
+	m.runStatus = "success"
+	m.automerge[1] = false
+	m.scheduleLive[1] = false
+	m.automergeAt[1] = m.nextEventTime()
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("requeue cancelled auto-merge: %v", err)
+	}
+
+	if got := len(m.queueComments[1]); got != before+1 {
+		t.Fatalf("queue comment updates = %d, want %d", got, before+1)
+	}
+	body := m.queueComments[1][len(m.queueComments[1])-1]
+	if !strings.Contains(body, "State: requeued after auto-merge was cancelled") {
+		t.Fatalf("requeue comment missing state:\n%s", body)
+	}
+	if strings.Contains(body, "Outcome: terminal") {
+		t.Fatalf("requeue comment incorrectly marked terminal:\n%s", body)
 	}
 }
 
 func TestBatchLingerWaitsWhileUnderTargetAndWindow(t *testing.T) {
 	m := newMock(-1, 1, 2)
-	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 3}, m, m)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", BatchLinger: 10 * time.Second, BatchTarget: 3, QueueComments: true}, m, m)
 	now := time.Unix(100, 0)
 	e.now = func() time.Time { return now }
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start linger: %v", err)
 	}
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("initial linger comment updates = %d, want 1", got)
+	}
+	if body := m.queueComments[1][0]; !strings.Contains(body, "State: queued; acknowledged by shunt; waiting for batch linger window") {
+		t.Fatalf("initial linger comment missing state:\n%s", body)
+	}
 	now = now.Add(9 * time.Second)
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("continue linger: %v", err)
+	}
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("unchanged linger comment updates = %d, want 1", got)
 	}
 
 	if len(e.active) != 0 {
