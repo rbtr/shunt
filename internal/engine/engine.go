@@ -97,6 +97,7 @@ type Engine struct {
 
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
+	requeueStates         map[int]string
 	checkpointLoaded      bool
 	checkpointExists      bool
 	leaseHeld             bool
@@ -125,6 +126,7 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		queueFirstSeen:        map[int]time.Time{},
 		queueComments:         map[int]string{},
 		terminalQueueComments: map[int]string{},
+		requeueStates:         map[int]string{},
 		durableLease:          durableLease,
 	}
 }
@@ -237,6 +239,7 @@ func (e *Engine) resetVolatileQueueState() {
 	e.stagingSeq = 0
 	e.queueComments = map[int]string{}
 	e.terminalQueueComments = map[int]string{}
+	e.requeueStates = map[int]string{}
 	e.checkpointLoaded = false
 	e.checkpointExists = false
 }
@@ -334,7 +337,9 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 			e.lingerSince = time.Time{}
 			return false, nil
 		}
-		if e.linger(ready) {
+		lingering := e.linger(ready)
+		e.acknowledgeQueued(ctx, ready, lingering)
+		if lingering {
 			return false, nil
 		}
 		e.enqueue(ready)
@@ -513,8 +518,8 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			continue
 		}
 		if current.State != "open" {
-			e.skipLand(ctx, staged, current, fmt.Sprintf("state changed to %q", current.State), len(a.prs) > 1, a.debugURL)
-			e.requeueActiveRemainder(a.prs[1:])
+			e.skipLand(ctx, staged, current, fmt.Sprintf("state changed to %q", current.State), len(a.prs) > 1, a.debugURL, false)
+			e.requeueActiveRemainder("requeued after an earlier PR left the batch", a.prs[1:])
 			e.removeActive(a)
 			return true, merged, nil
 		}
@@ -529,8 +534,9 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				fmt.Sprintf("head changed from %s to %s", short(staged.Head.Sha), short(current.Head.Sha)),
 				len(a.prs) > 1,
 				a.debugURL,
+				true,
 			)
-			e.requeueActiveRemainder(a.prs)
+			e.requeueActiveRemainder("requeued after PR head changed", a.prs)
 			e.removeActive(a)
 			return true, merged, nil
 		}
@@ -540,8 +546,8 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			return false, merged, err
 		}
 		if !queued {
-			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL)
-			e.requeueActiveRemainder(a.prs)
+			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
+			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 			e.removeActive(a)
 			return true, merged, nil
 		}
@@ -569,8 +575,8 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				return false, merged, err
 			}
 			if !state.Scheduled {
-				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL)
-				e.requeueActiveRemainder(a.prs)
+				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
+				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 				e.removeActive(a)
 				return true, merged, nil
 			}
@@ -601,12 +607,13 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 					"shunt skipped this PR before landing because auto-merge is no longer scheduled. It will be re-tested if it remains queued.",
 					a.debugURL,
 					true,
+					false,
 				)
-				e.requeueActiveRemainder(a.prs)
+				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 				e.removeActive(a)
 				return true, merged, nil
 			}
-			e.requeueActiveRemainder(a.prs)
+			e.requeueActiveRemainder("retrying after forge merge recovery", a.prs)
 			e.removeActive(a)
 			if err := e.scheduleAutomerge(ctx, current); err != nil {
 				return false, merged, fmt.Errorf("restore auto-merge for PR #%d: %w", staged.Number, err)
@@ -632,6 +639,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				"the forge did not complete its scheduled merge; shunt restored the queue entry for a fresh test.",
 				a.debugURL,
 				true,
+				false,
 			)
 			e.logger.Error("native auto-merge timed out", "pr", staged.Number)
 			return true, merged, nil
@@ -663,8 +671,8 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			return false, merged, err
 		}
 		if !state.Scheduled {
-			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL)
-			e.requeueActiveRemainder(a.prs)
+			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
+			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 			e.removeActive(a)
 			return true, merged, nil
 		}
@@ -722,6 +730,7 @@ func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.
 		"shunt tested this PR in a staging batch, then the forge completed its scheduled merge.",
 		a.debugURL,
 		true,
+		true,
 	)
 	e.logger.Info("PR merged", "pr", staged.Number)
 }
@@ -737,10 +746,10 @@ func (e *Engine) releasedByShunt(ctx context.Context, a *activeBatch, staged for
 	return ok && status.Status == "success" && status.Description == landingSuccessDescription, nil
 }
 
-func (e *Engine) requeueActiveRemainder(prs []forge.PullRequest) {
+func (e *Engine) requeueActiveRemainder(state string, prs []forge.PullRequest) {
 	nums := numbersOf(prs)
 	if len(nums) > 0 {
-		e.enqueue(nums)
+		e.enqueueWithState(state, nums)
 	}
 }
 
@@ -754,7 +763,7 @@ func (e *Engine) handleStagingConflict(ctx context.Context, prs []forge.PullRequ
 		e.bounce(ctx, conflictPR, prs[idx].Head.Sha, "merge conflict while staging the PR", "error", "")
 		if len(nums) > 1 {
 			rest := append([]int(nil), nums[1:]...)
-			e.enqueue(rest)
+			e.enqueueWithState("retrying after staging conflict; testing a smaller batch", rest)
 			e.logger.Info("batch conflict on first PR", "prs", nums, "conflictPR", conflictPR, "requeued", rest)
 		}
 		return nil
@@ -762,12 +771,12 @@ func (e *Engine) handleStagingConflict(ctx context.Context, prs []forge.PullRequ
 
 	prefix := append([]int(nil), nums[:idx]...)
 	suffix := append([]int(nil), nums[idx:]...)
-	e.enqueue(prefix, suffix)
+	e.enqueueWithState("retrying after staging conflict; testing a smaller batch", prefix, suffix)
 	e.logger.Info("batch conflict split", "prs", nums, "conflictPR", conflictPR, "prefix", prefix, "suffix", suffix)
 	return nil
 }
 
-func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest, reason string, hasRemainder bool, debugURL string) {
+func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest, reason string, hasRemainder bool, debugURL string, willRetry bool) {
 	num := staged.Number
 	e.logger.Info("PR skipped before merge", "pr", num, "reason", reason, "hasRemainder", hasRemainder)
 	if current.State == "open" && !current.Merged {
@@ -775,7 +784,7 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 		if sha == "" {
 			sha = staged.Head.Sha
 		}
-		e.notifyPR(ctx, num, sha, "error", "Skipped by merge queue", "shunt skipped this PR before landing because "+reason+". It will be re-tested if it remains queued.", debugURL, true)
+		e.notifyPR(ctx, num, sha, "error", "Skipped by merge queue", "shunt skipped this PR before landing because "+reason+". It will be re-tested if it remains queued.", debugURL, true, !willRetry)
 	}
 }
 
@@ -793,7 +802,7 @@ func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status stri
 	mid := len(nums) / 2
 	first := append([]int(nil), nums[:mid]...)
 	second := append([]int(nil), nums[mid:]...)
-	e.enqueue(first, second)
+	e.enqueueWithState("retrying after gate "+status+"; isolating the batch", first, second)
 	e.logger.Info("batch failed; bisecting", "prs", nums, "status", status, "first", first, "second", second)
 	return true, nil
 }
@@ -808,11 +817,11 @@ func gateOutcomeStatus(status string) string {
 func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, statusState, debugURL string) bool {
 	if pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, num); err == nil && pr.State == "open" && !pr.Merged {
 		if expectedHeadSHA != "" && pr.Head.Sha != expectedHeadSHA {
-			e.enqueue([]int{num})
+			e.enqueueWithState("requeued after PR head changed", []int{num})
 			e.logger.Info("PR requeued instead of bounced after head changed", "pr", num, "oldHead", short(expectedHeadSHA), "newHead", short(pr.Head.Sha))
 			return false
 		}
-		e.notifyPR(ctx, num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true)
+		e.notifyPR(ctx, num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true, true)
 	}
 	e.cfg.Metrics.IncBounce(e.metricLabels())
 	e.observeQueueExit(num, "bounced")
@@ -851,6 +860,18 @@ func (e *Engine) enqueue(cands ...[]int) {
 	})
 }
 
+func (e *Engine) enqueueWithState(state string, cands ...[]int) {
+	if e.requeueStates == nil {
+		e.requeueStates = map[int]string{}
+	}
+	for _, cand := range cands {
+		for _, num := range cand {
+			e.requeueStates[num] = state
+		}
+	}
+	e.enqueue(cands...)
+}
+
 func (e *Engine) readyToResolve(a *activeBatch) bool {
 	first := firstPR(a.prs)
 	for _, cand := range e.pending {
@@ -884,19 +905,19 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 	}
 	a := e.active[idx]
 	e.active = append(e.active[:idx], e.active[idx+1:]...)
-	e.enqueue(numbersOf(a.prs))
+	e.enqueueWithState("requeued; waiting for an earlier queue entry", numbersOf(a.prs))
 	e.logger.Info("speculative batch requeued for earlier candidate", "prs", numbersOf(a.prs), "earlier", e.pending[0])
 }
 
 func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
 	e.removeActive(a)
-	e.enqueue(numbersOf(a.prs))
+	e.enqueueWithState("requeued after base branch advanced", numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
 }
 
 func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
 	e.removeActive(a)
-	e.enqueue(numbersOf(a.prs))
+	e.enqueueWithState("requeued after PR head changed", numbersOf(a.prs))
 	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))
 }
 
@@ -939,6 +960,7 @@ func (e *Engine) observeQueue() {
 
 const queueCommentMarker = "<!-- shunt:queue-status -->"
 const outcomeCommentMarker = "<!-- shunt:outcome -->"
+const queueCommentFooter = "_shunt updates this sticky status comment. It may also post one separate durable outcome comment for a final, skipped, or recovery outcome._"
 
 type queueCommentStatus struct {
 	number        int
@@ -1001,7 +1023,7 @@ func (e *Engine) queueCommentStatuses(ctx context.Context) ([]queueCommentStatus
 	states := map[int]string{}
 	for _, cand := range e.pending {
 		for _, num := range cand {
-			states[num] = "queued"
+			states[num] = e.queuedState(num)
 		}
 	}
 	activeSummary := e.activeSummary()
@@ -1016,7 +1038,13 @@ func (e *Engine) queueCommentStatuses(ctx context.Context) ([]queueCommentStatus
 			}
 		}
 		for _, pr := range a.prs {
-			states[pr.Number] = state
+			prState := state
+			if a.outcome == "" {
+				if requeueState, ok := e.requeueStates[pr.Number]; ok {
+					prState = requeueState + "; testing in active batch"
+				}
+			}
+			states[pr.Number] = prState
 		}
 	}
 	if len(states) == 0 {
@@ -1025,9 +1053,9 @@ func (e *Engine) queueCommentStatuses(ctx context.Context) ([]queueCommentStatus
 			return nil, err
 		}
 		for _, num := range ready {
-			state := "queued"
+			state := e.queuedState(num)
 			if e.cfg.BatchLinger > 0 && !e.lingerSince.IsZero() {
-				state = "queued; waiting for batch linger window"
+				state += "; waiting for batch linger window"
 			}
 			states[num] = state
 		}
@@ -1065,7 +1093,7 @@ func (e *Engine) queueCommentBody(status queueCommentStatus) string {
 		fmt.Fprintln(&b, "- Active batch: none")
 	}
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	fmt.Fprintln(&b, queueCommentFooter)
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -1078,7 +1106,7 @@ func (e *Engine) queueCommentNotQueuedBody() string {
 	fmt.Fprintf(&b, "- Base: `%s`\n", e.cfg.Base)
 	fmt.Fprintln(&b, "- State: not currently queued")
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	fmt.Fprintln(&b, queueCommentFooter)
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -1090,6 +1118,7 @@ func (e *Engine) queueCommentTerminalBody(title, detail, debugURL string) string
 	fmt.Fprintf(&b, "- Repository: `%s/%s`\n", e.cfg.Owner, e.cfg.Repo)
 	fmt.Fprintf(&b, "- Base: `%s`\n", e.cfg.Base)
 	fmt.Fprintf(&b, "- State: %s\n", title)
+	fmt.Fprintln(&b, "- Outcome: terminal")
 	if detail != "" {
 		fmt.Fprintf(&b, "- Detail: %s\n", detail)
 	}
@@ -1097,11 +1126,11 @@ func (e *Engine) queueCommentTerminalBody(title, detail, debugURL string) string
 		fmt.Fprintf(&b, "- Debug: [staging run/commit](%s)\n", debugURL)
 	}
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "_shunt updates this sticky comment instead of posting new queue-status comments._")
+	fmt.Fprintln(&b, queueCommentFooter)
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title, detail, debugURL string, durableComment bool) {
+func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title, detail, debugURL string, durableComment, terminal bool) {
 	if statusState != "" && sha != "" {
 		if err := e.fc.SetCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, sha, e.cfg.StatusCtx, statusState, statusDescription(title), debugURL); err != nil {
 			if !errors.Is(err, forge.ErrUnavailable) {
@@ -1110,7 +1139,7 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 		}
 	}
 	body := terminalCommentBody(title, detail, debugURL)
-	if e.cfg.QueueComments {
+	if e.cfg.QueueComments && terminal {
 		sticky := e.queueCommentTerminalBody(title, detail, debugURL)
 		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, sticky); err != nil {
 			if !errors.Is(err, forge.ErrUnavailable) {
@@ -1120,6 +1149,8 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 			e.queueComments[num] = sticky
 			e.terminalQueueComments[num] = sticky
 		}
+	} else if !terminal {
+		delete(e.terminalQueueComments, num)
 	}
 	if durableComment {
 		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, outcomeCommentMarker, e.cfg.BotUser, body); err != nil {
@@ -1128,6 +1159,41 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 			}
 		}
 	}
+}
+
+func (e *Engine) acknowledgeQueued(ctx context.Context, nums []int, lingering bool) {
+	if !e.cfg.QueueComments {
+		return
+	}
+	for i, num := range nums {
+		state := "queued; acknowledged by shunt"
+		if lingering {
+			state += "; waiting for batch linger window"
+		}
+		body := e.queueCommentBody(queueCommentStatus{
+			number:   num,
+			position: i + 1,
+			total:    len(nums),
+			state:    state,
+		})
+		if e.queueComments[num] == body {
+			continue
+		}
+		if err := e.fc.UpsertComment(ctx, e.cfg.Owner, e.cfg.Repo, num, queueCommentMarker, e.cfg.BotUser, body); err != nil {
+			if !errors.Is(err, forge.ErrUnavailable) {
+				e.logger.Warn("queue acknowledgement failed", "pr", num, "error", err)
+			}
+			continue
+		}
+		e.queueComments[num] = body
+	}
+}
+
+func (e *Engine) queuedState(num int) string {
+	if state, ok := e.requeueStates[num]; ok {
+		return state
+	}
+	return "queued; acknowledged by shunt"
 }
 
 func terminalCommentBody(title, detail, debugURL string) string {
@@ -1201,6 +1267,7 @@ func (e *Engine) observeReady(nums []int) {
 }
 
 func (e *Engine) observeQueueExit(num int, outcome string) {
+	delete(e.requeueStates, num)
 	if e.queueFirstSeen == nil {
 		return
 	}

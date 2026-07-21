@@ -218,20 +218,21 @@ whether any batch is active; they omit tokens, clone URLs, staging SHAs, and
 other internal details.
 
 Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
-keeps one sticky comment per queued PR, identified by a stable hidden marker, and
-edits it only when the displayed queue state changes. The comment shows the repo,
-base branch, queue position, current state, and active batch when known. This is
-off by default because it adds issue-comment API reads/writes on repositories that
-opt in.
+posts a queued acknowledgement before staging, then keeps one sticky status comment
+per queued PR, identified by a stable hidden marker. It edits that status comment
+only when the displayed queue state changes. The comment shows the repo, base
+branch, queue position, current state (including requeues and retries), and active
+batch when known. This is off by default because it adds issue-comment API
+reads/writes on repositories that opt in.
 
 Terminal outcomes are always reported on the source PR, even when sticky queue
-comments are disabled. shunt maintains one durable outcome comment per PR and
-updates it when the outcome changes. Rejected PRs receive a failed or errored
+comments are disabled. shunt maintains one separate durable outcome comment per PR
+and updates it when the outcome changes, so a PR can have both a sticky status
+comment and an outcome comment. Rejected PRs receive a failed or errored
 source-head status, auto-merge is cancelled, and the outcome comment includes the
-rejection reason and a staging run/commit link when one exists. PRs skipped
-before landing because their head changed, auto-merge was cancelled, or the
-forge did not complete its scheduled merge receive an error status and an
-explanatory outcome.
+rejection reason and a staging run/commit link when one exists. PRs skipped before
+landing because their head changed, auto-merge was cancelled, or the forge did not
+complete its scheduled merge receive an error status and an explanatory outcome.
 
 ## Deploy
 
