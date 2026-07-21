@@ -23,7 +23,7 @@ spec:
         fsGroup: 65534
       containers:
         - name: shunt
-          image: ghcr.io/rbtr/shunt:0.1.0
+          image: ghcr.io/rbtr/shunt:0.8.0
           env:
             - name: SHUNT_INSTANCE
               value: "https://forge.example.com"

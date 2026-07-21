@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-21
+
 ### Security
 - Bumped the indirect `golang.org/x/text` dependency (pulled in via
   `jackc/pgx/v5`) to v0.39.0, fixing
