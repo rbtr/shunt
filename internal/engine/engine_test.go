@@ -336,13 +336,10 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 		t.Fatalf("start batch: %v", err)
 	}
 
-	if got := len(m.queueComments[1]); got != 2 {
-		t.Fatalf("PR 1 queue comment updates = %d, want 2", got)
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("PR 1 queue comment updates = %d, want 1", got)
 	}
-	if body := m.queueComments[1][0]; !strings.Contains(body, "State: queued; acknowledged by shunt") {
-		t.Fatalf("initial queue acknowledgement missing queued state:\n%s", body)
-	}
-	body := m.queueComments[1][1]
+	body := m.queueComments[1][0]
 	for _, want := range []string{
 		queueCommentMarker,
 		"Repository: `o/r`",
@@ -360,8 +357,8 @@ func TestQueueStatusCommentsAreStickyAndConcise(t *testing.T) {
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("unchanged running batch: %v", err)
 	}
-	if got := len(m.queueComments[1]); got != 2 {
-		t.Fatalf("unchanged queue comment updates = %d, want 2", got)
+	if got := len(m.queueComments[1]); got != 1 {
+		t.Fatalf("unchanged queue comment updates = %d, want 1", got)
 	}
 }
 
@@ -382,10 +379,10 @@ func TestQueueStatusCommentMarksCachedPRNotQueued(t *testing.T) {
 		t.Fatalf("observe merge: %v", err)
 	}
 
-	if got := len(m.queueComments[1]); got != 4 {
-		t.Fatalf("PR 1 queue comment updates = %d, want 4", got)
+	if got := len(m.queueComments[1]); got != 3 {
+		t.Fatalf("PR 1 queue comment updates = %d, want 3", got)
 	}
-	if body := m.queueComments[1][3]; !strings.Contains(body, "State: Landed via merge queue") || !strings.Contains(body, "Outcome: terminal") {
+	if body := m.queueComments[1][2]; !strings.Contains(body, "State: Landed via merge queue") || !strings.Contains(body, "Outcome: terminal") {
 		t.Fatalf("final queue comment did not mark PR as landed:\n%s", body)
 	}
 }

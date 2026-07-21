@@ -338,8 +338,8 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		lingering := e.linger(ready)
-		e.acknowledgeQueued(ctx, ready, lingering)
 		if lingering {
+			e.acknowledgeQueued(ctx, ready)
 			return false, nil
 		}
 		e.enqueue(ready)
@@ -1161,20 +1161,16 @@ func (e *Engine) notifyPR(ctx context.Context, num int, sha, statusState, title,
 	}
 }
 
-func (e *Engine) acknowledgeQueued(ctx context.Context, nums []int, lingering bool) {
+func (e *Engine) acknowledgeQueued(ctx context.Context, nums []int) {
 	if !e.cfg.QueueComments {
 		return
 	}
 	for i, num := range nums {
-		state := "queued; acknowledged by shunt"
-		if lingering {
-			state += "; waiting for batch linger window"
-		}
 		body := e.queueCommentBody(queueCommentStatus{
 			number:   num,
 			position: i + 1,
 			total:    len(nums),
-			state:    state,
+			state:    "queued; acknowledged by shunt; waiting for batch linger window",
 		})
 		if e.queueComments[num] == body {
 			continue

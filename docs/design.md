@@ -157,10 +157,11 @@ back to source PRs:
   were not landed.
 
 Queue status and outcome comments use separate hidden markers. The queue status
-comment is posted when shunt acknowledges an auto-merge request and then updated
-as the PR is queued, retried, or tested. A durable outcome comment records a
-landing, rejection, skip, or recovery, so a PR can have one comment of each type.
-Repeated reconciliation updates the matching comment instead of adding another.
+comment is posted while shunt acknowledges an auto-merge request held for batch
+linger, or when the PR begins testing, and is then updated as the PR is queued,
+retried, or tested. A durable outcome comment records a landing, rejection, skip, or
+recovery, so a PR can have one comment of each type. Repeated reconciliation updates
+the matching comment instead of adding another.
 
 If sticky queue comments are enabled, terminal outcomes update the sticky comment
 too. Intermediate multi-PR batch failures are not broadcast to every source PR;

@@ -217,13 +217,14 @@ identity (`owner`, `repo`, `base`), depth, active/pending PR-number batches, and
 whether any batch is active; they omit tokens, clone URLs, staging SHAs, and
 other internal details.
 
-Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. shunt
-posts a queued acknowledgement before staging, then keeps one sticky status comment
-per queued PR, identified by a stable hidden marker. It edits that status comment
-only when the displayed queue state changes. The comment shows the repo, base
-branch, queue position, current state (including requeues and retries), and active
-batch when known. This is off by default because it adds issue-comment API
-reads/writes on repositories that opt in.
+Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. While a
+batch waits for the optional linger window, shunt posts a queued acknowledgement;
+otherwise it shows the active testing state directly. It keeps one sticky status
+comment per queued PR, identified by a stable hidden marker, and edits that comment
+only when the displayed queue state changes. The comment shows the repo, base branch,
+queue position, current state (including requeues and retries), and active batch when
+known. This is off by default because it adds issue-comment API reads/writes on
+repositories that opt in.
 
 Terminal outcomes are always reported on the source PR, even when sticky queue
 comments are disabled. shunt maintains one separate durable outcome comment per PR

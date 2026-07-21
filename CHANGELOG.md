@@ -7,8 +7,8 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- Sticky queue comments now acknowledge queued auto-merge requests before
-  staging and distinguish retries/requeues from terminal outcomes.
+- Sticky queue comments now acknowledge queued auto-merge requests during batch
+  linger and distinguish retries/requeues from terminal outcomes.
 
 ### Changed
 - Queue comment copy now explains the separate sticky status and durable outcome
