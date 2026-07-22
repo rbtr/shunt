@@ -2,8 +2,8 @@ apiVersion: v2
 name: shunt
 description: A merge queue for Forgejo and Gitea
 type: application
-version: 0.7.0
-appVersion: 0.7.0
+version: 0.8.0
+appVersion: 0.8.0
 sources:
   - https://github.com/rbtr/shunt
 maintainers:
