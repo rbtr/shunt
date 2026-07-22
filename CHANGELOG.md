@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+- Bumped the indirect `golang.org/x/text` dependency (pulled in via
+  `jackc/pgx/v5`) to v0.39.0, fixing
+  [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970), an infinite loop on
+  invalid input reachable through `sql.DB.ExecContext` in the Postgres
+  checkpoint backend.
+
 ### Added
 - Sticky queue comments now acknowledge queued auto-merge requests during batch
   linger and distinguish retries/requeues from terminal outcomes.
