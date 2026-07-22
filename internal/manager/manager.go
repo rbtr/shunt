@@ -7,7 +7,10 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
@@ -15,6 +18,13 @@ import (
 	"github.com/rbtr/shunt/internal/metrics"
 	"github.com/rbtr/shunt/internal/repoconfig"
 )
+
+// reconciler is the subset of *engine.Engine used by the manager.
+// Separating it as an interface keeps the manager unit-testable with
+// lightweight fakes.
+type reconciler interface {
+	Reconcile(ctx context.Context) error
+}
 
 type Config struct {
 	Topic         string
@@ -39,19 +49,49 @@ type Config struct {
 	LeaseTTL      time.Duration
 	Logger        *slog.Logger
 	EngineLogger  *slog.Logger
+	// MaxConcurrentReconciles caps how many engines may be reconciled
+	// concurrently in a single Tick pass. Values ≤ 0 or 1 preserve today's
+	// serial behaviour exactly. Values > 1 enable cross-repo parallelism.
+	MaxConcurrentReconciles int
 }
 
 type Manager struct {
-	fc           *forge.Client
-	cfg          Config
-	logger       *slog.Logger
-	engineLogger *slog.Logger
-	engines      map[string]*managedEngine
+	fc            *forge.Client
+	cfg           Config
+	logger        *slog.Logger
+	engineLogger  *slog.Logger
+	engines       map[string]*managedEngine
+	maxConcurrent int
 }
 
+// managedEngine couples a reconcile engine to its per-instance lifecycle so
+// that Tick and Refresh can safely coordinate:
+//
+//   - lifetimeCtx / stop: Refresh cancels this context before replacing or
+//     removing the engine, giving any in-flight Reconcile a prompt exit signal.
+//   - mu: held for the duration of every Reconcile call.  Tick uses TryLock to
+//     enforce the at-most-one-concurrent-call-per-engine invariant; Refresh uses
+//     Lock to drain any in-flight call before touching the engines map.
 type managedEngine struct {
-	engine *engine.Engine
-	cfg    engine.Config
+	engine      reconciler
+	cfg         engine.Config
+	lifetimeCtx context.Context
+	stop        context.CancelFunc // cancels lifetimeCtx
+	mu          sync.Mutex
+}
+
+func newManagedEngine(eng reconciler, cfg engine.Config) *managedEngine {
+	ctx, stop := context.WithCancel(context.Background())
+	return &managedEngine{engine: eng, cfg: cfg, lifetimeCtx: ctx, stop: stop}
+}
+
+// drain cancels the engine's lifetime context (giving any in-flight Reconcile
+// a prompt exit signal) and then waits for the call to return.
+// Must be called before replacing or removing this engine from the map.
+func (me *managedEngine) drain() {
+	me.stop()      // signal Reconcile to exit at its next ctx.Err() check
+	me.mu.Lock()   // block until any in-flight Reconcile has returned
+	me.mu.Unlock() //nolint:staticcheck
 }
 
 func New(fc *forge.Client, cfg Config) *Manager {
@@ -63,7 +103,14 @@ func New(fc *forge.Client, cfg Config) *Manager {
 	if engineLogger == nil {
 		engineLogger = slog.Default().With("component", "engine")
 	}
-	return &Manager{fc: fc, cfg: cfg, logger: logger, engineLogger: engineLogger, engines: map[string]*managedEngine{}}
+	maxConcurrent := cfg.MaxConcurrentReconciles
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
+	return &Manager{
+		fc: fc, cfg: cfg, logger: logger, engineLogger: engineLogger,
+		engines: map[string]*managedEngine{}, maxConcurrent: maxConcurrent,
+	}
 }
 
 func keyOf(owner, repo, base string) string { return owner + "/" + repo + "@" + base }
@@ -122,11 +169,18 @@ func (m *Manager) Refresh(ctx context.Context) error {
 			queueLogger.Info("webhook configured")
 		}
 		st := gitops.NewStager(cloneURL(m.cfg.InstanceURL, r.Owner, r.Name), m.cfg.BotUser, m.cfg.Token, m.cfg.BotUser, m.cfg.BotEmail)
-		m.engines[k] = &managedEngine{engine: engine.New(cfg, m.fc, st), cfg: cfg}
+		// Drain before replacement: cancel any in-flight Reconcile on the old engine
+		// and wait for it to finish so stale checkpoint writes cannot race with the
+		// new engine loading state under the same (owner, repo, base) key.
+		if old, ok := m.engines[k]; ok {
+			old.drain()
+		}
+		m.engines[k] = newManagedEngine(engine.New(cfg, m.fc, st), cfg)
 		queueLogger.Info("repo managed")
 	}
 	for k := range m.engines {
 		if !seen[k] {
+			m.engines[k].drain() // wait for any in-flight Reconcile before removing
 			delete(m.engines, k)
 			m.cfg.Metrics.ForgetQueue(labelsOfKey(k))
 			m.logger.Info("repo no longer managed", "queue", k)
@@ -135,15 +189,49 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	return nil
 }
 
-// Tick reconciles every managed queue once.
+// Tick reconciles every managed queue, bounded to m.maxConcurrent concurrent
+// engines at a time. The default (maxConcurrent == 1) is serial and preserves
+// exactly the same behaviour as the original single-goroutine loop.
+//
+// Invariants:
+//   - At most one Reconcile call is ever in flight for a given engine at once.
+//     If a previous tick's Reconcile is still running (TryLock fails), this tick
+//     is skipped for that engine with a warning; this means SHUNT_POLL_INTERVAL
+//     is too short relative to the actual reconcile duration.
+//   - Tick blocks until every goroutine it started has returned, so the caller
+//     (the reconcile loop) can safely call Refresh immediately afterwards.
 func (m *Manager) Tick(ctx context.Context) {
+	var eg errgroup.Group
+	eg.SetLimit(m.maxConcurrent)
 	for k, e := range m.engines {
-		if err := e.engine.Reconcile(ctx); err != nil {
-			if !errors.Is(err, forge.ErrUnavailable) {
-				m.logger.Error("reconcile failed", "queue", k, "error", err)
+		k, e := k, e
+		eg.Go(func() error {
+			// At-most-one-concurrent-Reconcile-per-engine invariant. A failure
+			// here indicates SHUNT_POLL_INTERVAL is shorter than this engine's
+			// actual reconcile duration, or Tick is being called concurrently
+			// (unsupported).
+			if !e.mu.TryLock() {
+				m.logger.Warn("engine tick skipped: previous reconcile still in flight", "queue", k)
+				return nil
 			}
-		}
+			defer e.mu.Unlock()
+			// Derive a context that is cancelled by either process shutdown (ctx)
+			// or this engine's replacement/removal (e.lifetimeCtx), whichever
+			// comes first. context.AfterFunc is non-blocking and cleans up after
+			// itself once the stop function returned by AfterFunc is called.
+			rctx, rcancel := context.WithCancel(ctx)
+			defer rcancel()
+			stop := context.AfterFunc(e.lifetimeCtx, rcancel)
+			defer stop()
+			if err := e.engine.Reconcile(rctx); err != nil {
+				if !errors.Is(err, forge.ErrUnavailable) {
+					m.logger.Error("reconcile failed", "queue", k, "error", err)
+				}
+			}
+			return nil
+		})
 	}
+	_ = eg.Wait()
 }
 
 func (m *Manager) repoSettings(ctx context.Context, r forge.RepoRef) (repoconfig.Settings, string, error) {

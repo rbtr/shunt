@@ -194,6 +194,10 @@ func main() {
 	if err != nil {
 		fatal(logger, "forge client config error", "error", err)
 	}
+	maxConcurrentReconciles, err := strconv.Atoi(env("SHUNT_MAX_CONCURRENT_RECONCILES", "1"))
+	if err != nil || maxConcurrentReconciles < 1 {
+		fatal(logger, "bad SHUNT_MAX_CONCURRENT_RECONCILES: must be a positive integer")
+	}
 
 	if topic := os.Getenv("SHUNT_TOPIC"); topic != "" {
 		mgr := manager.New(fc, manager.Config{
@@ -201,8 +205,9 @@ func main() {
 			WebhookURL: webhookURL, WebhookSecret: webhookSecret,
 			InstanceURL: instance, PublicURL: publicURL, Token: token, BotUser: botUser, BotEmail: botEmail,
 			Metrics: metricsCollector, Checkpoint: checkpointStore, Lease: queueLease, LeaseHolderID: leaseHolderID, LeaseTTL: leaseTTL,
-			Logger:       baseLogger.With("component", "manager"),
-			EngineLogger: baseLogger.With("component", "engine"),
+			Logger:                  baseLogger.With("component", "manager"),
+			EngineLogger:            baseLogger.With("component", "engine"),
+			MaxConcurrentReconciles: maxConcurrentReconciles,
 		})
 		logger.Info("multi-repo mode", "topic", topic, "interval", interval)
 		if err := runDaemon(ctx, baseLogger, env("SHUNT_LISTEN", ":8080"), metricsCollector, webhook, interval, wake, func(ctx context.Context) {
