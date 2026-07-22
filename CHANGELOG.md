@@ -178,7 +178,9 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/rbtr/shunt/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/rbtr/shunt/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/rbtr/shunt/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rbtr/shunt/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rbtr/shunt/compare/v0.4.0...v0.4.1
