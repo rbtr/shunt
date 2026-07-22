@@ -35,6 +35,10 @@ type Config struct {
 	BisectFanout  int // max concurrent bisection staging runs (0 = 1)
 	QueueComments bool
 	BotUser       string
+	// ConfigSource describes whether this queue's settings came from a repo-level
+	// .shunt.yml file ("repo") or from process-global defaults ("default").
+	// Safe to expose in the /status JSON.
+	ConfigSource  string
 	Metrics       *metrics.Collector
 	Checkpoint    CheckpointStore
 	Lease         QueueLease
@@ -52,6 +56,8 @@ type activeBatch struct {
 	outcome       string
 	releasedPR    int
 	releasedAt    time.Time
+	phase         string    // "waiting_gate", "waiting_merge", or "bisecting"
+	phaseSince    time.Time // when the current phase started
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -95,6 +101,10 @@ type Engine struct {
 	baseGen        int
 	stagingSeq     int
 
+	// bisectOrigins tracks the first PR number of each pending candidate that was
+	// produced by bisection. Checked in startNext to set phase = "bisecting".
+	bisectOrigins map[int]bool
+
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
 	requeueStates         map[int]string
@@ -124,6 +134,7 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		logger:                logger,
 		now:                   time.Now,
 		queueFirstSeen:        map[int]time.Time{},
+		bisectOrigins:         map[int]bool{},
 		queueComments:         map[int]string{},
 		terminalQueueComments: map[int]string{},
 		requeueStates:         map[int]string{},
@@ -150,6 +161,12 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	if !held {
 		return nil
 	}
+	// Record reconcile duration only for the instance that holds the lease,
+	// to avoid standby instances skewing the histogram in HA deployments.
+	start := e.now()
+	defer func() {
+		e.cfg.Metrics.ObserveReconcileDuration(e.metricLabels(), e.now().Sub(start))
+	}()
 	if err := e.reconcileContextErr(ctx); err != nil {
 		return err
 	}
@@ -235,6 +252,7 @@ func (e *Engine) resetVolatileQueueState() {
 	e.active = nil
 	e.lingerSince = time.Time{}
 	e.queueFirstSeen = map[int]time.Time{}
+	e.bisectOrigins = map[int]bool{}
 	e.baseGen = 0
 	e.stagingSeq = 0
 	e.queueComments = map[int]string{}
@@ -343,6 +361,9 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		e.enqueue(ready)
+		if !e.lingerSince.IsZero() {
+			e.cfg.Metrics.ObserveLingerDuration(e.metricLabels(), e.now().Sub(e.lingerSince))
+		}
 		e.lingerSince = time.Time{}
 	}
 	cand := e.pending[0]
@@ -369,7 +390,19 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		}
 		return false, err
 	}
-	a := &activeBatch{prs: prs, stagingBranch: stagingBranch, stagingSHA: sha, baseGen: e.baseGen}
+	phase := "waiting_gate"
+	if e.bisectOrigins[cand[0]] {
+		phase = "bisecting"
+		delete(e.bisectOrigins, cand[0])
+	}
+	a := &activeBatch{
+		prs:           prs,
+		stagingBranch: stagingBranch,
+		stagingSHA:    sha,
+		baseGen:       e.baseGen,
+		phase:         phase,
+		phaseSince:    e.now(),
+	}
 	e.active = append(e.active, a)
 	e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
 	e.logger.Info("testing batch", "prs", numbersOf(prs), "stagingBranch", a.stagingBranch, "sha", short(sha))
@@ -426,6 +459,11 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				a.outcome = status
 				a.debugURL = debugURL
 				e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
+				e.cfg.Metrics.ObserveGateDuration(e.metricLabels(), status, e.now().Sub(a.phaseSince))
+				if status == "success" {
+					a.phase = "waiting_merge"
+					a.phaseSince = e.now()
+				}
 			default: // "", running, waiting, blocked -> keep waiting
 				continue
 			}
@@ -719,6 +757,9 @@ func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt tim
 }
 
 func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.PullRequest) {
+	if !a.releasedAt.IsZero() {
+		e.cfg.Metrics.ObserveNativeMergeDuration(e.metricLabels(), e.now().Sub(a.releasedAt))
+	}
 	e.cfg.Metrics.IncPRMerge(e.metricLabels())
 	e.observeQueueExit(staged.Number, "merged")
 	e.notifyPR(
@@ -802,9 +843,21 @@ func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status stri
 	mid := len(nums) / 2
 	first := append([]int(nil), nums[:mid]...)
 	second := append([]int(nil), nums[mid:]...)
+	e.markBisectOrigins(first[0], second[0])
 	e.enqueueWithState("retrying after gate "+status+"; isolating the batch", first, second)
 	e.logger.Info("batch failed; bisecting", "prs", nums, "status", status, "first", first, "second", second)
 	return true, nil
+}
+
+// markBisectOrigins records the first PR of each bisection sub-batch so that
+// startNext can set phase = "bisecting" when it stages them.
+func (e *Engine) markBisectOrigins(firstPRs ...int) {
+	if e.bisectOrigins == nil {
+		e.bisectOrigins = map[int]bool{}
+	}
+	for _, n := range firstPRs {
+		e.bisectOrigins[n] = true
+	}
 }
 
 func gateOutcomeStatus(status string) string {
@@ -950,11 +1003,24 @@ func (e *Engine) observeQueue() {
 	for _, cand := range e.pending {
 		pending = append(pending, append([]int(nil), cand...))
 	}
-	active := make([][]int, 0, len(e.active))
+	active := make([]metrics.ActiveBatchState, 0, len(e.active))
 	for _, a := range e.active {
-		active = append(active, numbersOf(a.prs))
+		active = append(active, metrics.ActiveBatchState{
+			PRs:        numbersOf(a.prs),
+			Phase:      a.phase,
+			PhaseSince: a.phaseSince,
+		})
 	}
-	e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active)
+	cfg := &metrics.EffectiveConfig{
+		ConfigSource: e.cfg.ConfigSource,
+		Base:         e.cfg.Base,
+		MergeStyle:   e.cfg.MergeStyle,
+		MaxBatch:     e.cfg.MaxBatch,
+		BatchLinger:  e.cfg.BatchLinger,
+		BatchTarget:  e.cfg.BatchTarget,
+		BisectFanout: e.cfg.BisectFanout,
+	}
+	e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active, e.lingerSince, cfg)
 	e.cfg.Metrics.ObserveQueueAge(e.metricLabels(), e.oldestQueueAge())
 }
 

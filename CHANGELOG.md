@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- Four new Prometheus histograms: `shunt_linger_seconds` (batch-linger window
+  duration), `shunt_gate_seconds{outcome}` (gate run duration), 
+  `shunt_native_merge_seconds` (forge auto-merge wait), and
+  `shunt_reconcile_seconds` (per-queue `Reconcile` call duration). Labels are
+  `{owner, repo, base}`; no high-cardinality PR-number labels are added.
+- Per-active-batch phase tracking in the engine: phases `waiting_gate`,
+  `waiting_merge`, and `bisecting` are set on staging and on gate-outcome
+  transitions, and are exposed in the JSON `/status` response.
+- Three additive fields in the `/status` JSON per-queue object
+  (`active_batch_states`, `linger_since`, `config`). The existing
+  `active_batches` and `pending_batches` fields remain `[][]int` and are
+  unchanged; existing consumers continue to work without modification.
+- `active_batch_states` carries per-batch `{prs, phase, phase_since}` for
+  consumers that want richer queue state.
+- `linger_since` (RFC3339) is present while the queue is in the
+  batch-linger accumulation window.
+- `config` exposes the safe resolved configuration subset: `config_source`
+  (`"repo"` or `"default"`), `base`, `merge_style`, `max_batch`,
+  `batch_linger`, `batch_target`, and `bisect_fanout`. Sensitive fields
+  (`token`, `instance_url`, `webhook_secret`, `bot_email`, `lease_holder_id`)
+  are intentionally excluded.
+
 ## [0.8.0] - 2026-07-21
 
 ### Security

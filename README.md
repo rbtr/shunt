@@ -202,20 +202,37 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 - `shunt_time_in_queue_seconds_bucket/_sum/_count{outcome="merged|bounced|dropped"}`
   histogram for process-local time from first queue observation until the PR
   leaves the queue.
+- `shunt_linger_seconds` — histogram of batch-linger window duration from when
+  the first ready PR appeared until the batch was formed.
+- `shunt_gate_seconds{outcome}` — histogram of gate run duration from staging
+  until a terminal outcome, labelled by outcome.
+- `shunt_native_merge_seconds` — histogram of time from releasing a PR to the
+  forge auto-merge worker until the merge was observed.
+- `shunt_reconcile_seconds` — histogram of per-queue `Reconcile` call duration.
 
 Logs are structured JSON on stdout, with stable fields such as `component`,
 `owner`, `repo`, and `base` where they apply. Metrics are process-local and
-intentionally minimal in v0.4: queue-age and time-in-queue observations restart
-from when the current process first sees a PR, and metrics do not include
-persisted history. Forge API rate limiting and health circuits are also
+restart when the process restarts; queue-age and time-in-queue observations
+start when the current process first sees a PR, and persisted history remains
+a roadmap item. Forge API rate limiting and health circuits are also
 process-local, including when queue ownership is coordinated through Postgres.
 
 `GET /status` exposes the process-local queue membership as JSON for lightweight
 ops surfaces that need more detail than counters. `GET /status.html` serves the
-same data as a small human-readable page. Both surfaces contain only queue
-identity (`owner`, `repo`, `base`), depth, active/pending PR-number batches, and
-whether any batch is active; they omit tokens, clone URLs, staging SHAs, and
-other internal details.
+same data as a small human-readable page.
+
+The core JSON shape is stable: `active_batches` and `pending_batches` remain
+`[][]int`. Three additive fields extend each queue object for richer consumers:
+
+- `active_batch_states` — per-active-batch phase detail:
+  `{prs, phase, phase_since}`. Phase is one of `waiting_gate`,
+  `waiting_merge`, or `bisecting`.
+- `linger_since` — RFC3339 timestamp present while the queue is in the
+  batch-linger accumulation window; absent otherwise.
+- `config` — safe resolved configuration: `{config_source, base, merge_style,
+  max_batch, batch_linger, batch_target, bisect_fanout}`. `config_source` is
+  `"repo"` when a `.shunt.yml` was found, `"default"` otherwise. Tokens,
+  URLs, bot credentials, and lease identifiers are intentionally excluded.
 
 Set `SHUNT_QUEUE_COMMENTS=true` to add a small PR-visible status surface. While a
 batch waits for the optional linger window, shunt posts a queued acknowledgement;

@@ -1927,6 +1927,271 @@ func TestDeadlinePreservesEarlierReconcileError(t *testing.T) {
 	}
 }
 
+// TestPhaseTracking verifies that active batches expose correct phase labels
+// through the metrics collector and that bisection sub-batches are tagged
+// "bisecting" while fresh batches are tagged "waiting_gate".
+func TestPhaseTracking(t *testing.T) {
+	m := newMock(1, 1, 2) // PR 1 is "bad"
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		BisectFanout: 2, Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	// First reconcile: stage the initial batch {1, 2}.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	snap := c.StatusSnapshot()
+	if len(snap.Queues) == 0 || len(snap.Queues[0].ActiveBatchStates) == 0 {
+		t.Fatalf("no active_batch_states after staging")
+	}
+	if got := snap.Queues[0].ActiveBatchStates[0].Phase; got != "waiting_gate" {
+		t.Fatalf("initial phase = %q, want %q", got, "waiting_gate")
+	}
+
+	// Second reconcile: gate fails, batch is bisected into {1} and {2}.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("gate fail reconcile: %v", err)
+	}
+
+	// Third reconcile: the two sub-batches get staged.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("bisect stage reconcile: %v", err)
+	}
+	snap2 := c.StatusSnapshot()
+	if len(snap2.Queues) == 0 {
+		t.Fatal("no queues after bisection")
+	}
+	q := snap2.Queues[0]
+	if len(q.ActiveBatchStates) == 0 {
+		t.Fatalf("no active_batch_states after bisection staging")
+	}
+	for i, s := range q.ActiveBatchStates {
+		if s.Phase != "bisecting" {
+			t.Fatalf("active_batch_states[%d].phase = %q, want %q", i, s.Phase, "bisecting")
+		}
+	}
+}
+
+// TestWaitingMergePhase verifies that a batch transitions to "waiting_merge"
+// after the gate passes.
+func TestWaitingMergePhase(t *testing.T) {
+	m := newMock(-1, 1) // no bad PR
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	// Stage the batch.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("stage reconcile: %v", err)
+	}
+	// Gate passes on this reconcile; land() releases PR and returns false.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("gate pass reconcile: %v", err)
+	}
+	snap := c.StatusSnapshot()
+	if len(snap.Queues) == 0 || len(snap.Queues[0].ActiveBatchStates) == 0 {
+		t.Fatalf("no active_batch_states while waiting for native merge")
+	}
+	if got := snap.Queues[0].ActiveBatchStates[0].Phase; got != "waiting_merge" {
+		t.Fatalf("phase after gate pass = %q, want %q", got, "waiting_merge")
+	}
+}
+
+// TestLingerSinceExposedInStatus verifies that linger_since appears in the JSON
+// status while the queue is in the batch-linger window.
+func TestLingerSinceExposedInStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		BatchLinger: 60 * time.Second, BatchTarget: 5, Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	// First reconcile: only 1 PR ready, target is 5, so we enter linger.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("linger reconcile: %v", err)
+	}
+	snap := c.StatusSnapshot()
+	if len(snap.Queues) == 0 {
+		t.Fatal("no queues after linger reconcile")
+	}
+	q := snap.Queues[0]
+	if q.LingerSince == nil {
+		t.Fatal("linger_since is nil while lingering")
+	}
+
+	// After linger window expires, linger_since should be nil.
+	now = now.Add(2 * time.Minute)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("post-linger reconcile: %v", err)
+	}
+	snap2 := c.StatusSnapshot()
+	if len(snap2.Queues) == 0 {
+		t.Fatal("no queues after staging")
+	}
+	if snap2.Queues[0].LingerSince != nil {
+		t.Fatalf("linger_since should be nil after batch staged, got %v", snap2.Queues[0].LingerSince)
+	}
+}
+
+// TestEffectiveConfigExposedInStatus verifies that the safe config subset
+// appears in the JSON status and contains no sensitive fields.
+func TestEffectiveConfigExposedInStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		MergeStyle: "squash", MaxBatch: 4, BatchLinger: 10 * time.Second,
+		BatchTarget: 2, BisectFanout: 3, ConfigSource: "repo",
+		Metrics: c,
+	}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	snap := c.StatusSnapshot()
+	if len(snap.Queues) == 0 {
+		t.Fatal("no queues after reconcile")
+	}
+	cfg := snap.Queues[0].Config
+	if cfg == nil {
+		t.Fatal("config is nil in status snapshot")
+	}
+	if cfg.ConfigSource != "repo" {
+		t.Fatalf("config_source = %q, want %q", cfg.ConfigSource, "repo")
+	}
+	if cfg.MergeStyle != "squash" {
+		t.Fatalf("merge_style = %q, want %q", cfg.MergeStyle, "squash")
+	}
+	if cfg.MaxBatch != 4 {
+		t.Fatalf("max_batch = %d, want 4", cfg.MaxBatch)
+	}
+	if cfg.BatchLinger != "10s" {
+		t.Fatalf("batch_linger = %q, want %q", cfg.BatchLinger, "10s")
+	}
+	if cfg.BatchTarget != 2 {
+		t.Fatalf("batch_target = %d, want 2", cfg.BatchTarget)
+	}
+	if cfg.BisectFanout != 3 {
+		t.Fatalf("bisect_fanout = %d, want 3", cfg.BisectFanout)
+	}
+}
+
+// TestGateDurationHistogram verifies that shunt_gate_seconds is observed after
+// a gate terminal outcome.
+func TestGateDurationHistogram(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	// Stage the batch.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// Advance time to simulate a gate run taking 5 minutes.
+	now = now.Add(5 * time.Minute)
+
+	// Gate passes.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("gate pass: %v", err)
+	}
+	assertMetric(t, c, `shunt_gate_seconds_count{owner="o",repo="r",base="main",outcome="success"} 1`)
+}
+
+// TestNativeMergeDurationHistogram verifies that shunt_native_merge_seconds is
+// observed when a PR is confirmed merged.
+func TestNativeMergeDurationHistogram(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	// Gate passes; land() releases PR and sets releasedAt.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("gate pass: %v", err)
+	}
+	// Advance time and confirm merge.
+	now = now.Add(30 * time.Second)
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("merge confirm: %v", err)
+	}
+	assertMetric(t, c, `shunt_native_merge_seconds_count{owner="o",repo="r",base="main"} 1`)
+}
+
+// TestReconcileDurationHistogram verifies that shunt_reconcile_seconds is
+// observed after every Reconcile call.
+func TestReconcileDurationHistogram(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		Metrics: c,
+	}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	assertMetric(t, c, `shunt_reconcile_seconds_count{owner="o",repo="r",base="main"} 1`)
+}
+
+// TestLingerDurationHistogram verifies that shunt_linger_seconds is observed
+// after a linger window expires and the batch is formed.
+func TestLingerDurationHistogram(t *testing.T) {
+	m := newMock(-1, 1)
+	c := metrics.New()
+	now := time.Unix(1000, 0)
+	e := New(Config{
+		Owner: "o", Repo: "r", Base: "main",
+		StatusCtx: "merge-queue", StagingBranch: "mq/main/staging",
+		BatchLinger: 30 * time.Second, BatchTarget: 5,
+		Metrics: c,
+	}, m, m)
+	e.now = func() time.Time { return now }
+
+	// Enter linger window.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("linger start: %v", err)
+	}
+
+	// Advance past linger window; batch forms and linger duration is observed.
+	now = now.Add(60 * time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("linger expire: %v", err)
+	}
+	assertMetric(t, c, `shunt_linger_seconds_count{owner="o",repo="r",base="main"} 1`)
+}
+
 type testQueueLease struct {
 	held  []bool
 	calls int

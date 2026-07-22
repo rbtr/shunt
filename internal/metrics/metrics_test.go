@@ -61,7 +61,10 @@ func TestLabelEscaping(t *testing.T) {
 func TestStatusHandlerExposesSafeQueueSnapshot(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: "octo", Repo: "widgets", Base: "main"}
-	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, [][]int{{1, 2}})
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, []ActiveBatchState{
+		{PRs: []int{1, 2}, Phase: "waiting_gate", PhaseSince: now},
+	}, time.Time{}, nil)
 
 	rr := httptest.NewRecorder()
 	c.StatusHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status", nil))
@@ -79,9 +82,12 @@ func TestStatusHandlerExposesSafeQueueSnapshot(t *testing.T) {
 	if len(raw.Queues) != 1 {
 		t.Fatalf("queues = %d, want 1 in %s", len(raw.Queues), body)
 	}
+	// Verify only safe fields appear. New fields active_batch_states, linger_since,
+	// and config are allowed; credentials and internal details are not.
 	allowed := map[string]bool{
 		"owner": true, "repo": true, "base": true, "queue_depth": true,
 		"active_batch": true, "active_batches": true, "pending_batches": true,
+		"active_batch_states": true, "linger_since": true, "config": true,
 	}
 	for key := range raw.Queues[0] {
 		if !allowed[key] {
@@ -112,10 +118,181 @@ func TestStatusHandlerExposesSafeQueueSnapshot(t *testing.T) {
 	}
 }
 
+// TestOldJSONShapeUnchanged is a regression test ensuring the backward-compatible
+// active_batches and pending_batches fields remain [][]int and are not altered.
+func TestOldJSONShapeUnchanged(t *testing.T) {
+	c := New()
+	labels := Labels{Owner: "o", Repo: "r", Base: "main"}
+	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, []ActiveBatchState{
+		{PRs: []int{1, 2}, Phase: "waiting_gate", PhaseSince: time.Now()},
+	}, time.Time{}, nil)
+
+	rr := httptest.NewRecorder()
+	c.StatusHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status", nil))
+
+	// Deserialize with a struct that uses only the old fields. If the type changed
+	// from [][]int to something else, this unmarshal would fail.
+	var raw struct {
+		Queues []struct {
+			ActiveBatches  [][]int `json:"active_batches"`
+			PendingBatches [][]int `json:"pending_batches"`
+		} `json:"queues"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("old-shape unmarshal failed: %v\nbody: %s", err, rr.Body.String())
+	}
+	if len(raw.Queues) != 1 {
+		t.Fatalf("queues = %d, want 1", len(raw.Queues))
+	}
+	if want := [][]int{{1, 2}}; !reflect.DeepEqual(raw.Queues[0].ActiveBatches, want) {
+		t.Fatalf("active_batches = %v, want %v", raw.Queues[0].ActiveBatches, want)
+	}
+	if want := [][]int{{3}, {4, 5}}; !reflect.DeepEqual(raw.Queues[0].PendingBatches, want) {
+		t.Fatalf("pending_batches = %v, want %v", raw.Queues[0].PendingBatches, want)
+	}
+}
+
+// TestNewStatusFieldsAppear verifies that active_batch_states, linger_since, and
+// config appear correctly in the JSON /status output.
+func TestNewStatusFieldsAppear(t *testing.T) {
+	c := New()
+	labels := Labels{Owner: "o", Repo: "r", Base: "main"}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	linger := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)
+	cfg := &EffectiveConfig{
+		ConfigSource: "repo",
+		Base:         "main",
+		MergeStyle:   "squash",
+		MaxBatch:     5,
+		BatchLinger:  30 * time.Second,
+		BatchTarget:  3,
+		BisectFanout: 2,
+	}
+	c.ObserveQueueStatus(labels, [][]int{{3}}, []ActiveBatchState{
+		{PRs: []int{1, 2}, Phase: "bisecting", PhaseSince: now},
+	}, linger, cfg)
+
+	snap := c.StatusSnapshot()
+	if len(snap.Queues) != 1 {
+		t.Fatalf("queues = %d, want 1", len(snap.Queues))
+	}
+	q := snap.Queues[0]
+
+	// active_batch_states
+	if len(q.ActiveBatchStates) != 1 {
+		t.Fatalf("active_batch_states len = %d, want 1", len(q.ActiveBatchStates))
+	}
+	s := q.ActiveBatchStates[0]
+	if want := []int{1, 2}; !reflect.DeepEqual(s.PRs, want) {
+		t.Fatalf("active_batch_states[0].prs = %v, want %v", s.PRs, want)
+	}
+	if s.Phase != "bisecting" {
+		t.Fatalf("phase = %q, want %q", s.Phase, "bisecting")
+	}
+	if s.PhaseSince != now.UTC().Format(time.RFC3339) {
+		t.Fatalf("phase_since = %q, want %q", s.PhaseSince, now.UTC().Format(time.RFC3339))
+	}
+
+	// linger_since
+	if q.LingerSince == nil {
+		t.Fatal("linger_since is nil, want non-nil")
+	}
+	if *q.LingerSince != linger.UTC().Format(time.RFC3339) {
+		t.Fatalf("linger_since = %q, want %q", *q.LingerSince, linger.UTC().Format(time.RFC3339))
+	}
+
+	// config
+	if q.Config == nil {
+		t.Fatal("config is nil, want non-nil")
+	}
+	if q.Config.ConfigSource != "repo" {
+		t.Fatalf("config_source = %q, want %q", q.Config.ConfigSource, "repo")
+	}
+	if q.Config.MergeStyle != "squash" {
+		t.Fatalf("merge_style = %q, want %q", q.Config.MergeStyle, "squash")
+	}
+	if q.Config.MaxBatch != 5 {
+		t.Fatalf("max_batch = %d, want 5", q.Config.MaxBatch)
+	}
+	if q.Config.BatchLinger != "30s" {
+		t.Fatalf("batch_linger = %q, want \"30s\"", q.Config.BatchLinger)
+	}
+	if q.Config.BatchTarget != 3 {
+		t.Fatalf("batch_target = %d, want 3", q.Config.BatchTarget)
+	}
+	if q.Config.BisectFanout != 2 {
+		t.Fatalf("bisect_fanout = %d, want 2", q.Config.BisectFanout)
+	}
+
+	// linger_since is absent when queue is not lingering
+	c2 := New()
+	c2.ObserveQueueStatus(labels, nil, nil, time.Time{}, nil)
+	snap2 := c2.StatusSnapshot()
+	if len(snap2.Queues) != 1 {
+		t.Fatalf("queues = %d, want 1", len(snap2.Queues))
+	}
+	if snap2.Queues[0].LingerSince != nil {
+		t.Fatalf("linger_since expected nil when not lingering, got %v", snap2.Queues[0].LingerSince)
+	}
+
+	// Confirm sensitive fields are absent from JSON
+	rr := httptest.NewRecorder()
+	c.StatusHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status", nil))
+	body := rr.Body.String()
+	for _, forbidden := range []string{"token", "instance_url", "webhook_secret", "bot_email", "lease_holder"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("status exposes forbidden field %q: %s", forbidden, body)
+		}
+	}
+}
+
+// TestPrometheusNewHistograms verifies that the four new histograms appear in /metrics.
+func TestPrometheusNewHistograms(t *testing.T) {
+	c := New()
+	labels := Labels{Owner: "o", Repo: "r", Base: "main"}
+	c.ObserveLingerDuration(labels, 45*time.Second)
+	c.ObserveGateDuration(labels, "success", 300*time.Second)
+	c.ObserveNativeMergeDuration(labels, 20*time.Second)
+	c.ObserveReconcileDuration(labels, 150*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"# TYPE shunt_linger_seconds histogram",
+		`shunt_linger_seconds_bucket{owner="o",repo="r",base="main",le="30"} 0`,
+		`shunt_linger_seconds_bucket{owner="o",repo="r",base="main",le="60"} 1`,
+		`shunt_linger_seconds_count{owner="o",repo="r",base="main"} 1`,
+		`shunt_linger_seconds_sum{owner="o",repo="r",base="main"} 45`,
+
+		"# TYPE shunt_gate_seconds histogram",
+		`shunt_gate_seconds_bucket{owner="o",repo="r",base="main",outcome="success",le="300"} 1`,
+		`shunt_gate_seconds_count{owner="o",repo="r",base="main",outcome="success"} 1`,
+		`shunt_gate_seconds_sum{owner="o",repo="r",base="main",outcome="success"} 300`,
+
+		"# TYPE shunt_native_merge_seconds histogram",
+		`shunt_native_merge_seconds_bucket{owner="o",repo="r",base="main",le="10"} 0`,
+		`shunt_native_merge_seconds_bucket{owner="o",repo="r",base="main",le="30"} 1`,
+		`shunt_native_merge_seconds_count{owner="o",repo="r",base="main"} 1`,
+
+		"# TYPE shunt_reconcile_seconds histogram",
+		`shunt_reconcile_seconds_bucket{owner="o",repo="r",base="main",le="0.1"} 0`,
+		`shunt_reconcile_seconds_bucket{owner="o",repo="r",base="main",le="0.25"} 1`,
+		`shunt_reconcile_seconds_count{owner="o",repo="r",base="main"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics output missing %q in:\n%s", want, body)
+		}
+	}
+}
+
 func TestStatusPageHandlerExposesHumanQueueSnapshot(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: "octo", Repo: "widgets", Base: "main"}
-	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, [][]int{{1, 2}})
+	c.ObserveQueueStatus(labels, [][]int{{3}, {4, 5}}, []ActiveBatchState{
+		{PRs: []int{1, 2}, Phase: "waiting_gate", PhaseSince: time.Now()},
+	}, time.Time{}, nil)
 
 	rr := httptest.NewRecorder()
 	c.StatusPageHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status.html", nil))
@@ -146,7 +323,7 @@ func TestStatusPageHandlerExposesHumanQueueSnapshot(t *testing.T) {
 func TestStatusPageHandlerEscapesQueueIdentity(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: `<script>`, Repo: `widgets&tools`, Base: `main"branch`}
-	c.ObserveQueueStatus(labels, [][]int{{1}}, nil)
+	c.ObserveQueueStatus(labels, [][]int{{1}}, nil, time.Time{}, nil)
 
 	rr := httptest.NewRecorder()
 	c.StatusPageHandler().ServeHTTP(rr, httptest.NewRequest("GET", "/status.html", nil))
@@ -168,10 +345,10 @@ func TestStatusSnapshotCopiesBatches(t *testing.T) {
 	c := New()
 	labels := Labels{Owner: "o", Repo: "r", Base: "main"}
 	pending := [][]int{{2, 3}}
-	active := [][]int{{1}}
-	c.ObserveQueueStatus(labels, pending, active)
+	active := []ActiveBatchState{{PRs: []int{1}, Phase: "waiting_gate"}}
+	c.ObserveQueueStatus(labels, pending, active, time.Time{}, nil)
 	pending[0][0] = 99
-	active[0][0] = 88
+	active[0].PRs[0] = 88
 
 	snap := c.StatusSnapshot()
 	if got, want := snap.Queues[0].PendingBatches, [][]int{{2, 3}}; !reflect.DeepEqual(got, want) {
@@ -179,6 +356,9 @@ func TestStatusSnapshotCopiesBatches(t *testing.T) {
 	}
 	if got, want := snap.Queues[0].ActiveBatches, [][]int{{1}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("active batches = %v, want %v", got, want)
+	}
+	if got, want := snap.Queues[0].ActiveBatchStates[0].PRs, []int{1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active_batch_states[0].prs = %v after caller mutation, want %v", got, want)
 	}
 
 	snap.Queues[0].PendingBatches[0][0] = 77

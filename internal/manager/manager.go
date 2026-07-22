@@ -80,7 +80,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	}
 	seen := make(map[string]bool, len(repos))
 	for _, r := range repos {
-		settings, err := m.repoSettings(ctx, r)
+		settings, configSource, err := m.repoSettings(ctx, r)
 		if err != nil {
 			if errors.Is(err, forge.ErrUnavailable) {
 				m.keepExistingRepo(seen, r.Owner, r.Name)
@@ -92,7 +92,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		}
 		k := keyOf(r.Owner, r.Name, settings.Base)
 		seen[k] = true
-		cfg := m.engineConfig(r, settings)
+		cfg := m.engineConfig(r, settings, configSource)
 		if existing, ok := m.engines[k]; ok && sameEngineConfig(existing.cfg, cfg) {
 			continue
 		}
@@ -146,7 +146,7 @@ func (m *Manager) Tick(ctx context.Context) {
 	}
 }
 
-func (m *Manager) repoSettings(ctx context.Context, r forge.RepoRef) (repoconfig.Settings, error) {
+func (m *Manager) repoSettings(ctx context.Context, r forge.RepoRef) (repoconfig.Settings, string, error) {
 	base := r.DefaultBranch
 	if base == "" {
 		base = "main"
@@ -162,15 +162,19 @@ func (m *Manager) repoSettings(ctx context.Context, r forge.RepoRef) (repoconfig
 	}
 	data, err := m.fc.ReadFile(ctx, r.Owner, r.Name, base, repoconfig.FileName)
 	if errors.Is(err, forge.ErrNotFound) {
-		return defaults, nil
+		return defaults, "default", nil
 	}
 	if err != nil {
-		return repoconfig.Settings{}, err
+		return repoconfig.Settings{}, "", err
 	}
-	return repoconfig.Apply(data, defaults)
+	settings, err := repoconfig.Apply(data, defaults)
+	if err != nil {
+		return repoconfig.Settings{}, "", err
+	}
+	return settings, "repo", nil
 }
 
-func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) engine.Config {
+func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings, configSource string) engine.Config {
 	return engine.Config{
 		Owner:         r.Owner,
 		Repo:          r.Name,
@@ -186,6 +190,7 @@ func (m *Manager) engineConfig(r forge.RepoRef, settings repoconfig.Settings) en
 		BisectFanout:  settings.BisectFanout,
 		QueueComments: m.cfg.QueueComments,
 		BotUser:       m.cfg.BotUser,
+		ConfigSource:  configSource,
 		Metrics:       m.cfg.Metrics,
 		Checkpoint:    m.cfg.Checkpoint,
 		Lease:         m.cfg.Lease,
