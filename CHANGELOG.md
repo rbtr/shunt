@@ -9,6 +9,22 @@ All notable changes to this project are documented here. The format is based on
 ## [0.9.0] - 2026-07-22
 
 ### Added
+- Per-engine lifecycle wrapper (`managedEngine`) carrying a lifetime context and
+  mutex. `Refresh()` now cancels the old engine's context and drains any
+  in-flight `Reconcile()` call before replacing or removing the engine, closing a
+  stale-checkpoint-write race that would have become exploitable once concurrent
+  ticks were enabled.
+- Bounded concurrent tick support via `SHUNT_MAX_CONCURRENT_RECONCILES` (default
+  `1`, preserving today's serial behaviour exactly). Values greater than `1` let
+  independent repo queues reconcile in parallel within one poll cycle, bounded by
+  an errgroup semaphore. The at-most-one-concurrent-`Reconcile`-per-engine
+  invariant is enforced with a per-engine `sync.Mutex`; a skipped tick logs a
+  warning rather than blocking.
+- Context propagation: each `Reconcile()` call derives its context from both the
+  process shutdown signal and the engine's own lifetime context so that either a
+  SIGTERM or an engine replacement cancels in-flight work promptly.
+
+### Added
 - Four new Prometheus histograms: `shunt_linger_seconds` (batch-linger window
   duration), `shunt_gate_seconds{outcome}` (gate run duration),
   `shunt_native_merge_seconds` (forge auto-merge wait), and

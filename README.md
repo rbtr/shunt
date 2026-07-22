@@ -116,6 +116,7 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BATCH_TARGET` | `0` | Start a lingering batch early once this many ready PRs are present (0 = wait the full linger window). |
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
+| `SHUNT_MAX_CONCURRENT_RECONCILES` | `1` | Maximum number of managed repos reconciled concurrently within a single poll tick. `1` (the default) preserves serial per-repo behaviour exactly and is safe for all deployments. Values greater than `1` improve throughput when many repos are managed and their reconciles are I/O-bound, but increase peak forge API usage proportionally. |
 | `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
 | `SHUNT_POSTGRES_DSN` | — | Optional Postgres DSN for durable queue checkpoints and replica coordination. Mutually exclusive with `SHUNT_STATE_PATH`; migrations are applied at startup. |
 | `SHUNT_QUEUE_LEASE_TTL` | `45s` | Postgres queue-ownership lease duration (at least `1µs`); renewed once per reconciliation tick, whose work is bounded to half this duration. |

@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rbtr/shunt/internal/engine"
 	"github.com/rbtr/shunt/internal/forge"
 	"github.com/rbtr/shunt/internal/metrics"
 )
@@ -315,4 +318,269 @@ func writeSatisfiedStagingProtection(t *testing.T, w http.ResponseWriter, r *htt
 		PushWhitelistTeams:      []string{},
 		PushWhitelistDeployKeys: false,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency-safety tests
+// ---------------------------------------------------------------------------
+
+// fakeReconciler is a controllable reconciler for concurrency tests.
+type fakeReconciler struct {
+	fn func(ctx context.Context) error
+}
+
+func (f *fakeReconciler) Reconcile(ctx context.Context) error {
+	if f.fn != nil {
+		return f.fn(ctx)
+	}
+	return nil
+}
+
+// newTestManager builds a Manager with no forge client, suitable for
+// white-box lifecycle tests that inject engines directly.
+func newTestManager(t *testing.T, maxConcurrent int) *Manager {
+	t.Helper()
+	return &Manager{
+		logger:        slog.Default(),
+		engines:       map[string]*managedEngine{},
+		maxConcurrent: maxConcurrent,
+		cfg:           Config{Metrics: metrics.New()},
+	}
+}
+
+// TestTickAtMostOneConcurrentReconcilePerEngine verifies that two overlapping
+// Tick calls for the same engine never produce concurrent Reconcile calls.
+// The second Tick must skip (not block or call Reconcile a second time) while
+// the first Tick's Reconcile is still in flight.
+func TestTickAtMostOneConcurrentReconcilePerEngine(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, 2) // concurrency > 1 so it's not the limiter
+
+	started := make(chan struct{})
+	gate := make(chan struct{})
+	var calls atomic.Int32
+	m.engines["o/r@main"] = newManagedEngine(&fakeReconciler{
+		fn: func(ctx context.Context) error {
+			calls.Add(1)
+			started <- struct{}{}
+			select {
+			case <-gate:
+			case <-ctx.Done():
+			}
+			return nil
+		},
+	}, engine.Config{})
+
+	// First Tick: starts a blocking Reconcile.
+	tick1Done := make(chan struct{})
+	go func() {
+		defer close(tick1Done)
+		m.Tick(context.Background())
+	}()
+
+	// Wait for the reconcile to be in flight.
+	<-started
+
+	// Second Tick while the first is still blocked: must skip, not block.
+	m.Tick(context.Background())
+
+	// Unblock the first Tick.
+	close(gate)
+	<-tick1Done
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("Reconcile called %d times, want exactly 1 (no concurrent overlap)", n)
+	}
+}
+
+// TestRefreshDrainsBeforeReplacement verifies that drain() blocks until any
+// in-flight Reconcile has returned, mirroring what Refresh does before
+// replacing or removing an engine.  The test exercises the drain path
+// directly (without concurrent map modification) because in the production
+// reconcile loop Refresh and Tick are always sequential: eg.Wait() in Tick
+// returns before Refresh ever touches the engines map.
+func TestRefreshDrainsBeforeReplacement(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	var reconcileFinished atomic.Bool
+
+	me := newManagedEngine(&fakeReconciler{
+		fn: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done() // blocks until drain() cancels via lifetimeCtx
+			reconcileFinished.Store(true)
+			return nil
+		},
+	}, engine.Config{})
+
+	// Simulate what Tick's goroutine does: hold mu for the Reconcile duration.
+	reconcileDone := make(chan struct{})
+	go func() {
+		defer close(reconcileDone)
+		if !me.mu.TryLock() {
+			t.Errorf("TryLock failed unexpectedly")
+			return
+		}
+		defer me.mu.Unlock()
+		rctx, rcancel := context.WithCancel(context.Background())
+		defer rcancel()
+		stop := context.AfterFunc(me.lifetimeCtx, rcancel)
+		defer stop()
+		_ = me.engine.Reconcile(rctx)
+	}()
+	<-started // Reconcile is now in flight
+
+	// drain() must: cancel the lifetime context (prompting Reconcile to exit
+	// via ctx.Done()), then block via mu.Lock() until Reconcile has returned.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		me.drain()
+	}()
+
+	select {
+	case <-drainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain() did not return promptly")
+	}
+	<-reconcileDone
+
+	if !reconcileFinished.Load() {
+		t.Error("Reconcile had not finished when drain() returned")
+	}
+}
+
+// TestTickConcurrentDifferentEngines verifies that with maxConcurrent > 1,
+// multiple engines run concurrently in a single Tick pass.
+// N blocking engines with maxConcurrent = N should all start within a short
+// window, not take N × block-duration.
+func TestTickConcurrentDifferentEngines(t *testing.T) {
+	t.Parallel()
+	const N = 3
+	m := newTestManager(t, N)
+
+	started := make(chan struct{}, N)
+	gate := make(chan struct{})
+	for i := range N {
+		key := "o/r" + strconv.Itoa(i) + "@main"
+		m.engines[key] = newManagedEngine(&fakeReconciler{
+			fn: func(ctx context.Context) error {
+				started <- struct{}{}
+				select {
+				case <-gate:
+				case <-ctx.Done():
+				}
+				return nil
+			},
+		}, engine.Config{})
+	}
+
+	tickDone := make(chan struct{})
+	go func() {
+		defer close(tickDone)
+		m.Tick(context.Background())
+	}()
+
+	// All N reconciles should start before Tick returns (concurrently).
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for range N {
+		select {
+		case <-started:
+		case <-timeout.C:
+			t.Fatal("timed out waiting for all engines to start concurrently")
+		}
+	}
+	// All N are running simultaneously — Tick is still blocked in eg.Wait().
+	select {
+	case <-tickDone:
+		t.Fatal("Tick returned before all engines were released")
+	default:
+	}
+
+	close(gate)
+	<-tickDone
+}
+
+// TestTickShutdownCancelsInFlightReconciles verifies that cancelling the
+// context passed to Tick causes in-flight Reconcile calls to exit promptly.
+func TestTickShutdownCancelsInFlightReconciles(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, 2)
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	m.engines["o/r@main"] = newManagedEngine(&fakeReconciler{
+		fn: func(ctx context.Context) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			close(cancelled)
+			return ctx.Err()
+		},
+	}, engine.Config{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tickDone := make(chan struct{})
+	go func() {
+		defer close(tickDone)
+		m.Tick(ctx)
+	}()
+
+	<-started
+	cancel() // simulate SIGTERM / process shutdown
+
+	select {
+	case <-tickDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Tick did not return promptly after context cancellation")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Error("Reconcile was not notified of context cancellation")
+	}
+}
+
+// TestTickEngineReplacementCancelsReconcile verifies that calling drain()
+// (engine replacement/removal) cancels the in-flight Reconcile via the engine's
+// lifetime context even if the process context is still live.
+func TestTickEngineReplacementCancelsReconcile(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, 1)
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	me := newManagedEngine(&fakeReconciler{
+		fn: func(ctx context.Context) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			close(cancelled)
+			return ctx.Err()
+		},
+	}, engine.Config{})
+	m.engines["o/r@main"] = me
+
+	// Use a live (non-cancelled) process context.
+	tickDone := make(chan struct{})
+	go func() {
+		defer close(tickDone)
+		m.Tick(context.Background())
+	}()
+	<-started
+
+	// Draining (as Refresh would do) should cancel the in-flight Reconcile.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		me.drain()
+	}()
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reconcile was not cancelled by engine drain")
+	}
+	<-drainDone
+	<-tickDone
 }
