@@ -94,7 +94,7 @@ func TestNewLeaseHolderID(t *testing.T) {
 
 func TestHTTPMuxServesHealthMetricsAndStatus(t *testing.T) {
 	c := metrics.New()
-	c.ObserveQueueStatus(metrics.Labels{Owner: "o", Repo: "r", Base: "main"}, [][]int{{2}}, [][]int{{1}})
+	c.ObserveQueueStatus(metrics.Labels{Owner: "o", Repo: "r", Base: "main"}, [][]int{{2}}, []metrics.ActiveBatchState{{PRs: []int{1}}}, time.Time{}, nil)
 	mux := newHTTPMux(c, webhookConfig{})
 
 	health := httptest.NewRecorder()

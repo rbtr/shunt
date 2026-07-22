@@ -226,12 +226,15 @@ func main() {
 	settings := repoconfig.Settings{
 		Base: base, StatusCtx: statusCtx, MergeStyle: mergeStyle, MaxBatch: maxBatch, BatchLinger: batchLinger, BatchTarget: batchTarget, BisectFanout: bisectFanout,
 	}
+	configSource := "default"
 	if data, err := fc.ReadFile(ctx, owner, repo, base, repoconfig.FileName); errors.Is(err, forge.ErrNotFound) {
 		// No per-repo config; keep global defaults.
 	} else if err != nil {
 		fatal(logger, "repo config read failed", "owner", owner, "repo", repo, "path", repoconfig.FileName, "error", err)
 	} else if settings, err = repoconfig.Apply(data, settings); err != nil {
 		fatal(logger, "repo config invalid", "owner", owner, "repo", repo, "path", repoconfig.FileName, "error", err)
+	} else {
+		configSource = "repo"
 	}
 	base = settings.Base
 	queueLogger := logger.With("owner", owner, "repo", repo, "base", base)
@@ -249,6 +252,7 @@ func main() {
 	eng := engine.New(engine.Config{
 		Owner: owner, Repo: repo, Base: base,
 		StatusCtx: settings.StatusCtx, MergeStyle: settings.MergeStyle, MaxBatch: settings.MaxBatch, BatchLinger: settings.BatchLinger, BatchTarget: settings.BatchTarget, BisectFanout: settings.BisectFanout, QueueComments: queueComments, BotUser: botUser,
+		ConfigSource:  configSource,
 		StagingBranch: "mq/" + base + "/staging", InstanceURL: instance, PublicURL: publicURL,
 		Metrics: metricsCollector, Checkpoint: checkpointStore, Lease: queueLease, LeaseHolderID: leaseHolderID, LeaseTTL: leaseTTL, Logger: baseLogger.With("component", "engine"),
 	}, fc, gitops.NewStager(cloneURL, botUser, token, botUser, botEmail))

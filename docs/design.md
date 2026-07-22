@@ -291,12 +291,79 @@ in-memory queue. They reset on restart, so queue-age and time-in-queue
 observations start when the current process first observes a PR; persisted
 metrics history remains a roadmap item.
 
+Four new histograms were added to sharpen operational visibility (see
+[Observability contract](#observability-contract) below for bucket choices):
+
+- `shunt_linger_seconds` — duration of the batch-linger window from when the
+  first ready PR appeared until the batch was formed.
+- `shunt_gate_seconds{outcome}` — duration of a gate run from batch staging
+  until a terminal outcome; labelled by outcome for P50/P99 split.
+- `shunt_native_merge_seconds` — time from releasing a PR to the forge
+  auto-merge worker until the PR was observed merged.
+- `shunt_reconcile_seconds` — wall-clock time spent in one `Reconcile` call
+  per queue.
+
+No PR-number or other high-cardinality labels are added to these histograms.
+Labels remain `{owner, repo, base}` (plus `outcome` for the gate histogram).
+
 The JSON status endpoint complements those counters with safe queue membership:
 owner, repo, base, depth, active/pending PR-number batches, and active-batch
 presence. `/status.html` renders the same data for humans. Both omit staging
-SHAs and runtime configuration. When `SHUNT_QUEUE_COMMENTS=true`, shunt also
-keeps one sticky status comment on each queued PR and updates terminal queue
-outcomes there.
+SHAs and credential-adjacent runtime configuration.
+
+Three additive fields were added to the per-queue JSON object (consumers that
+only read the old fields are unaffected; `active_batches` and `pending_batches`
+remain `[][]int`):
+
+- `active_batch_states` — per-active-batch phase detail:
+  `{prs: []int, phase: string, phase_since: RFC3339}`. Phases:
+  - `waiting_gate` — batch staged, gate test running.
+  - `waiting_merge` — gate passed, releasing PRs to forge auto-merge.
+  - `bisecting` — batch is a bisection sub-batch (gate test running on a split
+    candidate).
+- `linger_since` — RFC3339 timestamp of when the current batch-linger window
+  opened; absent (`null`) when the queue is not lingering.
+- `config` — safe resolved configuration subset:
+  `{config_source, base, merge_style, max_batch, batch_linger, batch_target,
+  bisect_fanout}`. `config_source` is `"repo"` when a `.shunt.yml` was found,
+  `"default"` otherwise. Sensitive fields (`token`, `bot_email`, `instance_url`,
+  `webhook_secret`, `lease_holder_id`) are intentionally excluded.
+
+When `SHUNT_QUEUE_COMMENTS=true`, shunt also keeps one sticky status comment on
+each queued PR and updates terminal queue outcomes there.
+
+## Observability contract
+
+### Phase set
+
+The engine tracks a durable per-active-batch phase across `Reconcile` ticks.
+Only phases observable *between* ticks are modelled; transient states within a
+single call are not. Phases:
+
+| Phase | Condition |
+|-------|-----------|
+| `waiting_gate` | Batch staged; gate test running (`outcome == ""`). |
+| `waiting_merge` | Gate passed (`outcome == "success"`); releasing to forge auto-merge. |
+| `bisecting` | Batch is a bisection sub-batch; gate test running. |
+
+Queue-level `linger_since` (not per-batch) is non-nil while `BatchLinger > 0`
+and the queue is accumulating PRs but has not yet staged a batch.
+
+### New histogram buckets
+
+| Histogram | Buckets (seconds) |
+|-----------|-------------------|
+| `shunt_linger_seconds` | 1, 5, 10, 30, 60, 120, 300, 600, 1800 |
+| `shunt_gate_seconds` | 60, 300, 900, 1800, 3600, 7200, 21600, 43200, 86400 |
+| `shunt_native_merge_seconds` | 10, 30, 60, 120, 300, 600, 1800 |
+| `shunt_reconcile_seconds` | 0.01, 0.05, 0.1, 0.25, 0.5, 1, 5, 10, 60 |
+
+### Safe config subset
+
+The `/status` `config` object exposes: `config_source`, `base`, `merge_style`,
+`max_batch`, `batch_linger`, `batch_target`, `bisect_fanout`. Excluded:
+`token`, `instance_url`, `public_url`, `webhook_secret`, `bot_user`,
+`bot_email`, `staging_branch`, `lease_holder_id`, `status_ctx`.
 
 ## Running against a real instance (safely)
 
