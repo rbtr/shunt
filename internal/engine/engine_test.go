@@ -210,6 +210,11 @@ func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) (bool, err
 	return true, nil
 }
 
+func (m *mock) DeleteBranch(_ context.Context, _, _, branch string) error {
+	m.calls = append(m.calls, "delete:"+branch)
+	return nil
+}
+
 func (m *mock) nextEventTime() time.Time {
 	m.eventSeq++
 	return time.Now().Add(time.Duration(m.eventSeq) * time.Nanosecond)

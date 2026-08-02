@@ -72,6 +72,7 @@ type ForgeAPI interface {
 	SetCommitStatus(ctx context.Context, owner, repo, sha, context, state, desc, targetURL string) error
 	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error
 	CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error)
+	DeleteBranch(ctx context.Context, owner, repo, branch string) error
 	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
 }
 
@@ -733,6 +734,14 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 	}
 
 	e.removeActive(a)
+
+	// ponytail: delete the staging branch now that all PRs have landed.
+	// Best-effort: 404 = already deleted, other errors = warning.
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
+		e.logger.Warn("failed to delete staging branch",
+			"branch", a.stagingBranch, "error", err)
+	}
+
 	return true, merged, nil
 }
 
@@ -835,6 +844,13 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) (bool, error) {
 	nums := numbersOf(a.prs)
 	e.removeActive(a)
+
+	// ponytail: failed batch — clean up its staging branch.
+	// Best-effort: 404 = already deleted, other errors = warning.
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
+		e.logger.Warn("failed to delete staging branch after gate failure",
+			"branch", a.stagingBranch, "error", err)
+	}
 
 	if len(nums) == 1 {
 		bounced := e.bounce(ctx, nums[0], a.prs[0].Head.Sha, fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)

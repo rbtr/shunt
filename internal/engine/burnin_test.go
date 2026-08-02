@@ -179,6 +179,10 @@ func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int)
 	return true, nil
 }
 
+func (b *burnInForge) DeleteBranch(_ context.Context, _, _, branch string) error {
+	return nil
+}
+
 func (b *burnInForge) Comment(_ context.Context, _, _ string, _ int, _ string) error {
 	return nil
 }
