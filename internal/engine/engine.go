@@ -70,7 +70,7 @@ type ForgeAPI interface {
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	SetCommitStatus(ctx context.Context, owner, repo, sha, context, state, desc, targetURL string) error
-	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error
+	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) (forge.ScheduleAutomergeResult, error)
 	CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error)
 	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
 }
@@ -317,28 +317,22 @@ func (e *Engine) queued(ctx context.Context, pr forge.PullRequest) (bool, error)
 }
 
 func (e *Engine) queueEligibility(ctx context.Context, pr forge.PullRequest) (bool, error) {
+	// If already scheduled, no need to ask Forgejo — the automerge event
+	// is the proof the PR met requirements when it was first admitted.
 	state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number)
 	if err != nil {
 		return false, err
 	}
-	if e.cfg.StatusCtx == "" || pr.Head.Sha == "" {
-		return state.Scheduled, nil
+	if state.Scheduled {
+		return true, nil
 	}
-	status, ok, err := e.fc.LatestCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx)
+	// Not scheduled — ask Forgejo to admit it; it will reject if merge
+	// requirements (e.g. missing approvals) are not met.
+	result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
 	if err != nil {
 		return false, err
 	}
-	if state.Scheduled {
-		if ok &&
-			(status.Status == "error" || status.Status == "failure") &&
-			!status.CreatedAt.IsZero() &&
-			!state.UpdatedAt.IsZero() &&
-			status.CreatedAt.After(state.UpdatedAt) {
-			return false, nil
-		}
-		return true, nil
-	}
-	return false, nil
+	return result.Eligible, nil
 }
 
 func (e *Engine) startNext(ctx context.Context) (bool, error) {
@@ -740,7 +734,14 @@ func (e *Engine) scheduleAutomerge(ctx context.Context, pr forge.PullRequest) er
 	if pr.State != "open" || pr.Merged {
 		return nil
 	}
-	return e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
+	result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
+	if err != nil {
+		return err
+	}
+	if !result.Eligible {
+		return fmt.Errorf("forge rejected auto-merge for PR #%d", pr.Number)
+	}
+	return nil
 }
 
 func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt time.Time) bool {
