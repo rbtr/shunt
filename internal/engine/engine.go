@@ -271,6 +271,32 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	}
 	var nums []int
 	for _, p := range prs {
+		// Quick check: if the PR is not scheduled, it was likely a bounced
+		// or cancelled PR — skip without the admission gate.
+		state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, p.Number)
+		if err != nil {
+			return nil, err
+		}
+		if !state.Scheduled {
+			e.logger.Info("PR not eligible for merge queue", "pr", p.Number, "reason", "not scheduled")
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
+		// Admission gate: ask Forgejo to accept the PR into the merge queue.
+		// For PRs already scheduled, Forgejo returns 409 (already scheduled) → eligible.
+		// For new PRs, Forgejo validates merge requirements (e.g. approvals) and
+		// returns 422 if the PR doesn't meet them.
+		result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, p.Number, e.cfg.MergeStyle, p.Head.Sha)
+		if err != nil {
+			e.logger.Info("PR not eligible for merge queue", "pr", p.Number, "error", err)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
+		if !result.Eligible {
+			e.logger.Info("PR rejected by forge for merge queue", "pr", p.Number)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
 		ok, err := e.queued(ctx, p)
 		if err != nil {
 			return nil, err
@@ -299,6 +325,17 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 			e.observeQueueExit(n, "dropped")
 			continue
 		}
+		// Fast-fail for bounced/cancelled PRs — don't call ScheduleAutomerge
+		// (which is an admission gate for new PRs) just to re-check already-bounced ones.
+		state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, n)
+		if err != nil {
+			return nil, err
+		}
+		if !state.Scheduled {
+			e.logger.Info("dropping PR in resolve: not scheduled", "pr", n)
+			e.observeQueueExit(n, "dropped")
+			continue
+		}
 		ok, err := e.queued(ctx, pr)
 		if err != nil {
 			return nil, err
@@ -317,22 +354,11 @@ func (e *Engine) queued(ctx context.Context, pr forge.PullRequest) (bool, error)
 }
 
 func (e *Engine) queueEligibility(ctx context.Context, pr forge.PullRequest) (bool, error) {
-	// If already scheduled, no need to ask Forgejo — the automerge event
-	// is the proof the PR met requirements when it was first admitted.
 	state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number)
 	if err != nil {
 		return false, err
 	}
-	if state.Scheduled {
-		return true, nil
-	}
-	// Not scheduled — ask Forgejo to admit it; it will reject if merge
-	// requirements (e.g. missing approvals) are not met.
-	result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
-	if err != nil {
-		return false, err
-	}
-	return result.Eligible, nil
+	return state.Scheduled, nil
 }
 
 func (e *Engine) startNext(ctx context.Context) (bool, error) {

@@ -441,6 +441,7 @@ func TestQueueStatusCommentsMarkCancelledAutomergeRequeued(t *testing.T) {
 	m.automerge[1] = false
 	m.scheduleLive[1] = false
 	m.automergeAt[1] = m.nextEventTime()
+	m.scheduleRejected = true
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("requeue cancelled auto-merge: %v", err)
@@ -789,7 +790,7 @@ func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
 		t.Fatalf("statuses before first merge = %s, want only PR 1 released", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[status:pending status:success]" {
+	if got := fmt.Sprint(m.calls); got != "[schedule:1 schedule:2 status:pending status:success]" {
 		t.Fatalf("landing calls = %s, want status-only native release", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
@@ -946,7 +947,7 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
 		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[status:pending status:success status:error schedule:1 status:pending]" {
+	if got := fmt.Sprint(m.calls); got != "[schedule:1 status:pending status:success status:error schedule:1 status:pending]" {
 		t.Fatalf("recovery calls = %s, want eligibility + error, schedule, pending", got)
 	}
 	if got := fmt.Sprint(m.scheduled); got != "[1]" {
