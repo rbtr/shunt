@@ -152,6 +152,13 @@ type AutomergeState struct {
 	UpdatedAt time.Time
 }
 
+// ScheduleAutomergeResult captures the outcome of a ScheduleAutomerge attempt.
+type ScheduleAutomergeResult struct {
+	// Eligible is true when Forgejo accepted the schedule request.
+	// false means Forgejo rejected it (e.g., missing approvals, conflicts).
+	Eligible bool
+}
+
 type CommitStatus struct {
 	ID          int64     `json:"id"`
 	Status      string    `json:"status"`
@@ -484,18 +491,27 @@ func (c *Client) SetCommitStatus(ctx context.Context, owner, repo, sha, statusCo
 	}, nil)
 }
 
-func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error {
-	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), map[string]any{
-		"Do":                        style,
-		"head_commit_id":            headSHA,
-		"merge_when_checks_succeed": true,
-	}, nil)
-	if err != nil &&
-		strings.Contains(err.Error(), "http 409") &&
-		strings.Contains(strings.ToLower(err.Error()), "already scheduled") {
-		return nil
+func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) (ScheduleAutomergeResult, error) {
+	_, _, err := c.request(ctx, http.MethodPost,
+		fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index),
+		map[string]any{
+			"Do":                        style,
+			"head_commit_id":            headSHA,
+			"merge_when_checks_succeed": true,
+		})
+	if err != nil {
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) && statusErr.status == http.StatusConflict &&
+			strings.Contains(strings.ToLower(string(statusErr.body)), "already scheduled") {
+			// Already scheduled — the user clicked "merge when checks succeed".
+			// This is a valid eligibility signal.
+			return ScheduleAutomergeResult{Eligible: true}, nil
+		}
+		// Other errors (422, network, auth) — pass through.
+		return ScheduleAutomergeResult{Eligible: false}, err
 	}
-	return err
+	// 201 Created — schedule accepted.
+	return ScheduleAutomergeResult{Eligible: true}, nil
 }
 
 // CancelAutomerge reports whether a live scheduled merge was removed.

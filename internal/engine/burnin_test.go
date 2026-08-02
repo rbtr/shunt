@@ -166,9 +166,9 @@ func (b *burnInForge) SetCommitStatus(_ context.Context, _, _, sha, _, state, _,
 	return nil
 }
 
-func (b *burnInForge) ScheduleAutomerge(_ context.Context, _, _ string, index int, _, _ string) error {
+func (b *burnInForge) ScheduleAutomerge(_ context.Context, _, _ string, index int, _, _ string) (forge.ScheduleAutomergeResult, error) {
 	b.automerge[index] = true
-	return nil
+	return forge.ScheduleAutomergeResult{Eligible: true}, nil
 }
 
 func (b *burnInForge) CancelAutomerge(_ context.Context, _, _ string, index int) (bool, error) {

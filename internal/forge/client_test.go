@@ -26,8 +26,12 @@ func TestScheduleAutomergeSendsQueuedMergeRequest(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	if err := c.ScheduleAutomerge(context.Background(), "o", "r", 7, "rebase", "abc123"); err != nil {
+	result, err := c.ScheduleAutomerge(context.Background(), "o", "r", 7, "rebase", "abc123")
+	if err != nil {
 		t.Fatalf("ScheduleAutomerge: %v", err)
+	}
+	if !result.Eligible {
+		t.Fatalf("expected eligible result")
 	}
 	if got["Do"] != "rebase" || got["head_commit_id"] != "abc123" || got["merge_when_checks_succeed"] != true {
 		t.Fatalf("request body = %#v", got)
@@ -41,8 +45,12 @@ func TestScheduleAutomergeTreatsAlreadyScheduledAsSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "token")
-	if err := c.ScheduleAutomerge(context.Background(), "o", "r", 7, "rebase", "abc123"); err != nil {
+	result, err := c.ScheduleAutomerge(context.Background(), "o", "r", 7, "rebase", "abc123")
+	if err != nil {
 		t.Fatalf("ScheduleAutomerge: %v", err)
+	}
+	if !result.Eligible {
+		t.Fatalf("expected eligible result for already-scheduled PR")
 	}
 }
 

@@ -41,6 +41,7 @@ type mock struct {
 	queueComments        map[int][]string
 	runURLs              map[string]string
 	scheduled            []int
+	scheduleRejected     bool
 	calls                []string
 	eventSeq             int64
 	beforeNative         func(int)
@@ -92,6 +93,7 @@ func (m *mock) ListOpenPRs(_ context.Context, _, _, _ string) ([]forge.PullReque
 			out = append(out, *pr)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
 	return out, nil
 }
 func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, error) {
@@ -187,16 +189,19 @@ func (m *mock) RunTargetURL(_ context.Context, _, _, sha, _ string) (string, err
 	return m.runURLs[sha], nil
 }
 
-func (m *mock) ScheduleAutomerge(_ context.Context, _, _ string, n int, _, _ string) error {
+func (m *mock) ScheduleAutomerge(_ context.Context, _, _ string, n int, _, _ string) (forge.ScheduleAutomergeResult, error) {
 	m.calls = append(m.calls, fmt.Sprintf("schedule:%d", n))
+	if m.scheduleRejected {
+		return forge.ScheduleAutomergeResult{Eligible: false}, nil
+	}
 	if m.scheduleLive[n] {
-		return nil
+		return forge.ScheduleAutomergeResult{Eligible: true}, nil
 	}
 	m.scheduled = append(m.scheduled, n)
 	m.automerge[n] = true
 	m.scheduleLive[n] = true
 	m.automergeAt[n] = m.nextEventTime()
-	return nil
+	return forge.ScheduleAutomergeResult{Eligible: true}, nil
 }
 
 func (m *mock) CancelAutomerge(_ context.Context, _, _ string, n int) (bool, error) {
@@ -441,6 +446,7 @@ func TestQueueStatusCommentsMarkCancelledAutomergeRequeued(t *testing.T) {
 	m.automerge[1] = false
 	m.scheduleLive[1] = false
 	m.automergeAt[1] = m.nextEventTime()
+	m.scheduleRejected = true
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("requeue cancelled auto-merge: %v", err)
@@ -789,7 +795,7 @@ func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
 		t.Fatalf("statuses before first merge = %s, want only PR 1 released", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[status:pending status:success]" {
+	if got := fmt.Sprint(m.calls); got != "[schedule:1 schedule:2 status:pending status:success]" {
 		t.Fatalf("landing calls = %s, want status-only native release", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
@@ -946,8 +952,8 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
 		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[status:pending status:success status:error schedule:1 status:pending]" {
-		t.Fatalf("recovery calls = %s, want error, schedule, pending", got)
+	if got := fmt.Sprint(m.calls); got != "[schedule:1 status:pending status:success status:error schedule:1 status:pending]" {
+		t.Fatalf("recovery calls = %s, want eligibility + error, schedule, pending", got)
 	}
 	if got := fmt.Sprint(m.scheduled); got != "[1]" {
 		t.Fatalf("restored schedules = %s, want [1]", got)
@@ -1017,6 +1023,7 @@ func TestNativeMergeTimeoutDoesNotResurrectCancellation(t *testing.T) {
 	m.scheduleLive[1] = false
 	m.automerge[1] = false
 	m.automergeAt[1] = m.nextEventTime()
+	m.scheduleRejected = true
 	now = now.Add(nativeMergeTimeout + time.Second)
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("observe cancellation: %v", err)
@@ -1133,6 +1140,8 @@ func TestStaleLandingSuccessFromOlderVersionIsRecovered(t *testing.T) {
 
 func TestNewerTerminalStatusSuppressesOrphanedScheduleEvent(t *testing.T) {
 	m := newMock(-1, 1)
+	m.automerge[1] = false
+	m.scheduleLive[1] = false
 	m.latestStatus[1] = forge.CommitStatus{
 		ID:          200,
 		Status:      "error",
@@ -1140,6 +1149,7 @@ func TestNewerTerminalStatusSuppressesOrphanedScheduleEvent(t *testing.T) {
 		Context:     "merge-queue",
 		CreatedAt:   m.automergeAt[1].Add(time.Second),
 	}
+	m.scheduleRejected = true
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
 	if err := e.Reconcile(context.Background()); err != nil {
@@ -1175,6 +1185,7 @@ func TestCancellationAfterLandingClaimIsNotRecovered(t *testing.T) {
 	m := newMock(-1, 1)
 	m.automerge[1] = false
 	m.scheduleLive[1] = false
+	m.scheduleRejected = true
 	m.latestStatus[1] = forge.CommitStatus{
 		ID:          200,
 		Status:      "pending",
@@ -1352,6 +1363,7 @@ func TestLandSkipsCancelledAutomerge(t *testing.T) {
 		t.Fatalf("start batch: %v", err)
 	}
 	m.automerge[1] = false
+	m.scheduleRejected = true
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("land batch: %v", err)
 	}

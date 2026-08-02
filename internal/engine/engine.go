@@ -70,7 +70,7 @@ type ForgeAPI interface {
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	SetCommitStatus(ctx context.Context, owner, repo, sha, context, state, desc, targetURL string) error
-	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) error
+	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) (forge.ScheduleAutomergeResult, error)
 	CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error)
 	DeleteBranch(ctx context.Context, owner, repo, branch string) error
 	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
@@ -272,6 +272,32 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	}
 	var nums []int
 	for _, p := range prs {
+		// Quick check: if the PR is not scheduled, it was likely a bounced
+		// or cancelled PR — skip without the admission gate.
+		state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, p.Number)
+		if err != nil {
+			return nil, err
+		}
+		if !state.Scheduled {
+			e.logger.Info("PR not eligible for merge queue", "pr", p.Number, "reason", "not scheduled")
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
+		// Admission gate: ask Forgejo to accept the PR into the merge queue.
+		// For PRs already scheduled, Forgejo returns 409 (already scheduled) → eligible.
+		// For new PRs, Forgejo validates merge requirements (e.g. approvals) and
+		// returns 422 if the PR doesn't meet them.
+		result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, p.Number, e.cfg.MergeStyle, p.Head.Sha)
+		if err != nil {
+			e.logger.Info("PR not eligible for merge queue", "pr", p.Number, "error", err)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
+		if !result.Eligible {
+			e.logger.Info("PR rejected by forge for merge queue", "pr", p.Number)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
 		ok, err := e.queued(ctx, p)
 		if err != nil {
 			return nil, err
@@ -300,6 +326,17 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 			e.observeQueueExit(n, "dropped")
 			continue
 		}
+		// Fast-fail for bounced/cancelled PRs — don't call ScheduleAutomerge
+		// (which is an admission gate for new PRs) just to re-check already-bounced ones.
+		state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, n)
+		if err != nil {
+			return nil, err
+		}
+		if !state.Scheduled {
+			e.logger.Info("dropping PR in resolve: not scheduled", "pr", n)
+			e.observeQueueExit(n, "dropped")
+			continue
+		}
 		ok, err := e.queued(ctx, pr)
 		if err != nil {
 			return nil, err
@@ -322,24 +359,7 @@ func (e *Engine) queueEligibility(ctx context.Context, pr forge.PullRequest) (bo
 	if err != nil {
 		return false, err
 	}
-	if e.cfg.StatusCtx == "" || pr.Head.Sha == "" {
-		return state.Scheduled, nil
-	}
-	status, ok, err := e.fc.LatestCommitStatus(ctx, e.cfg.Owner, e.cfg.Repo, pr.Head.Sha, e.cfg.StatusCtx)
-	if err != nil {
-		return false, err
-	}
-	if state.Scheduled {
-		if ok &&
-			(status.Status == "error" || status.Status == "failure") &&
-			!status.CreatedAt.IsZero() &&
-			!state.UpdatedAt.IsZero() &&
-			status.CreatedAt.After(state.UpdatedAt) {
-			return false, nil
-		}
-		return true, nil
-	}
-	return false, nil
+	return state.Scheduled, nil
 }
 
 func (e *Engine) startNext(ctx context.Context) (bool, error) {
@@ -749,7 +769,14 @@ func (e *Engine) scheduleAutomerge(ctx context.Context, pr forge.PullRequest) er
 	if pr.State != "open" || pr.Merged {
 		return nil
 	}
-	return e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
+	result, err := e.fc.ScheduleAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, pr.Number, e.cfg.MergeStyle, pr.Head.Sha)
+	if err != nil {
+		return err
+	}
+	if !result.Eligible {
+		return fmt.Errorf("forge rejected auto-merge for PR #%d", pr.Number)
+	}
+	return nil
 }
 
 func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt time.Time) bool {
