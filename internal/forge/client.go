@@ -492,7 +492,7 @@ func (c *Client) SetCommitStatus(ctx context.Context, owner, repo, sha, statusCo
 }
 
 func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) (ScheduleAutomergeResult, error) {
-	data, status, err := c.request(ctx, http.MethodPost,
+	_, _, err := c.request(ctx, http.MethodPost,
 		fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index),
 		map[string]any{
 			"Do":                        style,
@@ -500,7 +500,9 @@ func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, inde
 			"merge_when_checks_succeed": true,
 		})
 	if err != nil {
-		if status == http.StatusConflict && strings.Contains(strings.ToLower(string(data)), "already scheduled") {
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) && statusErr.status == http.StatusConflict &&
+			strings.Contains(strings.ToLower(string(statusErr.body)), "already scheduled") {
 			// Already scheduled — the user clicked "merge when checks succeed".
 			// This is a valid eligibility signal.
 			return ScheduleAutomergeResult{Eligible: true}, nil
