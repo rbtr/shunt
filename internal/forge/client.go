@@ -507,6 +507,17 @@ func (c *Client) CancelAutomerge(ctx context.Context, owner, repo string, index 
 	return err == nil, err
 }
 
+// DeleteBranch removes the named branch from the repository.
+// A 404 response is treated as success (branch already deleted).
+func (c *Client) DeleteBranch(ctx context.Context, owner, repo, branch string) error {
+	_, err := c.doRaw(ctx, http.MethodDelete,
+		fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 func (c *Client) Comment(ctx context.Context, owner, repo string, index int, body string) error {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repoPath(owner, repo), index), map[string]string{"body": body}, nil)
 }
