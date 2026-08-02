@@ -6,9 +6,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-07-22
+### Fixed
+
+- Dangling merge-queue staging branches: `land()` now deletes the staging
+  branch after all PRs in a batch have landed, and `bisectOrBounce()` deletes
+  it immediately after `removeActive()` when a batch fails or bounces, covering
+  both success and failure paths.
 
 ### Added
+
+- Forgejo-native approval admission gate in `readyNumbers`: PRs entering the
+  queue are validated against Forgejo's merge requirements (required reviews,
+  status checks) via `ScheduleAutomerge`. Forgejo rejects (422) PRs that do not
+  meet these requirements; already-scheduled PRs are accepted (409). Bounced or
+  cancelled PRs (no automerge scheduled) are skipped without re-calling
+  Forgejo, preventing infinite bounce loops during checkpoint recovery.
+
+## [0.11.0] - 2026-08-02
+
+### Added
+
 - Per-engine lifecycle wrapper (`managedEngine`) carrying a lifetime context and
   mutex. `Refresh()` now cancels the old engine's context and drains any
   in-flight `Reconcile()` call before replacing or removing the engine, closing a
@@ -25,6 +42,7 @@ All notable changes to this project are documented here. The format is based on
   SIGTERM or an engine replacement cancels in-flight work promptly.
 
 ### Added
+
 - Four new Prometheus histograms: `shunt_linger_seconds` (batch-linger window
   duration), `shunt_gate_seconds{outcome}` (gate run duration),
   `shunt_native_merge_seconds` (forge auto-merge wait), and
@@ -50,6 +68,7 @@ All notable changes to this project are documented here. The format is based on
 ## [0.8.0] - 2026-07-21
 
 ### Security
+
 - Bumped the indirect `golang.org/x/text` dependency (pulled in via
   `jackc/pgx/v5`) to v0.39.0, fixing
   [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970), an infinite loop on
@@ -57,27 +76,32 @@ All notable changes to this project are documented here. The format is based on
   checkpoint backend.
 
 ### Added
+
 - Sticky queue comments now acknowledge queued auto-merge requests during batch
   linger and distinguish retries/requeues from terminal outcomes.
 
 ### Changed
+
 - Queue comment copy now explains the separate sticky status and durable outcome
   comments maintained for a PR.
 
 ## [0.7.0] - 2026-07-17
 
 ### Added
+
 - Postgres-backed queue ownership leases, renewed at each reconciliation tick,
   to coordinate a queue across replicas. A takeover reloads durable state and
   re-stages active work.
 
 ### Changed
+
 - Forge outage and rate-limit cooldowns now quietly defer queue work and
   multi-repository discovery until the process-local Forge client recovers.
 
 ## [0.6.0] - 2026-07-17
 
 ### Fixed
+
 - Delegated final landing to the forge's scheduled auto-merge worker and
   released passing PRs one at a time.
 - Requeued PRs when native auto-merge consumed a schedule without completing
@@ -92,14 +116,17 @@ All notable changes to this project are documented here. The format is based on
 ## [0.5.0] - 2026-07-11
 
 ### Added
+
 - shunt now creates bot-only branch protection for its `mq/<base>/staging*`
   staging refs.
 
 ### Changed
+
 - Staging refs are immutable per attempt and retained for audit/debug links
   instead of being force-pushed and deleted between queue runs.
 
 ### Fixed
+
 - Active staging batches are abandoned and re-staged as soon as a queued PR's
   head changes, instead of waiting for the stale gate run to finish.
 - Build and release toolchains now require Go 1.25.12, which includes the latest
@@ -108,12 +135,14 @@ All notable changes to this project are documented here. The format is based on
 ## [0.4.1] - 2026-06-26
 
 ### Fixed
+
 - Managed webhook setup now adopts same-URL Forgejo-typed JSON hooks instead of
   creating a duplicate Gitea-typed hook.
 
 ## [0.4.0] - 2026-06-25
 
 ### Added
+
 - Structured JSON logging with stable fields for daemon lifecycle, webhook,
   manager, and queue events.
 - JSON `/status` endpoint with safe process-local queue identity, depth, and
@@ -137,6 +166,7 @@ All notable changes to this project are documented here. The format is based on
   staging, failed batch bisection, bad-PR bounce, and good-PR landings.
 
 ### Fixed
+
 - Reconcile, checkpoint, forge API, and git staging operations now receive the
   process context so shutdown can cancel in-flight work cleanly.
 - Forgejo Actions readiness now prefers the run-level aggregate status before
@@ -144,6 +174,7 @@ All notable changes to this project are documented here. The format is based on
   are still being materialized.
 
 ### Changed
+
 - Raised the minimum supported Go version to 1.25 and added CI race/vulnerability
   checks.
 
@@ -155,6 +186,7 @@ and clearer queue visibility. It also fixes Forgejo task-status aggregation so
 multi-job checks are interpreted correctly.
 
 ### Added
+
 - `/webhook` endpoint support for auto-merge, pull-request, review, status, and
   push events. Webhooks wake reconciliation promptly while the poll loop remains
   as a backstop.
@@ -168,6 +200,7 @@ multi-job checks are interpreted correctly.
   correctness.
 
 ### Fixed
+
 - Forgejo action-task aggregation now treats a commit as successful only when
   all relevant task statuses have succeeded, avoiding false positives from
   mixed job results.
@@ -179,6 +212,7 @@ correctness under real traffic, intentional batching, observability, and broader
 Forgejo/Gitea merge-method support.
 
 ### Added
+
 - Prometheus `/metrics` endpoint with queue depth, active batch presence,
   batches started, PR merges, bounces, staging conflicts, reconcile errors, and
   terminal gate outcome counters.
@@ -190,6 +224,7 @@ Forgejo/Gitea merge-method support.
   the existing merge-commit behavior.
 
 ### Changed
+
 - Staging conflicts now preserve queue order: if a later PR conflicts with an
   earlier batch-mate, shunt tests the earlier prefix first and retries the
   conflicting suffix against the real current base before bouncing anything.
@@ -203,6 +238,7 @@ Forgejo/Gitea merge-method support.
 Initial release.
 
 ### Added
+
 - Rollup-batch + **bisection** merge queue for Forgejo (Gitea-compatible API).
 - Auto-merge-button trigger — PRs enter the queue via "Merge when checks
   succeed", detected from the PR timeline. No bot commands.
@@ -215,11 +251,13 @@ Initial release.
 - Mock-driven unit tests for the bisection state machine.
 
 ### Security
+
 - Git remotes are kept credential-free; staging pushes authenticate through
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/rbtr/shunt/compare/v0.9.0...v0.11.0
 [0.9.0]: https://github.com/rbtr/shunt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/rbtr/shunt/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/rbtr/shunt/compare/v0.6.0...v0.7.0
