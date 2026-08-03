@@ -102,6 +102,9 @@ func New() *Collector {
 
 // Handler returns an HTTP handler for the Prometheus text endpoint.
 func (c *Collector) Handler() http.Handler {
+	if c == nil {
+		return nil
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		c.WritePrometheus(w)
@@ -110,6 +113,9 @@ func (c *Collector) Handler() http.Handler {
 
 // StatusHandler returns an HTTP handler for the JSON queue status endpoint.
 func (c *Collector) StatusHandler() http.Handler {
+	if c == nil {
+		return nil
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(c.StatusSnapshot()); err != nil {
@@ -120,6 +126,9 @@ func (c *Collector) StatusHandler() http.Handler {
 
 // StatusPageHandler returns a small human-readable queue status page.
 func (c *Collector) StatusPageHandler() http.Handler {
+	if c == nil {
+		return nil
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statusPageTemplate.Execute(w, c.StatusSnapshot()); err != nil {

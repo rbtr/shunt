@@ -590,3 +590,22 @@ func commentByUser(comment IssueComment, botUser string) bool {
 func later(id int64, createdAt time.Time, otherID int64, otherCreatedAt time.Time) bool {
 	return createdAt.After(otherCreatedAt) || (createdAt.Equal(otherCreatedAt) && id > otherID)
 }
+
+// API is the interface that *Client implements.
+// Both the standard *Client and alternative implementations satisfy this.
+type API interface {
+	ListOpenPRs(ctx context.Context, owner, repo, base string) ([]PullRequest, error)
+	GetPR(ctx context.Context, owner, repo string, index int) (PullRequest, error)
+	AutomergeScheduled(ctx context.Context, owner, repo string, index int) (bool, error)
+	AutomergeState(ctx context.Context, owner, repo string, index int) (AutomergeState, error)
+	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (CommitStatus, bool, error)
+	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
+	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
+	SetCommitStatus(ctx context.Context, owner, repo, sha, statusContext, state, desc, targetURL string) error
+	ScheduleAutomerge(ctx context.Context, owner, repo string, index int, style, headSHA string) (ScheduleAutomergeResult, error)
+	CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error)
+	DeleteBranch(ctx context.Context, owner, repo, branch string) error
+	Comment(ctx context.Context, owner, repo string, index int, body string) error
+	UpsertComment(ctx context.Context, owner, repo string, index int, marker, botUser, body string) error
+	ReadFile(ctx context.Context, owner, repo, ref, path string) ([]byte, error)
+}
