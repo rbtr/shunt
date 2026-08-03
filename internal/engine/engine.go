@@ -155,7 +155,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	}
 	held, err := e.acquireLease(ctx)
 	if err != nil {
-		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		}
 		e.observeQueue()
 		return err
 	}
@@ -166,13 +168,17 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	// to avoid standby instances skewing the histogram in HA deployments.
 	start := e.now()
 	defer func() {
-		e.cfg.Metrics.ObserveReconcileDuration(e.metricLabels(), e.now().Sub(start))
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.ObserveReconcileDuration(e.metricLabels(), e.now().Sub(start))
+		}
 	}()
 	if err := e.reconcileContextErr(ctx); err != nil {
 		return err
 	}
 	if err := e.loadCheckpoint(ctx); err != nil {
-		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		}
 		e.observeQueue()
 		return err
 	}
@@ -206,7 +212,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		} else if !errors.Is(err, ctxErr) {
 			err = errors.Join(err, ctxErr)
 		}
-		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		}
 		e.observeQueue()
 		return err
 	}
@@ -215,7 +223,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		return nil
 	}
 	if err != nil {
-		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		}
 	}
 	if commentErr := e.syncQueueComments(ctx); commentErr != nil {
 		if !errors.Is(commentErr, forge.ErrUnavailable) {
@@ -228,7 +238,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 
 func (e *Engine) reconcileContextErr(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.IncReconcileError(e.metricLabels())
+		}
 		e.observeQueue()
 		return err
 	}
@@ -383,7 +395,9 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		}
 		e.enqueue(ready)
 		if !e.lingerSince.IsZero() {
-			e.cfg.Metrics.ObserveLingerDuration(e.metricLabels(), e.now().Sub(e.lingerSince))
+			if e.cfg.Metrics != nil {
+				e.cfg.Metrics.ObserveLingerDuration(e.metricLabels(), e.now().Sub(e.lingerSince))
+			}
 		}
 		e.lingerSince = time.Time{}
 	}
@@ -406,7 +420,9 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 	sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, stagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
-			e.cfg.Metrics.IncStagingConflict(e.metricLabels())
+			if e.cfg.Metrics != nil {
+				e.cfg.Metrics.IncStagingConflict(e.metricLabels())
+			}
 			return false, e.handleStagingConflict(ctx, prs, conflictPR)
 		}
 		return false, err
@@ -425,7 +441,9 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		phaseSince:    e.now(),
 	}
 	e.active = append(e.active, a)
-	e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
+	}
 	e.logger.Info("testing batch", "prs", numbersOf(prs), "stagingBranch", a.stagingBranch, "sha", short(sha))
 	return true, nil
 }
@@ -479,8 +497,10 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				}
 				a.outcome = status
 				a.debugURL = debugURL
-				e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
-				e.cfg.Metrics.ObserveGateDuration(e.metricLabels(), status, e.now().Sub(a.phaseSince))
+				if e.cfg.Metrics != nil {
+					e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
+					e.cfg.Metrics.ObserveGateDuration(e.metricLabels(), status, e.now().Sub(a.phaseSince))
+				}
 				if status == "success" {
 					a.phase = "waiting_merge"
 					a.phaseSince = e.now()
@@ -794,9 +814,13 @@ func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt tim
 
 func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.PullRequest) {
 	if !a.releasedAt.IsZero() {
-		e.cfg.Metrics.ObserveNativeMergeDuration(e.metricLabels(), e.now().Sub(a.releasedAt))
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.ObserveNativeMergeDuration(e.metricLabels(), e.now().Sub(a.releasedAt))
+		}
 	}
-	e.cfg.Metrics.IncPRMerge(e.metricLabels())
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.IncPRMerge(e.metricLabels())
+	}
 	e.observeQueueExit(staged.Number, "merged")
 	e.notifyPR(
 		ctx,
@@ -919,7 +943,9 @@ func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, s
 		}
 		e.notifyPR(ctx, num, pr.Head.Sha, statusState, "Bounced from merge queue", "shunt rejected this PR from the merge queue: "+reason+".", debugURL, true, true)
 	}
-	e.cfg.Metrics.IncBounce(e.metricLabels())
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.IncBounce(e.metricLabels())
+	}
 	e.observeQueueExit(num, "bounced")
 	if _, err := e.fc.CancelAutomerge(ctx, e.cfg.Owner, e.cfg.Repo, num); err != nil {
 		if !errors.Is(err, forge.ErrUnavailable) {
@@ -1063,8 +1089,10 @@ func (e *Engine) observeQueue() {
 		BatchTarget:  e.cfg.BatchTarget,
 		BisectFanout: e.cfg.BisectFanout,
 	}
-	e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active, e.lingerSince, cfg)
-	e.cfg.Metrics.ObserveQueueAge(e.metricLabels(), e.oldestQueueAge())
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.ObserveQueueStatus(e.metricLabels(), pending, active, e.lingerSince, cfg)
+		e.cfg.Metrics.ObserveQueueAge(e.metricLabels(), e.oldestQueueAge())
+	}
 }
 
 const queueCommentMarker = "<!-- shunt:queue-status -->"
@@ -1384,7 +1412,9 @@ func (e *Engine) observeQueueExit(num int, outcome string) {
 	if age < 0 {
 		age = 0
 	}
-	e.cfg.Metrics.ObserveTimeInQueue(e.metricLabels(), outcome, age)
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.ObserveTimeInQueue(e.metricLabels(), outcome, age)
+	}
 	delete(e.queueFirstSeen, num)
 }
 
