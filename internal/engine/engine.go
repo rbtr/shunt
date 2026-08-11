@@ -750,6 +750,31 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		a.releasedPR = staged.Number
 		a.releasedAt = e.now()
 		e.logger.Info("PR released to native auto-merge", "pr", staged.Number)
+
+		// Check immediately whether the forge completed the merge.
+		// If it did, continue to the next PR in the batch so we can
+		// process the entire queue within this tick. The merge queue
+		// must land in order — we cannot set success on PR N+1 until
+		// PR N has merged.
+		current, err = e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+		if err != nil {
+			e.logger.Warn("post-merge check failed", "pr", staged.Number, "error", err)
+			return false, merged, nil
+		}
+		if current.Merged {
+			released, _ := e.releasedByShunt(ctx, a, staged)
+			if released {
+				e.recordLanded(ctx, a, staged)
+			}
+			a.prs = a.prs[1:]
+			a.releasedPR = 0
+			a.releasedAt = time.Time{}
+			merged++
+			// Continue to next PR in the batch
+			continue
+		}
+		// PR hasn't merged yet — return unresolved; next cron tick
+		// will pick up the remaining PRs.
 		return false, merged, nil
 	}
 
