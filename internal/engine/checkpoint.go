@@ -8,11 +8,8 @@ import (
 )
 
 // CheckpointStore persists queue snapshots for one engine-managed queue.
-type CheckpointStore interface {
-	LoadQueue(ctx context.Context, key checkpoint.QueueKey) (checkpoint.QueueSnapshot, bool, error)
-	SaveQueue(ctx context.Context, snapshot checkpoint.QueueSnapshot) error
-	DeleteQueue(ctx context.Context, key checkpoint.QueueKey) error
-}
+// Alias of the public mq/checkpoint.Store so hosts can implement it.
+type CheckpointStore = checkpoint.Store
 
 func (e *Engine) loadCheckpoint(ctx context.Context) error {
 	if e.checkpointLoaded {

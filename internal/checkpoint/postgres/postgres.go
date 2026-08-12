@@ -4,6 +4,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"strings"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -60,16 +61,38 @@ func (s stdDB) QueryRowContext(ctx context.Context, query string, args ...any) r
 // Store stores queue snapshots in a Postgres database. Call ApplyMigrations
 // before the first LoadQueue or SaveQueue.
 type Store struct {
-	db sqlExecutor
+	db        sqlExecutor
+	stateTbl  string
+	leaseTbl  string
 }
 
-// New returns a Postgres-backed Store using db. The caller owns opening
-// and closing db, including registering the chosen Postgres driver.
-func New(db *sql.DB) *Store {
+// New returns a Postgres-backed Store using db. namespace (optional) suffixes
+// the table names (shunt_queue_state_<ns>) so distinct tenants/forge
+// instances never share queue-state rows. The caller owns opening and closing
+// db, including registering the chosen Postgres driver.
+func New(db *sql.DB, namespace string) *Store {
 	if db == nil {
 		return &Store{}
 	}
-	return &Store{db: stdDB{db: db}}
+	ns := sanitizeNamespace(namespace)
+	stateTbl, leaseTbl := "shunt_queue_state", "shunt_queue_leases"
+	if ns != "" {
+		stateTbl += "_" + ns
+		leaseTbl += "_" + ns
+	}
+	return &Store{db: stdDB{db: db}, stateTbl: stateTbl, leaseTbl: leaseTbl}
+}
+
+// sanitizeNamespace restricts a namespace to [a-z0-9_] so it can safely
+// suffix table names.
+func sanitizeNamespace(ns string) string {
+	var b strings.Builder
+	for _, r := range ns {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // ApplyMigrations ensures the backing tables and indexes exist.
@@ -78,7 +101,9 @@ func (p *Store) ApplyMigrations(ctx context.Context) error {
 		return err
 	}
 	for _, migration := range []string{PostgresMigrationV1, PostgresMigrationV2} {
-		if _, err := p.db.ExecContext(ctx, migration); err != nil {
+		m := strings.ReplaceAll(migration, "shunt_queue_state", p.stateTbl)
+		m = strings.ReplaceAll(m, "shunt_queue_leases", p.leaseTbl)
+		if _, err := p.db.ExecContext(ctx, m); err != nil {
 			return fmt.Errorf("state: apply postgres migrations: %w", err)
 		}
 	}
@@ -103,16 +128,16 @@ func (p *Store) AcquireLease(ctx context.Context, key checkpoint.QueueKey, holde
 	}
 
 	var expiresAt time.Time
-	err := p.db.QueryRowContext(ctx, `
-INSERT INTO shunt_queue_leases (owner, repo, base, holder_id, expires_at)
+	err := p.db.QueryRowContext(ctx, fmt.Sprintf(`
+INSERT INTO %s (owner, repo, base, holder_id, expires_at)
 VALUES ($1, $2, $3, $4, now() + $5 * interval '1 microsecond')
 ON CONFLICT (owner, repo, base) DO UPDATE SET
     holder_id = EXCLUDED.holder_id,
     expires_at = EXCLUDED.expires_at
-WHERE shunt_queue_leases.holder_id = EXCLUDED.holder_id
-   OR shunt_queue_leases.expires_at <= now()
+WHERE %s.holder_id = EXCLUDED.holder_id
+   OR %s.expires_at <= now()
 RETURNING expires_at
-`, key.Owner, key.Repo, key.Base, holderID, ttl.Microseconds()).Scan(&expiresAt)
+`, p.leaseTbl, p.leaseTbl, p.leaseTbl), key.Owner, key.Repo, key.Base, holderID, ttl.Microseconds()).Scan(&expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -143,8 +168,8 @@ func (p *Store) SaveQueue(ctx context.Context, snapshot checkpoint.QueueSnapshot
 	if !snapshot.LingerSince.IsZero() {
 		linger = snapshot.LingerSince.UTC()
 	}
-	_, err = p.db.ExecContext(ctx, `
-INSERT INTO shunt_queue_state (
+	_, err = p.db.ExecContext(ctx, fmt.Sprintf(`
+INSERT INTO %s (
     owner, repo, base, pending, active, linger_since, base_generation, staging_sequence, updated_at
 ) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, now())
 ON CONFLICT (owner, repo, base) DO UPDATE SET
@@ -154,7 +179,7 @@ ON CONFLICT (owner, repo, base) DO UPDATE SET
     base_generation = EXCLUDED.base_generation,
     staging_sequence = EXCLUDED.staging_sequence,
     updated_at = now()
-`, snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, string(pending), string(active), linger, snapshot.BaseGeneration, snapshot.StagingSequence)
+`, p.stateTbl), snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, string(pending), string(active), linger, snapshot.BaseGeneration, snapshot.StagingSequence)
 	if err != nil {
 		return fmt.Errorf("state: save queue %s/%s@%s: %w", snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, err)
 	}
@@ -173,11 +198,11 @@ func (p *Store) LoadQueue(ctx context.Context, key checkpoint.QueueKey) (checkpo
 	var pendingRaw, activeRaw []byte
 	var linger sql.NullTime
 	var baseGeneration, stagingSequence int
-	err := p.db.QueryRowContext(ctx, `
+	err := p.db.QueryRowContext(ctx, fmt.Sprintf(`
 SELECT pending, active, linger_since, base_generation, staging_sequence
-FROM shunt_queue_state
+FROM %s
 WHERE owner = $1 AND repo = $2 AND base = $3
-`, key.Owner, key.Repo, key.Base).Scan(&pendingRaw, &activeRaw, &linger, &baseGeneration, &stagingSequence)
+`, p.stateTbl), key.Owner, key.Repo, key.Base).Scan(&pendingRaw, &activeRaw, &linger, &baseGeneration, &stagingSequence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return checkpoint.QueueSnapshot{}, false, nil
 	}
@@ -216,10 +241,10 @@ func (p *Store) DeleteQueue(ctx context.Context, key checkpoint.QueueKey) error 
 	if err := key.Validate(); err != nil {
 		return err
 	}
-	_, err := p.db.ExecContext(ctx, `
-DELETE FROM shunt_queue_state
+	_, err := p.db.ExecContext(ctx, fmt.Sprintf(`
+DELETE FROM %s
 WHERE owner = $1 AND repo = $2 AND base = $3
-`, key.Owner, key.Repo, key.Base)
+`, p.stateTbl), key.Owner, key.Repo, key.Base)
 	if err != nil {
 		return fmt.Errorf("state: delete queue %s/%s@%s: %w", key.Owner, key.Repo, key.Base, err)
 	}

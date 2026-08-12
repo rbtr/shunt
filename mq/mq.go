@@ -13,6 +13,7 @@
 package mq
 
 import (
+	"github.com/rbtr/shunt/mq/checkpoint"
 	"context"
 	"log/slog"
 	"time"
@@ -48,6 +49,8 @@ type Config struct {
 	QueueComments bool          // post sticky queue-status comments on PRs
 	BotUser       string        // bot username for comments and status updates
 	LeaseTTL      time.Duration // lease TTL for distributed locking (0 = 45s)
+	Checkpoint    checkpoint.Store
+	Logger        *slog.Logger // engine logger (defaults to slog.Default)
 }
 
 // Engine wraps shunt's merge queue engine with a simplified public API.
@@ -123,7 +126,8 @@ func New(cfg *Config, fc ForgeClient, st Stager) *Engine {
 		BisectFanout:  cfg.BisectFanout,
 		QueueComments: cfg.QueueComments,
 		BotUser:       cfg.BotUser,
-		Logger:        slog.Default(),
+		Logger:        mqLogger(cfg),
+		Checkpoint:    cfg.Checkpoint,
 	}
 
 	// Apply defaults
@@ -144,6 +148,15 @@ func New(cfg *Config, fc ForgeClient, st Stager) *Engine {
 	}
 
 	return &Engine{e: engine.New(eCfg, &adapter{fc}, &stagerAdapter{st})}
+}
+
+// mqLogger returns the configured engine logger, defaulting to slog.Default
+// when the caller did not provide one.
+func mqLogger(cfg *Config) *slog.Logger {
+	if cfg != nil && cfg.Logger != nil {
+		return cfg.Logger
+	}
+	return slog.Default()
 }
 
 // Reconcile advances the merge queue by one step.
