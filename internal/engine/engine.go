@@ -1037,19 +1037,19 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 		return
 	}
 	a := e.active[idx]
-	e.active = append(e.active[:idx], e.active[idx+1:]...)
+	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued; waiting for an earlier queue entry", numbersOf(a.prs))
 	e.logger.Info("speculative batch requeued for earlier candidate", "prs", numbersOf(a.prs), "earlier", e.pending[0])
 }
 
 func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
-	e.removeActive(a)
+	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after base branch advanced", numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
 }
 
 func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
-	e.removeActive(a)
+	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after PR head changed", numbersOf(a.prs))
 	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))
 }
