@@ -4,11 +4,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"strings"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rbtr/shunt/internal/checkpoint"
@@ -61,9 +61,9 @@ func (s stdDB) QueryRowContext(ctx context.Context, query string, args ...any) r
 // Store stores queue snapshots in a Postgres database. Call ApplyMigrations
 // before the first LoadQueue or SaveQueue.
 type Store struct {
-	db        sqlExecutor
-	stateTbl  string
-	leaseTbl  string
+	db       sqlExecutor
+	stateTbl string
+	leaseTbl string
 }
 
 // New returns a Postgres-backed Store using db. namespace (optional) suffixes

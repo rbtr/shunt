@@ -13,8 +13,8 @@
 package mq
 
 import (
-	"github.com/rbtr/shunt/mq/checkpoint"
 	"context"
+	"github.com/rbtr/shunt/mq/checkpoint"
 	"log/slog"
 	"time"
 
