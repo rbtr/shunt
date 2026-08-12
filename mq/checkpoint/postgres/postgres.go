@@ -1,6 +1,6 @@
 // Package postgres exposes shunt's Postgres-backed queue state store publicly
-// so hosts (e.g. gondolier on Supabase) can wire durable checkpoint + lease
-// persistence without importing internal packages.
+// so hosts can wire durable checkpoint + lease persistence without importing
+// internal packages.
 package postgres
 
 import (

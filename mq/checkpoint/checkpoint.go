@@ -2,8 +2,8 @@
 // interface for persisting in-flight batch state across restarts.
 //
 // The engine's CheckpointStore was previously internal (shunt/internal/...);
-// gondolier (and any other host) needs it to wire durable restart survival,
-// so the types and the interface are exposed here.
+// hosts wire it for durable restart survival, so the types and the interface
+// are exposed here.
 package checkpoint
 
 import (
