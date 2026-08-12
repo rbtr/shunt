@@ -16,6 +16,15 @@ import (
 	"github.com/rbtr/shunt/internal/metrics"
 )
 
+// Shrink the native-merge grace window to zero so tests drive merges
+// explicitly with advanceNative() between Reconcile calls, as before the
+// in-tick grace wait existed. Tests that exercise the wait path set a
+// small grace themselves.
+func init() {
+	nativeMergeGrace = 0
+	nativeMergePoll = time.Millisecond
+}
+
 // mock implements both ForgeAPI and Stager. A staged batch "fails" iff it
 // contains badPR; merges/bounces are recorded.
 type mock struct {
@@ -837,6 +846,38 @@ func TestFreeSlotEvictionDeletesStagingBranch(t *testing.T) {
 	}
 	if got := len(e.active); got != 1 || numbersOf(e.active[0].prs)[0] != 3 {
 		t.Fatalf("active = %#v, want only batch 3 remaining", e.active)
+	}
+}
+
+func TestNativeLandingWaitsWithinGraceForForgeMerge(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	// The forge completes each released PR's merge only on the second
+	// post-release poll. The old single-check code would bail after the
+	// first (unmerged) check; the grace window must keep waiting and land
+	// the whole queue within one tick.
+	postRelease := map[int]int{}
+	m.beforeGetPR = func(n int) {
+		if m.nativePending[n] != "" {
+			postRelease[n]++
+			if postRelease[n] >= 2 {
+				m.advanceNative()
+			}
+		}
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	defer func(g, p time.Duration) { nativeMergeGrace, nativeMergePoll = g, p }(nativeMergeGrace, nativeMergePoll)
+	nativeMergeGrace, nativeMergePoll = time.Second, time.Millisecond
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("land queue: %v", err)
+	}
+
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 2]" {
+		t.Fatalf("merged = %s, want [1 2] landed within one tick despite a delayed forge merge", got)
 	}
 }
 
