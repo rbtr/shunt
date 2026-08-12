@@ -815,6 +815,31 @@ func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	}
 }
 
+func TestFreeSlotEvictionDeletesStagingBranch(t *testing.T) {
+	m := newMock(-1, 1, 3, 5)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BisectFanout: 2}, m, m)
+	e.pending = [][]int{{1}}
+	e.active = []*activeBatch{
+		{prs: []forge.PullRequest{*m.prs[3]}, stagingBranch: "mq/main/staging-3", stagingSHA: "stage-3", outcome: "success"},
+		{prs: []forge.PullRequest{*m.prs[5]}, stagingBranch: "mq/main/staging-5", stagingSHA: "stage-5", outcome: "success"},
+	}
+
+	e.freeSlotForEarlierPending(context.Background())
+
+	// The later speculative batch (5) is evicted to make room for the
+	// earlier pending candidate (1); its staging branch must be deleted,
+	// the remaining batch's branch untouched.
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging-5") {
+		t.Fatalf("calls = %s, want evicted batch's staging branch deleted", got)
+	}
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "delete:mq/main/staging-3") {
+		t.Fatalf("calls = %s, want remaining batch's branch untouched", got)
+	}
+	if got := len(e.active); got != 1 || numbersOf(e.active[0].prs)[0] != 3 {
+		t.Fatalf("active = %#v, want only batch 3 remaining", e.active)
+	}
+}
+
 func TestNativeMergeRequeuesSpeculativeBatchesFromOldBase(t *testing.T) {
 	m := newMock(-1, 1, 2, 3)
 	e := New(Config{
@@ -826,14 +851,16 @@ func TestNativeMergeRequeuesSpeculativeBatchesFromOldBase(t *testing.T) {
 		BisectFanout:  2,
 	}, m, m)
 	first := &activeBatch{
-		prs:        []forge.PullRequest{*m.prs[1], *m.prs[2]},
-		stagingSHA: "stage-first",
-		outcome:    "success",
+		prs:           []forge.PullRequest{*m.prs[1], *m.prs[2]},
+		stagingBranch: "mq/main/staging-first",
+		stagingSHA:    "stage-first",
+		outcome:       "success",
 	}
 	later := &activeBatch{
-		prs:        []forge.PullRequest{*m.prs[3]},
-		stagingSHA: "stage-later",
-		outcome:    "success",
+		prs:           []forge.PullRequest{*m.prs[3]},
+		stagingBranch: "mq/main/staging-later",
+		stagingSHA:    "stage-later",
+		outcome:       "success",
 	}
 	e.active = []*activeBatch{first, later}
 
@@ -856,6 +883,11 @@ func TestNativeMergeRequeuesSpeculativeBatchesFromOldBase(t *testing.T) {
 	}
 	if got := len(e.active); got != 1 || e.active[0] != first {
 		t.Fatalf("active batches = %#v, want only current landing batch", e.active)
+	}
+	// requeueStaleActive routes through cleanupBatch: the stale speculative
+	// batch's staging branch is deleted when it is requeued from an old base.
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging-later") {
+		t.Fatalf("calls = %s, want stale batch branch deleted on base-advance requeue", got)
 	}
 }
 
@@ -952,8 +984,12 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
 		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
-	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging-") {
-		t.Fatalf("recovery calls = %s, want delete + eligibility + error + schedule + pending", got)
+	// The branch name is recorded by the mock at staging time; assert the
+	// full call sequence with the exact branch so the delete is pinned to
+	// its position in the recovery path.
+	wantCalls := fmt.Sprintf("[schedule:1 status:pending status:success status:error delete:%s schedule:1 status:pending]", m.stagingBranches[0])
+	if got := fmt.Sprint(m.calls); got != wantCalls {
+		t.Fatalf("recovery calls = %s, want %s", got, wantCalls)
 	}
 	if got := fmt.Sprint(m.scheduled); got != "[1]" {
 		t.Fatalf("restored schedules = %s, want [1]", got)
@@ -1256,6 +1292,14 @@ func TestActiveBatchRestacksChangedHeadImmediately(t *testing.T) {
 	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
 		t.Fatalf("staged = %s, want immediate restack", got)
 	}
+	// requeueChangedActive routes through cleanupBatch: the stale staging
+	// branch is deleted before the PR is re-staged on a fresh branch.
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+m.stagingBranches[0]) {
+		t.Fatalf("calls = %s, want stale staging branch %s deleted on restack", got, m.stagingBranches[0])
+	}
+	if got := fmt.Sprint(m.calls); strings.Count(got, "delete:") != 1 {
+		t.Fatalf("calls = %s, want exactly one delete on restack", got)
+	}
 	if len(e.active) != 1 {
 		t.Fatalf("active batches = %d, want 1", len(e.active))
 	}
@@ -1377,6 +1421,10 @@ func TestLandSkipsCancelledAutomerge(t *testing.T) {
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") || !strings.Contains(got, "auto-merge is no longer scheduled") {
 		t.Errorf("comments = %s, want cancelled-auto-merge skip comment", got)
 	}
+	// The skip early-return in land() must delete the batch's staging branch.
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+m.stagingBranches[0]) {
+		t.Errorf("calls = %s, want staging branch %s deleted on skip", got, m.stagingBranches[0])
+	}
 }
 
 func TestLandSkipsClosedOrMergedPR(t *testing.T) {
@@ -1404,6 +1452,10 @@ func TestLandSkipsClosedOrMergedPR(t *testing.T) {
 			assertNoLand(t, m)
 			if got := len(m.comments[1]); got != 0 {
 				t.Errorf("comments = %d, want 0", got)
+			}
+			// The closed/merged early-return in land() deletes the branch.
+			if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+m.stagingBranches[0]) {
+				t.Errorf("calls = %s, want staging branch %s deleted on skip", got, m.stagingBranches[0])
 			}
 		})
 	}
