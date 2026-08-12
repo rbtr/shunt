@@ -6,6 +6,40 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-12
+
+### Added
+
+- Public merge-queue engine package (`mq`): external consumers can import the
+  engine, its types, and adapters without depending on `internal/` packages.
+  Exports `Config`, `Engine`, `ForgeClient`, `Stager`, type aliases
+  (`PullRequest`, `AutomergeState`, `CommitStatus`, `MergedRef`), plus
+  adapter/stager bridges.
+- Public queue-state store (`mq/checkpoint`) with a Postgres-backed
+  implementation (`mq/checkpoint/postgres`): hosts can wire durable checkpoint
+  and lease persistence without importing internal packages. Store and lease
+  tables are namespaced per tenant (`New(db, namespace)` →
+  `shunt_queue_state_<ns>`) so distinct tenants sharing a repo identity never
+  collide on the same rows.
+- Optional metrics: the forge client is abstracted behind an interface and
+  metrics collection can be omitted, simplifying embedding in hosts that do
+  not expose Prometheus.
+- Native-merge grace window: after releasing a PR to the forge's scheduled
+  auto-merge, `land()` polls for the merge within a bounded window (default
+  30s) so a whole batch can land within one tick when the forge merges
+  promptly, instead of waiting a full poll interval per PR.
+
+### Fixed
+
+- Staging branches are now deleted on every terminal batch path — landing,
+  skip, bounce, eviction, and requeue — via a single `cleanupBatch` helper
+  (`removeActive` + best-effort `DeleteBranch`). This closes the leak on the
+  early-return paths in `land()` (state change, head change, cancelled
+  auto-merge, native-merge recovery) and on the eviction/requeue paths, where
+  the branch previously survived.
+
+## [0.11.0] - 2026-08-02
+
 ### Fixed
 
 - Dangling merge-queue staging branches: `land()` now deletes the staging
@@ -21,11 +55,6 @@ All notable changes to this project are documented here. The format is based on
   meet these requirements; already-scheduled PRs are accepted (409). Bounced or
   cancelled PRs (no automerge scheduled) are skipped without re-calling
   Forgejo, preventing infinite bounce loops during checkpoint recovery.
-
-## [0.11.0] - 2026-08-02
-
-### Added
-
 - Per-engine lifecycle wrapper (`managedEngine`) carrying a lifetime context and
   mutex. `Refresh()` now cancels the old engine's context and drains any
   in-flight `Reconcile()` call before replacing or removing the engine, closing a
@@ -256,7 +285,8 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/rbtr/shunt/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rbtr/shunt/compare/v0.9.0...v0.11.0
 [0.9.0]: https://github.com/rbtr/shunt/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/rbtr/shunt/compare/v0.7.0...v0.8.0
