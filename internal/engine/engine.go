@@ -599,7 +599,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		if current.State != "open" {
 			e.skipLand(ctx, staged, current, fmt.Sprintf("state changed to %q", current.State), len(a.prs) > 1, a.debugURL, false)
 			e.requeueActiveRemainder("requeued after an earlier PR left the batch", a.prs[1:])
-			e.removeActive(a)
+			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
 		if current.Head.Sha != staged.Head.Sha {
@@ -616,7 +616,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				true,
 			)
 			e.requeueActiveRemainder("requeued after PR head changed", a.prs)
-			e.removeActive(a)
+			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
 
@@ -627,7 +627,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		if !queued {
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
-			e.removeActive(a)
+			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
 
@@ -656,7 +656,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			if !state.Scheduled {
 				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
-				e.removeActive(a)
+				e.cleanupBatch(ctx, a)
 				return true, merged, nil
 			}
 			if err := e.fc.SetCommitStatus(
@@ -689,11 +689,11 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 					false,
 				)
 				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
-				e.removeActive(a)
+				e.cleanupBatch(ctx, a)
 				return true, merged, nil
 			}
 			e.requeueActiveRemainder("retrying after forge merge recovery", a.prs)
-			e.removeActive(a)
+			e.cleanupBatch(ctx, a)
 			if err := e.scheduleAutomerge(ctx, current); err != nil {
 				return false, merged, fmt.Errorf("restore auto-merge for PR #%d: %w", staged.Number, err)
 			}
@@ -752,7 +752,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		if !state.Scheduled {
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
-			e.removeActive(a)
+			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
 		if err := e.fc.SetCommitStatus(
@@ -798,14 +798,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		return false, merged, nil
 	}
 
-	e.removeActive(a)
-
-	// ponytail: delete the staging branch now that all PRs have landed.
-	// Best-effort: 404 = already deleted, other errors = warning.
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("failed to delete staging branch",
-			"branch", a.stagingBranch, "error", err)
-	}
+	e.cleanupBatch(ctx, a)
 
 	return true, merged, nil
 }
@@ -919,14 +912,7 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 // recursion isolates the bad PR(s)).
 func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) (bool, error) {
 	nums := numbersOf(a.prs)
-	e.removeActive(a)
-
-	// ponytail: failed batch — clean up its staging branch.
-	// Best-effort: 404 = already deleted, other errors = warning.
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("failed to delete staging branch after gate failure",
-			"branch", a.stagingBranch, "error", err)
-	}
+	e.cleanupBatch(ctx, a)
 
 	if len(nums) == 1 {
 		bounced := e.bounce(ctx, nums[0], a.prs[0].Head.Sha, fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
@@ -1082,6 +1068,16 @@ func (e *Engine) removeActive(a *activeBatch) {
 			e.active = append(e.active[:i], e.active[i+1:]...)
 			return
 		}
+	}
+}
+
+// cleanupBatch removes the batch from the active list and deletes its staging
+// branch. Called on every path that finishes with a batch (land, skip, bounce).
+func (e *Engine) cleanupBatch(ctx context.Context, a *activeBatch) {
+	e.removeActive(a)
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
+		e.logger.Warn("failed to delete staging branch",
+			"branch", a.stagingBranch, "error", err)
 	}
 }
 

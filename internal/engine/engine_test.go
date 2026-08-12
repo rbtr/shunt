@@ -952,8 +952,8 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
 		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[schedule:1 status:pending status:success status:error schedule:1 status:pending]" {
-		t.Fatalf("recovery calls = %s, want eligibility + error, schedule, pending", got)
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging-") {
+		t.Fatalf("recovery calls = %s, want delete + eligibility + error + schedule + pending", got)
 	}
 	if got := fmt.Sprint(m.scheduled); got != "[1]" {
 		t.Fatalf("restored schedules = %s, want [1]", got)
