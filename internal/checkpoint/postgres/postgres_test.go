@@ -15,7 +15,7 @@ import (
 func TestPostgresSaveQueueUpsertsSnapshot(t *testing.T) {
 	linger := time.Date(2026, 6, 22, 21, 30, 0, 0, time.FixedZone("local", -5*60*60))
 	db := &fakeDB{}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 	snapshot := checkpoint.QueueSnapshot{
 		Key:     checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"},
 		Pending: [][]int{{1, 2}, {3}},
@@ -79,7 +79,7 @@ func TestPostgresLoadQueueDecodesSnapshot(t *testing.T) {
 			return nil
 		},
 	}}}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 
 	snapshot, ok, err := store.LoadQueue(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"})
 	if err != nil {
@@ -111,7 +111,7 @@ func TestPostgresLoadQueueDecodesSnapshot(t *testing.T) {
 
 func TestPostgresLoadQueueMissingReturnsFalse(t *testing.T) {
 	db := &fakeDB{rows: []fakeRow{{err: sql.ErrNoRows}}}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 
 	_, ok, err := store.LoadQueue(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"})
 	if err != nil {
@@ -124,7 +124,7 @@ func TestPostgresLoadQueueMissingReturnsFalse(t *testing.T) {
 
 func TestPostgresApplyMigrationsAndDelete(t *testing.T) {
 	db := &fakeDB{}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 
 	if err := store.ApplyMigrations(context.Background()); err != nil {
 		t.Fatalf("ApplyMigrations: %v", err)
@@ -151,7 +151,7 @@ func TestPostgresApplyMigrationsAndDelete(t *testing.T) {
 
 func TestPostgresAcquireLeaseAcquiresAndRenews(t *testing.T) {
 	db := &fakeDB{rows: []fakeRow{leaseRow(), leaseRow()}}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 	key := checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}
 
 	for _, holderID := range []string{"holder-a", "holder-a"} {
@@ -180,7 +180,7 @@ func TestPostgresAcquireLeaseAcquiresAndRenews(t *testing.T) {
 
 func TestPostgresAcquireLeaseActiveContentionReturnsFalse(t *testing.T) {
 	db := &fakeDB{rows: []fakeRow{{err: sql.ErrNoRows}}}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 
 	acquired, err := store.AcquireLease(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}, "holder-b", time.Minute)
 	if err != nil {
@@ -193,7 +193,7 @@ func TestPostgresAcquireLeaseActiveContentionReturnsFalse(t *testing.T) {
 
 func TestPostgresAcquireLeaseExpiredHolderCanBeTakenOver(t *testing.T) {
 	db := &fakeDB{rows: []fakeRow{leaseRow()}}
-	store := &Store{db: db}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
 
 	acquired, err := store.AcquireLease(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}, "holder-b", time.Minute)
 	if err != nil {

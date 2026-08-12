@@ -308,7 +308,7 @@ func openCheckpointStore(ctx context.Context, logger *slog.Logger) (checkpointSt
 			return nil, fmt.Errorf("open SHUNT_POSTGRES_DSN: %w", err)
 		}
 		configurePostgresDB(db)
-		store := checkpointpostgres.New(db)
+		store := checkpointpostgres.New(db, "")
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		if err := db.PingContext(startupCtx); err != nil {
