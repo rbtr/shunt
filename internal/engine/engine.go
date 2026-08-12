@@ -83,6 +83,15 @@ const (
 	nativeMergeTimeout        = 5 * time.Minute
 )
 
+// nativeMergeGrace bounds how long land() waits within one tick for the
+// forge to complete a released PR's scheduled merge before yielding to the
+// next reconcile tick; nativeMergePoll is the re-check interval while
+// waiting. Vars (not consts) so tests can shrink them.
+var (
+	nativeMergeGrace = 30 * time.Second
+	nativeMergePoll  = time.Second
+)
+
 // Stager builds an integration ("staging") branch from a base + PR head refs.
 type Stager interface {
 	BuildStaging(ctx context.Context, base, stagingBranch string, refs []gitops.MergedRef) (sha string, conflictPR int, err error)
@@ -573,6 +582,10 @@ func (e *Engine) activeHeadChanged(ctx context.Context, a *activeBatch) (bool, e
 
 // land releases one PR at a time to the forge's scheduled auto-merge worker.
 // The next PR is not released until the previous one is observed merged.
+// After each release it waits within a bounded grace window for the forge to
+// complete the merge, so the whole queue can land within one tick; if the
+// merge has not completed by the deadline it returns unresolved and the next
+// tick re-checks (nativeMergeTimeout recovery still applies across ticks).
 func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merged int, err error) {
 	for len(a.prs) > 0 {
 		staged := a.prs[0]
@@ -771,31 +784,48 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		a.releasedAt = e.now()
 		e.logger.Info("PR released to native auto-merge", "pr", staged.Number)
 
-		// Check immediately whether the forge completed the merge.
-		// If it did, continue to the next PR in the batch so we can
-		// process the entire queue within this tick. The merge queue
-		// must land in order — we cannot set success on PR N+1 until
-		// PR N has merged.
-		current, err = e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
-		if err != nil {
-			e.logger.Warn("post-merge check failed", "pr", staged.Number, "error", err)
-			return false, merged, nil
-		}
-		if current.Merged {
-			released, _ := e.releasedByShunt(ctx, a, staged)
-			if released {
-				e.recordLanded(ctx, a, staged)
+		// Wait for the forge to complete the scheduled merge so the
+		// whole queue can land within this tick. The merge queue must
+		// land in order — we cannot set success on PR N+1 until PR N
+		// has merged. Poll within a bounded grace window; if the merge
+		// has not completed by the deadline, return unresolved and let
+		// the next tick re-check (nativeMergeTimeout recovery still
+		// applies across ticks). Bail early if the PR left the
+		// mergeable state — it is not likely to succeed.
+		deadline := e.now().Add(nativeMergeGrace)
+		for {
+			current, err = e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+			if err != nil {
+				e.logger.Warn("post-merge check failed", "pr", staged.Number, "error", err)
+				return false, merged, nil
 			}
-			a.prs = a.prs[1:]
-			a.releasedPR = 0
-			a.releasedAt = time.Time{}
-			merged++
-			// Continue to next PR in the batch
-			continue
+			if current.Merged {
+				released, _ := e.releasedByShunt(ctx, a, staged)
+				if released {
+					e.recordLanded(ctx, a, staged)
+				}
+				a.prs = a.prs[1:]
+				a.releasedPR = 0
+				a.releasedAt = time.Time{}
+				merged++
+				// Merged — continue to the next PR in the batch.
+				break
+			}
+			if current.State != "open" || current.Head.Sha != staged.Head.Sha {
+				// PR left the mergeable state while we waited; the
+				// next tick's preflight will requeue it.
+				return false, merged, nil
+			}
+			if !e.now().Before(deadline) {
+				// Reasonable effort exhausted; next tick picks it up.
+				return false, merged, nil
+			}
+			select {
+			case <-ctx.Done():
+				return false, merged, nil
+			case <-time.After(nativeMergePoll):
+			}
 		}
-		// PR hasn't merged yet — return unresolved; next cron tick
-		// will pick up the remaining PRs.
-		return false, merged, nil
 	}
 
 	e.cleanupBatch(ctx, a)
