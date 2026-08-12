@@ -1000,6 +1000,133 @@ func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
 	}
 }
 
+func TestNeverMergeablePRBouncedAfterRepeatedTimeouts(t *testing.T) {
+	m := newMock(-1, 1)
+	// failNativeMerge: the forge accepts the schedule but never completes the
+	// merge — simulating a PR that is approval-blocked / changes-requested /
+	// conflicted and will never merge on its own.
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "rebase", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	// Tick 1: stage the batch; tick 2: gate passes, release to native
+	// auto-merge (grace window is 0 in tests, so the tick yields unresolved).
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+
+	// First nativeMergeTimeout: recovery requeues + restores (strike 1). The
+	// PR must NOT be bounced after a single timeout — slow merges get one retry.
+	m.advanceNative() // no-op under failNativeMerge
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+	if m.bounced[1] {
+		t.Fatal("PR bounced after a single native-merge timeout; want one retry")
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1]]" {
+		t.Fatalf("pending = %s, want PR requeued after first timeout", got)
+	}
+
+	// Re-stage and re-release, then a second nativeMergeTimeout: strike 2 → bounce.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-stage: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-release: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+
+	if !m.bounced[1] {
+		t.Fatal("PR not bounced after repeated native-merge timeouts")
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "cancel:1") {
+		t.Fatalf("calls = %s, want auto-merge cancelled on bounce", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Bounced from merge queue") {
+		t.Fatalf("comments = %s, want terminal bounce outcome", got)
+	}
+	if m.scheduleLive[1] {
+		t.Fatal("auto-merge still scheduled after bounce")
+	}
+	// Next tick: the PR is no longer scheduled, so it is not admitted again.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("post-bounce reconcile: %v", err)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want [] after bounce (PR leaves the queue)", got)
+	}
+}
+
+// TestMergeStrikesArePerHeadSHA is the honest-state sibling: the strike
+// counter is keyed by the PR's actual head SHA, records real consecutive
+// failures, and a successful merge clears it — a single timeout must not
+// fabricate a bounce, and a merged head must not carry stale strikes.
+func TestMergeStrikesArePerHeadSHA(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "rebase", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+
+	// One timeout records exactly one strike for head-1, not a bounce, and no
+	// fabricated strikes for other heads.
+	if got := e.mergeStrikes["head-1"]; got != 1 {
+		t.Fatalf("mergeStrikes[head-1] = %d, want 1 after one timeout", got)
+	}
+	if got := len(e.mergeStrikes); got != 1 {
+		t.Fatalf("mergeStrikes = %d keys, want only the failed head recorded", got)
+	}
+	if m.bounced[1] || m.bounced[2] {
+		t.Fatal("no PR may bounce after a single timeout")
+	}
+
+	// Now the forge completes the merge (e.g. an approval lands): the next
+	// release must land normally, clearing the strike.
+	m.failNativeMerge = 0
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-stage: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-release: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
+	}
+
+	if got := fmt.Sprint(m.merged); got != "[1]" {
+		t.Fatalf("merged = %s, want PR 1 landed after approval", got)
+	}
+	if m.bounced[1] {
+		t.Fatal("PR bounced despite eventually merging")
+	}
+	if got := len(e.mergeStrikes); got != 0 {
+		t.Fatalf("mergeStrikes = %d keys, want cleared after a successful merge", got)
+	}
+}
+
 func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	m := newMock(-1, 1)
 	m.failNativeMerge = 1

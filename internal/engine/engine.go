@@ -81,6 +81,12 @@ const (
 	landingSuccessDescription = "merge queue: batch passed"
 	queueRestoreDescription   = "merge queue: re-queued after incomplete native merge"
 	nativeMergeTimeout        = 5 * time.Minute
+	// mergeStrikeCap is how many consecutive native-merge failures on the
+	// same PR head bounce the PR out of the queue instead of re-queueing it
+	// forever. A never-mergeable PR (approval-blocked, changes requested,
+	// merge conflict) is observed via the 5-minute native-merge timeout; two
+	// consecutive timeouts on the same head terminate it.
+	mergeStrikeCap = 2
 )
 
 // nativeMergeGrace bounds how long land() waits within one tick for the
@@ -118,10 +124,13 @@ type Engine struct {
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
 	requeueStates         map[int]string
-	checkpointLoaded      bool
-	checkpointExists      bool
-	leaseHeld             bool
-	durableLease          bool
+	// mergeStrikes counts consecutive native-merge failures per PR head SHA
+	// so a never-mergeable PR is bounced instead of re-queued indefinitely.
+	mergeStrikes     map[string]int
+	checkpointLoaded bool
+	checkpointExists bool
+	leaseHeld        bool
+	durableLease     bool
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
@@ -148,6 +157,7 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		queueComments:         map[int]string{},
 		terminalQueueComments: map[int]string{},
 		requeueStates:         map[int]string{},
+		mergeStrikes:          map[string]int{},
 		durableLease:          durableLease,
 	}
 }
@@ -280,6 +290,7 @@ func (e *Engine) resetVolatileQueueState() {
 	e.queueComments = map[int]string{}
 	e.terminalQueueComments = map[int]string{}
 	e.requeueStates = map[int]string{}
+	e.mergeStrikes = map[string]int{}
 	e.checkpointLoaded = false
 	e.checkpointExists = false
 }
@@ -705,6 +716,20 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				e.cleanupBatch(ctx, a)
 				return true, merged, nil
 			}
+			// The forge has had a full nativeMergeTimeout to complete the
+			// scheduled merge and has not. A PR whose merge repeatedly times
+			// out on the same head SHA will never complete on its own
+			// (approval-blocked, changes requested, or conflict) — after
+			// mergeStrikeCap consecutive timeouts, bounce it instead of
+			// re-queueing it forever.
+			if e.strikeMergeFailure(staged) {
+				e.logger.Warn("PR bounced: native merge repeatedly did not complete", "pr", staged.Number, "head", short(staged.Head.Sha))
+				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+				e.cleanupBatch(ctx, a)
+				e.bounce(ctx, staged.Number, staged.Head.Sha,
+					"the forge did not complete its scheduled merge after repeated attempts", "error", a.debugURL)
+				return true, merged, nil
+			}
 			e.requeueActiveRemainder("retrying after forge merge recovery", a.prs)
 			e.cleanupBatch(ctx, a)
 			if err := e.scheduleAutomerge(ctx, current); err != nil {
@@ -860,6 +885,21 @@ func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt tim
 	return !e.now().Before(releasedAt.Add(nativeMergeTimeout))
 }
 
+// strikeMergeFailure records one more consecutive native-merge timeout for
+// the PR's current head SHA and reports whether mergeStrikeCap was reached.
+// A successful merge clears the strike via clearMergeFailure, so the counter
+// only accumulates across genuinely repeated failures on the same head.
+func (e *Engine) strikeMergeFailure(staged forge.PullRequest) bool {
+	e.mergeStrikes[staged.Head.Sha]++
+	return e.mergeStrikes[staged.Head.Sha] >= mergeStrikeCap
+}
+
+// clearMergeFailure forgets native-merge failure tracking for a head SHA
+// (called when the PR merges, so a later PR reusing the head isn't penalized).
+func (e *Engine) clearMergeFailure(headSHA string) {
+	delete(e.mergeStrikes, headSHA)
+}
+
 func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.PullRequest) {
 	if !a.releasedAt.IsZero() {
 		if e.cfg.Metrics != nil {
@@ -869,6 +909,7 @@ func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.
 	if e.cfg.Metrics != nil {
 		e.cfg.Metrics.IncPRMerge(e.metricLabels())
 	}
+	e.clearMergeFailure(staged.Head.Sha)
 	e.observeQueueExit(staged.Number, "merged")
 	e.notifyPR(
 		ctx,

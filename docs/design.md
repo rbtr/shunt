@@ -156,6 +156,19 @@ back to source PRs:
 - skipped/requeued PRs get an `error` status plus a comment explaining why they
   were not landed.
 
+Forgejo's PR API does not expose a reliable "mergeable" flag (`mergeable: true`
+holds even for approval-blocked PRs), so shunt cannot reject a never-mergeable
+PR at admission. Instead, a PR whose scheduled native merge does not complete
+within `nativeMergeTimeout` (5 minutes) accumulates a strike keyed by its head
+SHA. After `mergeStrikeCap` (2) consecutive timeouts on the same head, shunt
+bounces the PR via the normal bounce path — cancelling auto-merge, posting a
+terminal "Bounced from merge queue" outcome — so an approval-blocked,
+changes-requested, or conflicted PR leaves the queue instead of being requeued
+forever. A successful merge clears the strike; a head change restarts the count.
+The first timeout still requeues and restores the schedule (a slow-but-healthy
+merge gets one retry); only the second consecutive timeout on the same head
+terminates the PR.
+
 Queue status and outcome comments use separate hidden markers. The queue status
 comment is posted while shunt acknowledges an auto-merge request held for batch
 linger, or when the PR begins testing, and is then updated as the PR is queued,
