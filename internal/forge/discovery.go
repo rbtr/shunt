@@ -53,6 +53,15 @@ type BranchProtection struct {
 	PushWhitelistUsernames  []string `json:"push_whitelist_usernames"`
 	PushWhitelistTeams      []string `json:"push_whitelist_teams"`
 	PushWhitelistDeployKeys bool     `json:"push_whitelist_deploy_keys"`
+
+	// Admission-gate fields: a PR that cannot satisfy these is barred from
+	// the queue before it wastes a staging/CI run.
+	RequiredApprovals             int64 `json:"required_approvals"`
+	EnableApprovalsWhitelist      bool  `json:"enable_approvals_whitelist"`
+	BlockOnRejectedReviews        bool  `json:"block_on_rejected_reviews"`
+	BlockOnOfficialReviewRequests bool  `json:"block_on_official_review_requests"`
+	IgnoreStaleApprovals          bool  `json:"ignore_stale_approvals"`
+	DismissStaleApprovals         bool  `json:"dismiss_stale_approvals"`
 }
 
 // Hook is the subset of a Forgejo/Gitea repository webhook we manage.

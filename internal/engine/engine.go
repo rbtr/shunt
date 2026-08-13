@@ -66,6 +66,8 @@ type ForgeAPI interface {
 	ListOpenPRs(ctx context.Context, owner, repo, base string) ([]forge.PullRequest, error)
 	GetPR(ctx context.Context, owner, repo string, index int) (forge.PullRequest, error)
 	AutomergeState(ctx context.Context, owner, repo string, index int) (forge.AutomergeState, error)
+	ListReviews(ctx context.Context, owner, repo string, index int) ([]forge.Review, error)
+	ProtectedBranch(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error)
 	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (forge.CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
@@ -81,6 +83,12 @@ const (
 	landingSuccessDescription = "merge queue: batch passed"
 	queueRestoreDescription   = "merge queue: re-queued after incomplete native merge"
 	nativeMergeTimeout        = 5 * time.Minute
+	// mergeStrikeCap is how many consecutive native-merge failures on the
+	// same PR head bounce the PR out of the queue instead of re-queueing it
+	// forever. A never-mergeable PR (approval-blocked, changes requested,
+	// merge conflict) is observed via the 5-minute native-merge timeout; two
+	// consecutive timeouts on the same head terminate it.
+	mergeStrikeCap = 2
 )
 
 // nativeMergeGrace bounds how long land() waits within one tick for the
@@ -118,10 +126,13 @@ type Engine struct {
 	queueComments         map[int]string
 	terminalQueueComments map[int]string
 	requeueStates         map[int]string
-	checkpointLoaded      bool
-	checkpointExists      bool
-	leaseHeld             bool
-	durableLease          bool
+	// mergeStrikes counts consecutive native-merge failures per PR head SHA
+	// so a never-mergeable PR is bounced instead of re-queued indefinitely.
+	mergeStrikes     map[string]int
+	checkpointLoaded bool
+	checkpointExists bool
+	leaseHeld        bool
+	durableLease     bool
 }
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
@@ -148,6 +159,7 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		queueComments:         map[int]string{},
 		terminalQueueComments: map[int]string{},
 		requeueStates:         map[int]string{},
+		mergeStrikes:          map[string]int{},
 		durableLease:          durableLease,
 	}
 }
@@ -280,6 +292,7 @@ func (e *Engine) resetVolatileQueueState() {
 	e.queueComments = map[int]string{}
 	e.terminalQueueComments = map[int]string{}
 	e.requeueStates = map[int]string{}
+	e.mergeStrikes = map[string]int{}
 	e.checkpointLoaded = false
 	e.checkpointExists = false
 }
@@ -291,6 +304,16 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fetch the base-branch protection rule once per admission pass. If the
+	// rule requires approvals or blocks on reviews, a PR that cannot satisfy
+	// it (approval-blocked, changes-requested) must not enter the queue at
+	// all — it would otherwise waste a full staging/CI run before the
+	// native-merge timeout bounce catches it.
+	protection, err := e.fc.ProtectedBranch(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return nil, err
+	}
+	gate := admissionGate{protection: protection}
 	var nums []int
 	for _, p := range prs {
 		// Quick check: if the PR is not scheduled, it was likely a bounced
@@ -319,6 +342,17 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 			e.observeQueueExit(p.Number, "ineligible")
 			continue
 		}
+		// For an already-scheduled PR the 409 path skips Forgejo's 422
+		// requirement validation, so re-check the review policy ourselves:
+		// a PR blocked by approvals or a live changes-requested review would
+		// never merge and must not consume a staging/CI run.
+		if blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, p.Number); err != nil {
+			return nil, err
+		} else if blocked {
+			e.logger.Info("PR blocked from merge queue by review policy", "pr", p.Number, "reason", reason)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
 		ok, err := e.queued(ctx, p)
 		if err != nil {
 			return nil, err
@@ -332,6 +366,51 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 		nums = nums[:e.cfg.MaxBatch]
 	}
 	return nums, nil
+}
+
+// admissionGate replicates the branch-protection review policy that Forgejo's
+// merge gate applies, so shunt can refuse to queue a PR that can never merge.
+// The rule only blocks when it actually requires something; a repo with no
+// protection rule (or one without approval/review requirements) admits freely.
+type admissionGate struct {
+	protection forge.BranchProtection
+}
+
+// blocks reports whether the PR is barred from the queue by the base-branch
+// review policy, and why. It mirrors HasEnoughApprovals,
+// MergeBlockedByRejectedReview, and MergeBlockedByOfficialReviewRequests:
+// approvals must be official, non-dismissed, and (when IgnoreStaleApprovals)
+// non-stale; a live REQUEST_CHANGES blocks when BlockOnRejectedReviews; an
+// outstanding official review request blocks when
+// BlockOnOfficialReviewRequests.
+func (g admissionGate) blocks(ctx context.Context, fc ForgeAPI, owner, repo string, num int) (bool, string, error) {
+	p := g.protection
+	if p.RequiredApprovals == 0 && !p.BlockOnRejectedReviews && !p.BlockOnOfficialReviewRequests {
+		return false, "", nil
+	}
+	reviews, err := fc.ListReviews(ctx, owner, repo, num)
+	if err != nil {
+		return false, "", err
+	}
+	var granted int64
+	for _, r := range reviews {
+		if r.Dismissed {
+			continue
+		}
+		if r.State == "APPROVED" && r.Official && (!p.IgnoreStaleApprovals || !r.Stale) {
+			granted++
+		}
+		if p.BlockOnRejectedReviews && r.State == "REQUEST_CHANGES" && r.Official {
+			return true, "a reviewer requested changes", nil
+		}
+		if p.BlockOnOfficialReviewRequests && r.State == "REQUEST_REVIEW" && r.Official {
+			return true, "an official review was requested", nil
+		}
+	}
+	if p.RequiredApprovals > 0 && granted < p.RequiredApprovals {
+		return true, fmt.Sprintf("needs %d more approval(s)", p.RequiredApprovals-granted), nil
+	}
+	return false, "", nil
 }
 
 // resolve drops PRs from a candidate that are no longer open or no longer have
@@ -705,6 +784,20 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				e.cleanupBatch(ctx, a)
 				return true, merged, nil
 			}
+			// The forge has had a full nativeMergeTimeout to complete the
+			// scheduled merge and has not. A PR whose merge repeatedly times
+			// out on the same head SHA will never complete on its own
+			// (approval-blocked, changes requested, or conflict) — after
+			// mergeStrikeCap consecutive timeouts, bounce it instead of
+			// re-queueing it forever.
+			if e.strikeMergeFailure(staged) {
+				e.logger.Warn("PR bounced: native merge repeatedly did not complete", "pr", staged.Number, "head", short(staged.Head.Sha))
+				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+				e.cleanupBatch(ctx, a)
+				e.bounce(ctx, staged.Number, staged.Head.Sha,
+					"the forge did not complete its scheduled merge after repeated attempts", "error", a.debugURL)
+				return true, merged, nil
+			}
 			e.requeueActiveRemainder("retrying after forge merge recovery", a.prs)
 			e.cleanupBatch(ctx, a)
 			if err := e.scheduleAutomerge(ctx, current); err != nil {
@@ -860,6 +953,21 @@ func (e *Engine) nativeMergeTimedOut(a *activeBatch, pr int, statusCreatedAt tim
 	return !e.now().Before(releasedAt.Add(nativeMergeTimeout))
 }
 
+// strikeMergeFailure records one more consecutive native-merge timeout for
+// the PR's current head SHA and reports whether mergeStrikeCap was reached.
+// A successful merge clears the strike via clearMergeFailure, so the counter
+// only accumulates across genuinely repeated failures on the same head.
+func (e *Engine) strikeMergeFailure(staged forge.PullRequest) bool {
+	e.mergeStrikes[staged.Head.Sha]++
+	return e.mergeStrikes[staged.Head.Sha] >= mergeStrikeCap
+}
+
+// clearMergeFailure forgets native-merge failure tracking for a head SHA
+// (called when the PR merges, so a later PR reusing the head isn't penalized).
+func (e *Engine) clearMergeFailure(headSHA string) {
+	delete(e.mergeStrikes, headSHA)
+}
+
 func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.PullRequest) {
 	if !a.releasedAt.IsZero() {
 		if e.cfg.Metrics != nil {
@@ -869,6 +977,7 @@ func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.
 	if e.cfg.Metrics != nil {
 		e.cfg.Metrics.IncPRMerge(e.metricLabels())
 	}
+	e.clearMergeFailure(staged.Head.Sha)
 	e.observeQueueExit(staged.Number, "merged")
 	e.notifyPR(
 		ctx,

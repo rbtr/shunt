@@ -32,6 +32,8 @@ type mock struct {
 	automerge            map[int]bool
 	scheduleLive         map[int]bool
 	automergeAt          map[int]time.Time
+	reviews              map[int][]forge.Review
+	protection           forge.BranchProtection
 	latestStatus         map[int]forge.CommitStatus
 	nativePending        map[int]string
 	batchOf              map[string][]int // staging sha -> PR numbers
@@ -70,6 +72,7 @@ type mock struct {
 func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
 		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{}, scheduleLive: map[int]bool{}, automergeAt: map[int]time.Time{},
+		reviews:      map[int][]forge.Review{},
 		latestStatus: map[int]forge.CommitStatus{}, nativePending: map[int]string{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
 		comments: map[int][]string{}, queueComments: map[int][]string{}, runURLs: map[string]string{},
@@ -120,6 +123,14 @@ func (m *mock) AutomergeState(_ context.Context, _, _ string, n int) (forge.Auto
 		m.beforeAutomergeState(n)
 	}
 	return forge.AutomergeState{Scheduled: m.automerge[n], UpdatedAt: m.automergeAt[n]}, nil
+}
+
+func (m *mock) ListReviews(_ context.Context, _, _ string, n int) ([]forge.Review, error) {
+	return m.reviews[n], nil
+}
+
+func (m *mock) ProtectedBranch(_ context.Context, _, _, _ string) (forge.BranchProtection, error) {
+	return m.protection, nil
 }
 func (m *mock) LatestCommitStatus(_ context.Context, _, _, sha, statusContext string) (forge.CommitStatus, bool, error) {
 	for n, pr := range m.prs {
@@ -286,6 +297,107 @@ func drive(e *Engine, n int) {
 		if m, ok := e.fc.(*mock); ok {
 			m.advanceNative()
 		}
+	}
+}
+
+func TestAdmissionBlocksChangesRequestedPRBeforeStaging(t *testing.T) {
+	m := newMock(-1, 1)
+	// Base branch requires approval and blocks on rejected reviews; the PR
+	// has a live official REQUEST_CHANGES review.
+	m.protection = forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}
+	m.reviews[1] = []forge.Review{{State: "REQUEST_CHANGES", Official: true}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The PR must never be staged: no staging run means no wasted CI.
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want [] (blocked PR must not consume a CI run)", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want [] (blocked PR not queued)", got)
+	}
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged = %s, want []", got)
+	}
+}
+
+func TestAdmissionBlocksPRWithoutEnoughApprovals(t *testing.T) {
+	m := newMock(-1, 1)
+	m.protection = forge.BranchProtection{RequiredApprovals: 2}
+	// One official, non-stale approval — short of the required two.
+	m.reviews[1] = []forge.Review{{State: "APPROVED", Official: true, Stale: false}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want [] (under-approval PR must not be staged)", got)
+	}
+}
+
+func TestAdmissionAllowsPRWithEnoughApprovals(t *testing.T) {
+	m := newMock(-1, 1)
+	m.protection = forge.BranchProtection{RequiredApprovals: 2, IgnoreStaleApprovals: true}
+	m.reviews[1] = []forge.Review{
+		{State: "APPROVED", Official: true, Stale: false},
+		{State: "APPROVED", Official: true, Stale: false},
+		{State: "APPROVED", Official: true, Stale: true},   // stale, ignored
+		{State: "APPROVED", Official: false, Stale: false}, // not official, ignored
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// The first tick stages the batch (sufficient approvals), the gate runs.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile stage: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want PR staged (sufficient approvals)", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want []", got)
+	}
+}
+
+// TestAdmissionGateHonestState is the honest-state sibling: the gate blocks
+// only when the branch-protection rule actually requires something. A PR with
+// a dismissed reject, a non-official reject, or no protection rule at all must
+// still be admitted — the mock state is read as-is, never fabricated.
+func TestAdmissionGateHonestState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		protection forge.BranchProtection
+		reviews    []forge.Review
+		wantStaged bool
+	}{
+		{name: "no protection rule", protection: forge.BranchProtection{}, reviews: []forge.Review{{State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
+		{name: "reject blocked off", protection: forge.BranchProtection{RequiredApprovals: 1}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
+		{name: "non-official reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: false}}, wantStaged: true},
+		{name: "dismissed reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true, Dismissed: true}}, wantStaged: true},
+		{name: "approval satisfies requirement", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}}, wantStaged: true},
+		{name: "live reject blocks", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true}}, wantStaged: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMock(-1, 1)
+			m.protection = tc.protection
+			m.reviews[1] = tc.reviews
+			e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+			if err := e.Reconcile(context.Background()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			got := fmt.Sprint(m.staged)
+			if tc.wantStaged {
+				if got != "[[1]]" {
+					t.Fatalf("staged = %s, want PR admitted", got)
+				}
+			} else if got != "[]" {
+				t.Fatalf("staged = %s, want [] (blocked before staging)", got)
+			}
+		})
 	}
 }
 
@@ -997,6 +1109,133 @@ func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
 		t.Errorf("comments missing landed outcome:\n%s", got)
+	}
+}
+
+func TestNeverMergeablePRBouncedAfterRepeatedTimeouts(t *testing.T) {
+	m := newMock(-1, 1)
+	// failNativeMerge: the forge accepts the schedule but never completes the
+	// merge — simulating a PR that is approval-blocked / changes-requested /
+	// conflicted and will never merge on its own.
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "rebase", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	// Tick 1: stage the batch; tick 2: gate passes, release to native
+	// auto-merge (grace window is 0 in tests, so the tick yields unresolved).
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+
+	// First nativeMergeTimeout: recovery requeues + restores (strike 1). The
+	// PR must NOT be bounced after a single timeout — slow merges get one retry.
+	m.advanceNative() // no-op under failNativeMerge
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+	if m.bounced[1] {
+		t.Fatal("PR bounced after a single native-merge timeout; want one retry")
+	}
+	if got := fmt.Sprint(e.pending); got != "[[1]]" {
+		t.Fatalf("pending = %s, want PR requeued after first timeout", got)
+	}
+
+	// Re-stage and re-release, then a second nativeMergeTimeout: strike 2 → bounce.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-stage: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-release: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+
+	if !m.bounced[1] {
+		t.Fatal("PR not bounced after repeated native-merge timeouts")
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "cancel:1") {
+		t.Fatalf("calls = %s, want auto-merge cancelled on bounce", got)
+	}
+	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Bounced from merge queue") {
+		t.Fatalf("comments = %s, want terminal bounce outcome", got)
+	}
+	if m.scheduleLive[1] {
+		t.Fatal("auto-merge still scheduled after bounce")
+	}
+	// Next tick: the PR is no longer scheduled, so it is not admitted again.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("post-bounce reconcile: %v", err)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want [] after bounce (PR leaves the queue)", got)
+	}
+}
+
+// TestMergeStrikesArePerHeadSHA is the honest-state sibling: the strike
+// counter is keyed by the PR's actual head SHA, records real consecutive
+// failures, and a successful merge clears it — a single timeout must not
+// fabricate a bounce, and a merged head must not carry stale strikes.
+func TestMergeStrikesArePerHeadSHA(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.failNativeMerge = 1
+	now := time.Now()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", MergeStyle: "rebase", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release PR: %v", err)
+	}
+	m.advanceNative()
+	now = now.Add(nativeMergeTimeout + time.Second)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+
+	// One timeout records exactly one strike for head-1, not a bounce, and no
+	// fabricated strikes for other heads.
+	if got := e.mergeStrikes["head-1"]; got != 1 {
+		t.Fatalf("mergeStrikes[head-1] = %d, want 1 after one timeout", got)
+	}
+	if got := len(e.mergeStrikes); got != 1 {
+		t.Fatalf("mergeStrikes = %d keys, want only the failed head recorded", got)
+	}
+	if m.bounced[1] || m.bounced[2] {
+		t.Fatal("no PR may bounce after a single timeout")
+	}
+
+	// Now the forge completes the merge (e.g. an approval lands): the next
+	// release must land normally, clearing the strike.
+	m.failNativeMerge = 0
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-stage: %v", err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("re-release: %v", err)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
+	}
+
+	if got := fmt.Sprint(m.merged); got != "[1]" {
+		t.Fatalf("merged = %s, want PR 1 landed after approval", got)
+	}
+	if m.bounced[1] {
+		t.Fatal("PR bounced despite eventually merging")
+	}
+	if got := len(e.mergeStrikes); got != 0 {
+		t.Fatalf("mergeStrikes = %d keys, want cleared after a successful merge", got)
 	}
 }
 
