@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-12
+
+### Fixed
+
+- Never-mergeable PRs (approval-blocked, changes-requested, or conflicted) no
+  longer loop through the queue forever. `readyNumbers` now consults the
+  base-branch review policy before admission: when the protection rule requires
+  approvals or blocks on reviews, a PR barred by it — insufficient official
+  approvals, a live official changes-requested review, or an outstanding
+  official review request — is refused entry entirely, before any staging or CI
+  run. Repos without a protection rule admit PRs unchanged; approval semantics
+  mirror Forgejo's merge gate (official, non-dismissed, and non-stale when
+  configured).
+- As a safety net for PRs that become unmergeable after admission (e.g. a
+  review lands while already staged), the engine tracks consecutive
+  native-merge timeouts keyed by PR head SHA. After two timeouts on the same
+  head, the PR is bounced via the normal bounce path — auto-merge cancelled,
+  terminal "Bounced from merge queue" outcome — so it leaves the queue instead
+  of being requeued indefinitely. The first timeout still gives a slow-but-
+  healthy merge one retry; a successful merge clears the strike.
+
 ## [0.12.0] - 2026-08-12
 
 ### Added
@@ -285,7 +306,8 @@ Initial release.
   non-interactive Git credential prompts instead of embedding tokens in clone
   URLs.
 
-[Unreleased]: https://github.com/rbtr/shunt/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/rbtr/shunt/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/rbtr/shunt/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rbtr/shunt/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rbtr/shunt/compare/v0.9.0...v0.11.0
 [0.9.0]: https://github.com/rbtr/shunt/compare/v0.8.0...v0.9.0
