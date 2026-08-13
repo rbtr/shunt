@@ -66,6 +66,8 @@ type ForgeAPI interface {
 	ListOpenPRs(ctx context.Context, owner, repo, base string) ([]forge.PullRequest, error)
 	GetPR(ctx context.Context, owner, repo string, index int) (forge.PullRequest, error)
 	AutomergeState(ctx context.Context, owner, repo string, index int) (forge.AutomergeState, error)
+	ListReviews(ctx context.Context, owner, repo string, index int) ([]forge.Review, error)
+	ProtectedBranch(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error)
 	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (forge.CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
@@ -302,6 +304,16 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fetch the base-branch protection rule once per admission pass. If the
+	// rule requires approvals or blocks on reviews, a PR that cannot satisfy
+	// it (approval-blocked, changes-requested) must not enter the queue at
+	// all — it would otherwise waste a full staging/CI run before the
+	// native-merge timeout bounce catches it.
+	protection, err := e.fc.ProtectedBranch(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return nil, err
+	}
+	gate := admissionGate{protection: protection}
 	var nums []int
 	for _, p := range prs {
 		// Quick check: if the PR is not scheduled, it was likely a bounced
@@ -330,6 +342,17 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 			e.observeQueueExit(p.Number, "ineligible")
 			continue
 		}
+		// For an already-scheduled PR the 409 path skips Forgejo's 422
+		// requirement validation, so re-check the review policy ourselves:
+		// a PR blocked by approvals or a live changes-requested review would
+		// never merge and must not consume a staging/CI run.
+		if blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, p.Number); err != nil {
+			return nil, err
+		} else if blocked {
+			e.logger.Info("PR blocked from merge queue by review policy", "pr", p.Number, "reason", reason)
+			e.observeQueueExit(p.Number, "ineligible")
+			continue
+		}
 		ok, err := e.queued(ctx, p)
 		if err != nil {
 			return nil, err
@@ -343,6 +366,51 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 		nums = nums[:e.cfg.MaxBatch]
 	}
 	return nums, nil
+}
+
+// admissionGate replicates the branch-protection review policy that Forgejo's
+// merge gate applies, so shunt can refuse to queue a PR that can never merge.
+// The rule only blocks when it actually requires something; a repo with no
+// protection rule (or one without approval/review requirements) admits freely.
+type admissionGate struct {
+	protection forge.BranchProtection
+}
+
+// blocks reports whether the PR is barred from the queue by the base-branch
+// review policy, and why. It mirrors HasEnoughApprovals,
+// MergeBlockedByRejectedReview, and MergeBlockedByOfficialReviewRequests:
+// approvals must be official, non-dismissed, and (when IgnoreStaleApprovals)
+// non-stale; a live REQUEST_CHANGES blocks when BlockOnRejectedReviews; an
+// outstanding official review request blocks when
+// BlockOnOfficialReviewRequests.
+func (g admissionGate) blocks(ctx context.Context, fc ForgeAPI, owner, repo string, num int) (bool, string, error) {
+	p := g.protection
+	if p.RequiredApprovals == 0 && !p.BlockOnRejectedReviews && !p.BlockOnOfficialReviewRequests {
+		return false, "", nil
+	}
+	reviews, err := fc.ListReviews(ctx, owner, repo, num)
+	if err != nil {
+		return false, "", err
+	}
+	var granted int64
+	for _, r := range reviews {
+		if r.Dismissed {
+			continue
+		}
+		if r.State == "APPROVED" && r.Official && (!p.IgnoreStaleApprovals || !r.Stale) {
+			granted++
+		}
+		if p.BlockOnRejectedReviews && r.State == "REQUEST_CHANGES" && r.Official {
+			return true, "a reviewer requested changes", nil
+		}
+		if p.BlockOnOfficialReviewRequests && r.State == "REQUEST_REVIEW" && r.Official {
+			return true, "an official review was requested", nil
+		}
+	}
+	if p.RequiredApprovals > 0 && granted < p.RequiredApprovals {
+		return true, fmt.Sprintf("needs %d more approval(s)", p.RequiredApprovals-granted), nil
+	}
+	return false, "", nil
 }
 
 // resolve drops PRs from a candidate that are no longer open or no longer have

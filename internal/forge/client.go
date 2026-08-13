@@ -152,6 +152,17 @@ type AutomergeState struct {
 	UpdatedAt time.Time
 }
 
+// Review is the subset of a pull-request review that shunt's admission gate
+// needs. Official is computed by Forgejo (reviewer in the approvals whitelist
+// or with write access when no rule exists); Stale marks a review made before
+// the head commit changed; Dismissed means an admin dismissed it.
+type Review struct {
+	State     string `json:"state"` // APPROVED | REQUEST_CHANGES | REQUEST_REVIEW | COMMENT | PENDING
+	Official  bool   `json:"official"`
+	Dismissed bool   `json:"dismissed"`
+	Stale     bool   `json:"stale"`
+}
+
 // ScheduleAutomergeResult captures the outcome of a ScheduleAutomerge attempt.
 type ScheduleAutomergeResult struct {
 	// Eligible is true when Forgejo accepted the schedule request.
@@ -512,6 +523,32 @@ func (c *Client) ScheduleAutomerge(ctx context.Context, owner, repo string, inde
 	}
 	// 201 Created — schedule accepted.
 	return ScheduleAutomergeResult{Eligible: true}, nil
+}
+
+// ListReviews returns the reviews posted on a pull request, newest first.
+func (c *Client) ListReviews(ctx context.Context, owner, repo string, index int) ([]Review, error) {
+	var reviews []Review
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d/reviews", repoPath(owner, repo), index), nil, &reviews); err != nil {
+		return nil, err
+	}
+	return reviews, nil
+}
+
+// ProtectedBranch returns the branch-protection rule for branch, or
+// (zero-value, nil) when the branch has no protection rule (not blocked).
+func (c *Client) ProtectedBranch(ctx context.Context, owner, repo, branch string) (BranchProtection, error) {
+	data, err := c.doRaw(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branches/%s/protection", repoPath(owner, repo), url.PathEscape(branch)), nil)
+	if errors.Is(err, ErrNotFound) {
+		return BranchProtection{}, nil
+	}
+	if err != nil {
+		return BranchProtection{}, err
+	}
+	var p BranchProtection
+	if err := json.Unmarshal(data, &p); err != nil {
+		return BranchProtection{}, err
+	}
+	return p, nil
 }
 
 // CancelAutomerge reports whether a live scheduled merge was removed.

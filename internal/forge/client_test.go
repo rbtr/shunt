@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -81,6 +82,67 @@ func TestCancelAutomergeReportsWhetherScheduleExisted(t *testing.T) {
 				t.Fatalf("cancelled = %v, want %v", cancelled, tc.cancelled)
 			}
 		})
+	}
+}
+
+func TestListReviewsParsesReviewFlags(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/repos/o/r/pulls/7/reviews" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[{"state":"APPROVED","official":true,"dismissed":false,"stale":true},{"state":"REQUEST_CHANGES","official":true},{"state":"COMMENT","official":false}]`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	reviews, err := c.ListReviews(context.Background(), "o", "r", 7)
+	if err != nil {
+		t.Fatalf("ListReviews: %v", err)
+	}
+	if len(reviews) != 3 {
+		t.Fatalf("reviews = %d, want 3", len(reviews))
+	}
+	if reviews[0] != (Review{State: "APPROVED", Official: true, Stale: true}) {
+		t.Fatalf("review[0] = %+v", reviews[0])
+	}
+	if reviews[1] != (Review{State: "REQUEST_CHANGES", Official: true}) {
+		t.Fatalf("review[1] = %+v", reviews[1])
+	}
+}
+
+func TestProtectedBranchParsesRequirementsAnd404MeansNoRule(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		if r.URL.Path == "/api/v1/repos/o/r/branches/main/protection" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"required_approvals":2,"block_on_rejected_reviews":true,"block_on_official_review_requests":true,"ignore_stale_approvals":true}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	p, err := c.ProtectedBranch(context.Background(), "o", "r", "main")
+	if err != nil {
+		t.Fatalf("ProtectedBranch: %v", err)
+	}
+	if p.RequiredApprovals != 2 || !p.BlockOnRejectedReviews || !p.BlockOnOfficialReviewRequests || !p.IgnoreStaleApprovals {
+		t.Fatalf("protection = %+v", p)
+	}
+	if !strings.Contains(path, "branches/main/protection") {
+		t.Fatalf("path = %s, want protection endpoint", path)
+	}
+
+	// A branch with no rule returns a zero-value rule, not an error.
+	p, err = c.ProtectedBranch(context.Background(), "o", "r", "other")
+	if err != nil {
+		t.Fatalf("ProtectedBranch (no rule): %v", err)
+	}
+	if p.RequiredApprovals != 0 || p.BlockOnRejectedReviews || p.BlockOnOfficialReviewRequests || p.IgnoreStaleApprovals {
+		t.Fatalf("protection (no rule) = %+v, want zero value", p)
 	}
 }
 

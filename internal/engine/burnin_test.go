@@ -134,6 +134,14 @@ func (b *burnInForge) AutomergeState(_ context.Context, _, _ string, index int) 
 	return forge.AutomergeState{Scheduled: b.automerge[index]}, nil
 }
 
+func (b *burnInForge) ListReviews(_ context.Context, _, _ string, _ int) ([]forge.Review, error) {
+	return nil, nil
+}
+
+func (b *burnInForge) ProtectedBranch(_ context.Context, _, _, _ string) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
+
 func (b *burnInForge) LatestCommitStatus(_ context.Context, _, _, _, _ string) (forge.CommitStatus, bool, error) {
 	return forge.CommitStatus{}, false, nil
 }

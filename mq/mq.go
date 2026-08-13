@@ -79,6 +79,25 @@ type AutomergeState struct {
 	UpdatedAt time.Time
 }
 
+// Review is the subset of a pull-request review the admission gate needs.
+type Review struct {
+	State     string `json:"state"` // APPROVED | REQUEST_CHANGES | REQUEST_REVIEW | COMMENT | PENDING
+	Official  bool   `json:"official"`
+	Dismissed bool   `json:"dismissed"`
+	Stale     bool   `json:"stale"`
+}
+
+// BranchProtection is the subset of a base-branch protection rule the
+// admission gate needs. Absent fields mean the rule does not gate on them.
+type BranchProtection struct {
+	RequiredApprovals             int64 `json:"required_approvals"`
+	EnableApprovalsWhitelist      bool  `json:"enable_approvals_whitelist"`
+	BlockOnRejectedReviews        bool  `json:"block_on_rejected_reviews"`
+	BlockOnOfficialReviewRequests bool  `json:"block_on_official_review_requests"`
+	IgnoreStaleApprovals          bool  `json:"ignore_stale_approvals"`
+	DismissStaleApprovals         bool  `json:"dismiss_stale_approvals"`
+}
+
 // CommitStatus mirrors the Forgejo API shape for commit statuses.
 type CommitStatus struct {
 	ID          int64     `json:"id"`
@@ -183,6 +202,8 @@ type ForgeClient interface {
 	ListOpenPRs(ctx context.Context, owner, repo, base string) ([]PullRequest, error)
 	GetPR(ctx context.Context, owner, repo string, index int) (PullRequest, error)
 	AutomergeState(ctx context.Context, owner, repo string, index int) (AutomergeState, error)
+	ListReviews(ctx context.Context, owner, repo string, index int) ([]Review, error)
+	ProtectedBranch(ctx context.Context, owner, repo, branch string) (BranchProtection, error)
 	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
@@ -226,6 +247,33 @@ func (a *adapter) ListOpenPRs(ctx context.Context, owner, repo, base string) ([]
 		}
 	}
 	return out, nil
+}
+
+func (a *adapter) ListReviews(ctx context.Context, owner, repo string, index int) ([]forge.Review, error) {
+	reviews, err := a.fc.ListReviews(ctx, owner, repo, index)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]forge.Review, len(reviews))
+	for i, r := range reviews {
+		out[i] = forge.Review{State: r.State, Official: r.Official, Dismissed: r.Dismissed, Stale: r.Stale}
+	}
+	return out, nil
+}
+
+func (a *adapter) ProtectedBranch(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error) {
+	p, err := a.fc.ProtectedBranch(ctx, owner, repo, branch)
+	if err != nil {
+		return forge.BranchProtection{}, err
+	}
+	return forge.BranchProtection{
+		RequiredApprovals:             p.RequiredApprovals,
+		EnableApprovalsWhitelist:      p.EnableApprovalsWhitelist,
+		BlockOnRejectedReviews:        p.BlockOnRejectedReviews,
+		BlockOnOfficialReviewRequests: p.BlockOnOfficialReviewRequests,
+		IgnoreStaleApprovals:          p.IgnoreStaleApprovals,
+		DismissStaleApprovals:         p.DismissStaleApprovals,
+	}, nil
 }
 
 func (a *adapter) GetPR(ctx context.Context, owner, repo string, index int) (forge.PullRequest, error) {

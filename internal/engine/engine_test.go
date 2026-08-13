@@ -32,6 +32,8 @@ type mock struct {
 	automerge            map[int]bool
 	scheduleLive         map[int]bool
 	automergeAt          map[int]time.Time
+	reviews              map[int][]forge.Review
+	protection           forge.BranchProtection
 	latestStatus         map[int]forge.CommitStatus
 	nativePending        map[int]string
 	batchOf              map[string][]int // staging sha -> PR numbers
@@ -70,6 +72,7 @@ type mock struct {
 func newMock(badPR int, prNums ...int) *mock {
 	m := &mock{
 		prs: map[int]*forge.PullRequest{}, automerge: map[int]bool{}, scheduleLive: map[int]bool{}, automergeAt: map[int]time.Time{},
+		reviews:      map[int][]forge.Review{},
 		latestStatus: map[int]forge.CommitStatus{}, nativePending: map[int]string{},
 		batchOf: map[string][]int{}, badPR: badPR, bounced: map[int]bool{},
 		comments: map[int][]string{}, queueComments: map[int][]string{}, runURLs: map[string]string{},
@@ -120,6 +123,14 @@ func (m *mock) AutomergeState(_ context.Context, _, _ string, n int) (forge.Auto
 		m.beforeAutomergeState(n)
 	}
 	return forge.AutomergeState{Scheduled: m.automerge[n], UpdatedAt: m.automergeAt[n]}, nil
+}
+
+func (m *mock) ListReviews(_ context.Context, _, _ string, n int) ([]forge.Review, error) {
+	return m.reviews[n], nil
+}
+
+func (m *mock) ProtectedBranch(_ context.Context, _, _, _ string) (forge.BranchProtection, error) {
+	return m.protection, nil
 }
 func (m *mock) LatestCommitStatus(_ context.Context, _, _, sha, statusContext string) (forge.CommitStatus, bool, error) {
 	for n, pr := range m.prs {
@@ -286,6 +297,107 @@ func drive(e *Engine, n int) {
 		if m, ok := e.fc.(*mock); ok {
 			m.advanceNative()
 		}
+	}
+}
+
+func TestAdmissionBlocksChangesRequestedPRBeforeStaging(t *testing.T) {
+	m := newMock(-1, 1)
+	// Base branch requires approval and blocks on rejected reviews; the PR
+	// has a live official REQUEST_CHANGES review.
+	m.protection = forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}
+	m.reviews[1] = []forge.Review{{State: "REQUEST_CHANGES", Official: true}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The PR must never be staged: no staging run means no wasted CI.
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want [] (blocked PR must not consume a CI run)", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want [] (blocked PR not queued)", got)
+	}
+	if got := fmt.Sprint(m.merged); got != "[]" {
+		t.Fatalf("merged = %s, want []", got)
+	}
+}
+
+func TestAdmissionBlocksPRWithoutEnoughApprovals(t *testing.T) {
+	m := newMock(-1, 1)
+	m.protection = forge.BranchProtection{RequiredApprovals: 2}
+	// One official, non-stale approval — short of the required two.
+	m.reviews[1] = []forge.Review{{State: "APPROVED", Official: true, Stale: false}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[]" {
+		t.Fatalf("staged = %s, want [] (under-approval PR must not be staged)", got)
+	}
+}
+
+func TestAdmissionAllowsPRWithEnoughApprovals(t *testing.T) {
+	m := newMock(-1, 1)
+	m.protection = forge.BranchProtection{RequiredApprovals: 2, IgnoreStaleApprovals: true}
+	m.reviews[1] = []forge.Review{
+		{State: "APPROVED", Official: true, Stale: false},
+		{State: "APPROVED", Official: true, Stale: false},
+		{State: "APPROVED", Official: true, Stale: true},   // stale, ignored
+		{State: "APPROVED", Official: false, Stale: false}, // not official, ignored
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// The first tick stages the batch (sufficient approvals), the gate runs.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile stage: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want PR staged (sufficient approvals)", got)
+	}
+	if got := fmt.Sprint(e.pending); got != "[]" {
+		t.Fatalf("pending = %s, want []", got)
+	}
+}
+
+// TestAdmissionGateHonestState is the honest-state sibling: the gate blocks
+// only when the branch-protection rule actually requires something. A PR with
+// a dismissed reject, a non-official reject, or no protection rule at all must
+// still be admitted — the mock state is read as-is, never fabricated.
+func TestAdmissionGateHonestState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		protection forge.BranchProtection
+		reviews    []forge.Review
+		wantStaged bool
+	}{
+		{name: "no protection rule", protection: forge.BranchProtection{}, reviews: []forge.Review{{State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
+		{name: "reject blocked off", protection: forge.BranchProtection{RequiredApprovals: 1}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
+		{name: "non-official reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: false}}, wantStaged: true},
+		{name: "dismissed reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true, Dismissed: true}}, wantStaged: true},
+		{name: "approval satisfies requirement", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}}, wantStaged: true},
+		{name: "live reject blocks", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true}}, wantStaged: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMock(-1, 1)
+			m.protection = tc.protection
+			m.reviews[1] = tc.reviews
+			e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+			if err := e.Reconcile(context.Background()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			got := fmt.Sprint(m.staged)
+			if tc.wantStaged {
+				if got != "[[1]]" {
+					t.Fatalf("staged = %s, want PR admitted", got)
+				}
+			} else if got != "[]" {
+				t.Fatalf("staged = %s, want [] (blocked before staging)", got)
+			}
+		})
 	}
 }
 
