@@ -374,6 +374,14 @@ func TestAdmissionGateHonestState(t *testing.T) {
 		wantStaged bool
 	}{
 		{name: "no protection rule", protection: forge.BranchProtection{}, reviews: []forge.Review{{State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
+		// The common production rule: branch protection requires the
+		// merge-queue status check (which shunt itself writes only after the
+		// gate passes) and maybe approvals. The admission gate must NOT treat
+		// the absent merge-queue check as a block — that would brick every
+		// queue.
+		{name: "status check required, no approvals", protection: forge.BranchProtection{EnableStatusCheck: true, StatusCheckContexts: []string{"merge-queue"}}, reviews: nil, wantStaged: true},
+		{name: "status check + approvals met", protection: forge.BranchProtection{EnableStatusCheck: true, StatusCheckContexts: []string{"merge-queue"}, RequiredApprovals: 1}, reviews: []forge.Review{{State: "APPROVED", Official: true}}, wantStaged: true},
+		{name: "status check + approvals unmet", protection: forge.BranchProtection{EnableStatusCheck: true, StatusCheckContexts: []string{"merge-queue"}, RequiredApprovals: 1}, reviews: nil, wantStaged: false},
 		{name: "reject blocked off", protection: forge.BranchProtection{RequiredApprovals: 1}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true}}, wantStaged: true},
 		{name: "non-official reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: false}}, wantStaged: true},
 		{name: "dismissed reject ignored", protection: forge.BranchProtection{RequiredApprovals: 1, BlockOnRejectedReviews: true}, reviews: []forge.Review{{State: "APPROVED", Official: true}, {State: "REQUEST_CHANGES", Official: true, Dismissed: true}}, wantStaged: true},
