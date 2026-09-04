@@ -30,14 +30,16 @@ type QueueSnapshot struct {
 }
 
 // ActiveBatchSnapshot records a staging branch currently waiting on its gate.
-// On restore the engine re-queues these PRs for fresh staging (applySnapshot
-// sets active = nil) — it does not resume the staged branch.
+// The engine resumes the staged branch after restart, preserving its gate
+// wait and missing-gate retry state.
 type ActiveBatchSnapshot struct {
-	PRs            []PullRequestSnapshot `json:"PRs"`
-	StagingBranch  string                `json:"StagingBranch"`
-	StagingSHA     string                `json:"StagingSHA"`
-	BaseGeneration int                   `json:"BaseGeneration"`
-	Outcome        string                `json:"Outcome"`
+	PRs                []PullRequestSnapshot `json:"PRs"`
+	StagingBranch      string                `json:"StagingBranch"`
+	StagingSHA         string                `json:"StagingSHA"`
+	BaseGeneration     int                   `json:"BaseGeneration"`
+	Outcome            string                `json:"Outcome"`
+	PhaseSince         time.Time             `json:"PhaseSince"`
+	MissingGateRetries int                   `json:"MissingGateRetries"`
 }
 
 // PullRequestSnapshot is the PR identity needed to re-queue a batch.
@@ -88,6 +90,9 @@ func (s QueueSnapshot) Validate() error {
 		}
 		if active.BaseGeneration < 0 {
 			return fmt.Errorf("queue checkpoint active batch %d has negative base generation", i)
+		}
+		if active.MissingGateRetries < 0 {
+			return fmt.Errorf("queue checkpoint active batch %d has negative missing-gate retries", i)
 		}
 		if active.Outcome != "" && active.Outcome != "success" && active.Outcome != "failure" && active.Outcome != "cancelled" && active.Outcome != "error" {
 			return fmt.Errorf("queue checkpoint active batch %d has invalid outcome %q", i, active.Outcome)
