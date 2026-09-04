@@ -197,8 +197,9 @@ func (eng *Engine) Reconcile(ctx context.Context) error {
 }
 
 // Transition is a structured record of one merge-queue lifecycle event
-// (a batch staged, its gate passed, it bisected, a PR bounced, or a PR
-// landed) recorded during a Reconcile call. See LastTransitions.
+// (a batch staged, its gate passed, it bisected, a staging attempt was
+// superseded, a PR bounced, or a PR landed) recorded during a Reconcile call.
+// See LastTransitions.
 type Transition = engine.Transition
 
 // LastTransitions returns the transitions recorded during the most

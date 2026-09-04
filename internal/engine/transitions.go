@@ -8,8 +8,9 @@ import (
 
 // Transition is a structured record of one merge-queue lifecycle event that
 // happened during a single Reconcile call: a batch was staged, its gate
-// passed, it was bisected, a PR bounced, or a PR landed. It exists so a
-// caller can persist what actually happened without parsing log text.
+// passed, it was bisected, a staging attempt was superseded, a PR bounced, or
+// a PR landed. It exists so a caller can persist what actually happened without
+// parsing log text.
 //
 // Additive to the engine's existing logger.Info/Warn calls at the same
 // sites — recording a Transition never changes what gets logged.
@@ -21,13 +22,12 @@ type Transition struct {
 	// whole bisection root was torn down after its base branch advanced or a
 	// pinned candidate changed mid-test; its candidates are re-queued as a
 	// fresh root and no source decision is published), or "node_superseded" (a
-	// speculatively-staged bisection node whose gate ran against an accumulator
-	// the resolved frontier no longer matches; re-staged on the correct
-	// baseline, no source decision).
+	// staging attempt was replaced without a source decision, including a
+	// speculative node whose accumulator no longer matches).
 	Kind string `json:"kind"`
-	// PRs is the batch's PR set for "staged"/"gate_success"/"bisected"/"held",
-	// or the single terminated/landed PR (as a length-1 slice) for
-	// "bounced"/"landed".
+	// PRs is the batch's PR set for "staged"/"gate_success"/"bisected"/
+	// "held"/"node_superseded", or the single terminated/landed PR (as a
+	// length-1 slice) for "bounced"/"landed".
 	PRs           []int  `json:"prs"`
 	StagingBranch string `json:"staging_branch"`
 	// RunID and LineagePath identify this batch's position in a bisection
@@ -37,8 +37,9 @@ type Transition struct {
 	// name strings from scratch.
 	RunID       string `json:"run_id"`
 	LineagePath string `json:"lineage_path"`
-	// Reason is set for "bounced" (why the PR was rejected) and for "held"
-	// (the held gate outcome: "success", "failure", or "error").
+	// Reason is set for "bounced" (why the PR was rejected), "held" (the held
+	// gate outcome: "success", "failure", or "error"), and
+	// "node_superseded" (why the staging attempt was replaced).
 	Reason string `json:"reason,omitempty"`
 	// EventID is a deterministic key for transitions that drive an
 	// irreversible side effect (a merge counter, a bounce notification): the

@@ -2191,6 +2191,16 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(e.pending); got != "[[1]]" {
 		t.Fatalf("pending = %s, want timed-out PR requeued", got)
 	}
+	var superseded bool
+	for _, transition := range e.Transitions() {
+		if transition.Kind == "node_superseded" && transition.StagingBranch == m.stagingBranches[0] {
+			superseded = true
+			break
+		}
+	}
+	if !superseded {
+		t.Fatalf("transitions = %v, want timed-out staging attempt marked superseded", e.Transitions())
+	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Merge did not complete") {
 		t.Fatalf("outcome comment = %q, want timeout outcome", got)
 	}
