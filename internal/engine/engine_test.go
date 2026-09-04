@@ -1032,17 +1032,18 @@ func TestSpeculativeFanoutResultSupersededWhenAccumulatorChanges(t *testing.T) {
 	if !m.bounced[1] || !m.bounced[4] {
 		t.Fatalf("bounced = %v, want PRs 1 and 4 rejected", m.bounced)
 	}
-	var spec, authoritative bool
+	// The [3 4] node's speculative key (assume [1 2] passes) is main+1+2+3+4,
+	// the cached root failure, so it never gets a redundant CI run — and once
+	// [1 2] is rejected it is superseded and re-staged authoritatively on the
+	// resolved [2] baseline as [2 3 4].
+	authoritative := false
 	for _, s := range m.staged {
-		switch fmt.Sprint(s) {
-		case "[3 4]":
-			spec = true // speculative: empty accumulator
-		case "[2 3 4]":
-			authoritative = true // re-staged on the resolved [2] baseline
+		if fmt.Sprint(s) == "[2 3 4]" {
+			authoritative = true
 		}
 	}
-	if !spec || !authoritative {
-		t.Fatalf("staged = %v; want both the speculative [3 4] and the re-staged [2 3 4]", m.staged)
+	if !authoritative {
+		t.Fatalf("staged = %v; want the suffix re-staged on the resolved baseline as [2 3 4]", m.staged)
 	}
 }
 
@@ -1050,6 +1051,39 @@ func TestSpeculativeFanoutResultSupersededWhenAccumulatorChanges(t *testing.T) {
 // held-success (in the accumulator, not currently active) gets a new head
 // mid-test. Its evidence — and every later key built on it — is now stale, so
 // the whole root is torn down and re-queued with nothing merged.
+// TestSpeculativeFanoutPromotesOnOptimisticBaseline: with fanout the right
+// subtree is staged assuming every earlier sibling passes. When that holds,
+// its exact key matches the resolved frontier and the gate result is used
+// without a re-run.
+func TestSpeculativeFanoutPromotesOnOptimisticBaseline(t *testing.T) {
+	m := newMock(3, 1, 2, 3, 4) // PR 3 is bad: root fails, [1 2] passes
+	c := metrics.New()
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BisectFanout: 2, Metrics: c}, m, m)
+	drive(e, 40)
+
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 2 4]" {
+		t.Fatalf("merged = %s, want [1 2 4]", got)
+	}
+	if !m.bounced[3] {
+		t.Fatalf("PR 3 should be bounced: %v", m.bounced)
+	}
+	// [3 4] was staged speculatively on the assumed [1 2] baseline (which is
+	// the root key, a cached failure), then promoted when [1 2] actually
+	// passed — no redundant CI run for it.
+	assertMetric(t, c, "shunt_speculative_started_total")
+	assertMetric(t, c, "shunt_speculative_promoted_total")
+	stagedCount := 0
+	for _, s := range m.staged {
+		if fmt.Sprint(s) == "[1 2 3 4]" {
+			stagedCount++
+		}
+	}
+	if stagedCount != 1 {
+		t.Fatalf("main+1+2+3+4 was staged %d times, want 1 (root only; the speculative [3 4] reuses that key)", stagedCount)
+	}
+}
+
 func TestRootInvalidatedWhenAcceptedCandidateHeadChanges(t *testing.T) {
 	m := newMock(2, 1, 2, 3)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
@@ -1469,8 +1503,13 @@ func TestParallelBisectionStartsSplitSubtreesTogether(t *testing.T) {
 		t.Fatalf("start split subtrees: %v", err)
 	}
 
-	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2] [3 4]]" {
-		t.Fatalf("staged = %s, want root plus both split subtrees", got)
+	// The left subtree [1 2] stages authoritatively. The right subtree [3 4]
+	// is staged speculatively assuming [1 2] passes — which makes its exact
+	// key main+1+2+3+4, the root key, already cached as a failure. So it
+	// resolves from the cache without a redundant CI run; only two staging
+	// calls, but still two active batches.
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2]]" {
+		t.Fatalf("staged = %s, want root and left subtree (right reuses the root key)", got)
 	}
 	if got := len(e.active); got != 2 {
 		t.Fatalf("active batches = %d, want 2", got)

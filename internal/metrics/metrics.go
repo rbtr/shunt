@@ -51,6 +51,9 @@ type queueMetrics struct {
 	Config                *EffectiveConfig
 	OldestQueueAgeSeconds float64
 	BatchesStarted        uint64
+	SpeculativeStarted    uint64
+	SpeculativePromoted   uint64
+	SpeculativeSuperseded uint64
 	PRMerges              uint64
 	Bounces               uint64
 	StagingConflicts      uint64
@@ -233,6 +236,39 @@ func (c *Collector) IncBatchesStarted(labels Labels) {
 	c.ensureLocked(labels).BatchesStarted++
 }
 
+// IncSpeculativeStarted records a batch staged speculatively ahead of the
+// authoritative frontier under BisectFanout > 1.
+func (c *Collector) IncSpeculativeStarted(labels Labels) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureLocked(labels).SpeculativeStarted++
+}
+
+// IncSpeculativePromoted records a speculative batch whose exact key matched
+// the resolved frontier, so its gate result was used without a re-run.
+func (c *Collector) IncSpeculativePromoted(labels Labels) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureLocked(labels).SpeculativePromoted++
+}
+
+// IncSpeculativeSuperseded records a speculative batch whose assumption did not
+// hold, so it was re-staged on the resolved baseline.
+func (c *Collector) IncSpeculativeSuperseded(labels Labels) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureLocked(labels).SpeculativeSuperseded++
+}
+
 // IncPRMerge records a PR landed through shunt's queue.
 func (c *Collector) IncPRMerge(labels Labels) {
 	if c == nil {
@@ -398,6 +434,12 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		"# TYPE shunt_queue_oldest_age_seconds gauge",
 		"# HELP shunt_batches_started_total Number of batches staged and sent to the gate.",
 		"# TYPE shunt_batches_started_total counter",
+		"# HELP shunt_speculative_started_total Number of batches staged speculatively ahead of the frontier under BisectFanout > 1.",
+		"# TYPE shunt_speculative_started_total counter",
+		"# HELP shunt_speculative_promoted_total Speculative batches whose exact key matched the resolved frontier.",
+		"# TYPE shunt_speculative_promoted_total counter",
+		"# HELP shunt_speculative_superseded_total Speculative batches re-staged because their assumption did not hold.",
+		"# TYPE shunt_speculative_superseded_total counter",
 		"# HELP shunt_pr_merges_total Number of pull requests landed through shunt's queue.",
 		"# TYPE shunt_pr_merges_total counter",
 		"# HELP shunt_bounces_total Number of pull requests bounced from the queue.",
@@ -432,6 +474,9 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 		fmt.Fprintf(w, "shunt_active_batch%s %d\n", labels, active)
 		fmt.Fprintf(w, "shunt_queue_oldest_age_seconds%s %s\n", labels, formatFloat(q.metrics.OldestQueueAgeSeconds))
 		fmt.Fprintf(w, "shunt_batches_started_total%s %d\n", labels, q.metrics.BatchesStarted)
+		fmt.Fprintf(w, "shunt_speculative_started_total%s %d\n", labels, q.metrics.SpeculativeStarted)
+		fmt.Fprintf(w, "shunt_speculative_promoted_total%s %d\n", labels, q.metrics.SpeculativePromoted)
+		fmt.Fprintf(w, "shunt_speculative_superseded_total%s %d\n", labels, q.metrics.SpeculativeSuperseded)
 		fmt.Fprintf(w, "shunt_pr_merges_total%s %d\n", labels, q.metrics.PRMerges)
 		fmt.Fprintf(w, "shunt_bounces_total%s %d\n", labels, q.metrics.Bounces)
 		fmt.Fprintf(w, "shunt_staging_conflicts_total%s %d\n", labels, q.metrics.StagingConflicts)
