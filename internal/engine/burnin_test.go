@@ -37,7 +37,10 @@ func TestBurnInBisectionWithRealGitStaging(t *testing.T) {
 		BisectFanout:  1,
 	}, burn, gitops.NewStager(repoDir, "bot", "unused-token", "bot", "bot@example.invalid"))
 
-	for i := 0; i < 12 && (len(burn.merged) < 2 || !burn.bounced[2]); i++ {
+	// Root finalization waits for every leaf before beginning ordered native
+	// merges, so this proof needs room for the held-leaf barrier as well as
+	// bisection and Forge completion.
+	for i := 0; i < 20 && (len(burn.merged) < 2 || !burn.bounced[2]); i++ {
 		if err := eng.Reconcile(ctx); err != nil {
 			t.Fatalf("reconcile %d: %v", i, err)
 		}
@@ -128,6 +131,12 @@ func (b *burnInForge) ListOpenPRs(_ context.Context, _, _, base string) ([]forge
 
 func (b *burnInForge) GetPR(_ context.Context, _, _ string, index int) (forge.PullRequest, error) {
 	return *b.prs[index], nil
+}
+
+func (b *burnInForge) BranchHead(_ context.Context, _, _, _ string) (string, error) {
+	// The burn-in drives the real git stager against a scratch repo; return no
+	// anchor so staging checks out the live base branch instead of a fake SHA.
+	return "", nil
 }
 
 func (b *burnInForge) AutomergeState(_ context.Context, _, _ string, index int) (forge.AutomergeState, error) {
