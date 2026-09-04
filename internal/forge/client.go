@@ -342,12 +342,7 @@ func (c *Client) LatestCommitStatus(ctx context.Context, owner, repo, sha, statu
 func (c *Client) RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error) {
 	runs, err := c.listActionRuns(ctx, owner, repo)
 	if err == nil {
-		if run := latestMatchingRun(runs, sha, branch); run != nil {
-			if run.Status != "" {
-				return run.Status, nil
-			}
-		}
-		return "", nil
+		return aggregateMatchingRuns(runs, sha, branch), nil
 	} else if !strings.Contains(err.Error(), "http 404") {
 		return "", err
 	}
@@ -438,6 +433,47 @@ func (c *Client) RunTargetURL(ctx context.Context, owner, repo, sha, branch stri
 		}
 	}
 	return "", nil
+}
+
+func aggregateMatchingRuns(runs []workflowRun, sha, branch string) string {
+	latest := make(map[string]workflowRun)
+	for _, run := range runs {
+		if run.CommitSHA != sha || (branch != "" && run.PrettyRef != branch) {
+			continue
+		}
+		key := run.WorkflowID
+		if key == "" {
+			key = fmt.Sprintf("run-%d", run.IndexInRepo)
+		}
+		if previous, ok := latest[key]; !ok || later(int64(run.IndexInRepo), time.Time{}, int64(previous.IndexInRepo), time.Time{}) {
+			latest[key] = run
+		}
+	}
+	if len(latest) == 0 {
+		return ""
+	}
+	pending := ""
+	missing := false
+	for _, run := range latest {
+		switch run.Status {
+		case "failure", "cancelled", "error":
+			return run.Status
+		case "success", "skipped":
+		case "":
+			missing = true
+		default:
+			if pending == "" {
+				pending = run.Status
+			}
+		}
+	}
+	if missing {
+		return ""
+	}
+	if pending != "" {
+		return pending
+	}
+	return "success"
 }
 
 func latestMatchingRun(runs []workflowRun, sha, branch string) *workflowRun {
