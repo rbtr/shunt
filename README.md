@@ -117,8 +117,8 @@ is discovered and managed automatically. For a single repo, set
 | `SHUNT_BISECT_FANOUT` | `1` | Maximum concurrent bisection staging runs per queue. `1` preserves serial bisection. |
 | `SHUNT_QUEUE_COMMENTS` | `false` | When true, maintain one sticky queue-status comment on each queued PR. Disabled by default to avoid extra write traffic. |
 | `SHUNT_MAX_CONCURRENT_RECONCILES` | `1` | Maximum number of managed repos reconciled concurrently within a single poll tick. `1` (the default) preserves serial per-repo behaviour exactly and is safe for all deployments. Values greater than `1` improve throughput when many repos are managed and their reconciles are I/O-bound, but increase peak forge API usage proportionally. |
-| `SHUNT_STATE_PATH` | — | Optional path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
-| `SHUNT_POSTGRES_DSN` | — | Optional Postgres DSN for durable queue checkpoints and replica coordination. Mutually exclusive with `SHUNT_STATE_PATH`; migrations are applied at startup. |
+| `SHUNT_STATE_PATH` | — | Recommended path to a local bbolt database for durable queue checkpoints. Leave empty for in-memory state. |
+| `SHUNT_POSTGRES_DSN` | — | Supported Postgres DSN for durable queue checkpoints and replica coordination. Do not set it with `SHUNT_STATE_PATH`. Shunt applies migrations at startup. |
 | `SHUNT_QUEUE_LEASE_TTL` | `45s` | Postgres queue-ownership lease duration (at least `1µs`); renewed once per reconciliation tick, whose work is bounded to half this duration. |
 | `SHUNT_POLL_INTERVAL` | `10s` | Reconcile cadence |
 | `SHUNT_PUBLIC_URL` | = `SHUNT_INSTANCE` | Base URL for the links written into PR comments (set when the bot reaches the forge over an internal URL) |
@@ -161,13 +161,14 @@ choosing the managed base; in single-repo mode, it reads from `SHUNT_BASE`.
 Missing files keep the global defaults. Invalid files are logged/rejected without
 applying partial settings.
 
-Set `SHUNT_STATE_PATH` to persist queue checkpoints in a local bbolt database, or
-set `SHUNT_POSTGRES_DSN` to use Postgres. Leave both empty for in-memory state;
-do not set both. Durable stores preserve pending candidates, active batch
-metadata, linger state, and bisection counters across restarts. Active batches
-are re-staged after restore rather than landed from pre-restart CI results. In
-Kubernetes, mount a bbolt path on a persistent volume; an `emptyDir` path only
-survives container restarts within the same pod lifetime. Keep Postgres DSNs in a
+Set `SHUNT_STATE_PATH` to use the recommended local bbolt store. Set
+`SHUNT_POSTGRES_DSN` to use the supported shared store. Leave both empty to use
+in-memory state. Do not set both values. Durable stores save pending candidates,
+active batch metadata, linger state, and bisection state. On restart, Shunt
+checks active evidence before it resumes a staging attempt. Shunt derives fresh
+work when the evidence is not valid. In Kubernetes, mount the bbolt path on a
+persistent volume. An `emptyDir` path survives only container restarts in one
+pod. Keep Postgres DSNs in a
 runtime secret store. Only Postgres coordinates queue ownership across replicas:
 each `(owner, repo, base)` has one lease holder, and a new holder reloads its
 checkpoint before acting. bbolt and in-memory state are single-process options;
@@ -198,6 +199,8 @@ Forgejo/Gitea events and wakes reconciliation promptly.
 - `shunt_batches_started_total`, `shunt_pr_merges_total`,
   `shunt_bounces_total`, `shunt_staging_conflicts_total`, and
   `shunt_reconcile_errors_total`.
+- `shunt_speculative_started_total`, `shunt_speculative_promoted_total`, and
+  `shunt_speculative_superseded_total` for speculative bisection attempts.
 - `shunt_gate_outcomes_total{outcome="success|failure|cancelled|error"}` for
   terminal gate results.
 - `shunt_time_in_queue_seconds_bucket/_sum/_count{outcome="merged|bounced|dropped"}`
