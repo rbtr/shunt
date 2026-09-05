@@ -551,6 +551,30 @@ func (c *Client) ProtectedBranch(ctx context.Context, owner, repo, branch string
 	return p, nil
 }
 
+// BranchHead returns the commit SHA at the tip of branch. The merge queue
+// pins this once when it opens a bisection root so every staged integration
+// and every exact test key is anchored to the same base, and so a later
+// external advance of the live branch can be detected as invalidation.
+func (c *Client) BranchHead(ctx context.Context, owner, repo, branch string) (string, error) {
+	data, err := c.doRaw(ctx, http.MethodGet,
+		fmt.Sprintf("/repos/%s/branches/%s", repoPath(owner, repo), url.PathEscape(branch)), nil)
+	if err != nil {
+		return "", err
+	}
+	var b struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := json.Unmarshal(data, &b); err != nil {
+		return "", err
+	}
+	if b.Commit.ID == "" {
+		return "", fmt.Errorf("branch %q has no commit id", branch)
+	}
+	return b.Commit.ID, nil
+}
+
 // CancelAutomerge reports whether a live scheduled merge was removed.
 func (c *Client) CancelAutomerge(ctx context.Context, owner, repo string, index int) (bool, error) {
 	_, err := c.doRaw(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/pulls/%d/merge", repoPath(owner, repo), index), nil)

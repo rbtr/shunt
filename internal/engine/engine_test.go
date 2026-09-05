@@ -69,6 +69,14 @@ type mock struct {
 	listErr              error
 	runStatusErr         error
 	upsertErr            error
+	branchHead           string            // base-branch head SHA the mock reports (default "anchor-<branch>")
+	branchHeads          map[string]string // per-branch override, checked before branchHead
+	stagedAnchors        []string          // baseAnchor passed to BuildStaging, per call
+	// gateOracle, when set, decides a batch's gate outcome from its exact
+	// ordered PR set (base anchor + accepted baseline + candidate, as the
+	// engine stages it). It lets a test express an arbitrary interacting CI
+	// oracle, unlike badPR which is a single candidate-independent failure.
+	gateOracle func(prNums []int) string
 }
 
 func newMock(badPR int, prNums ...int) *mock {
@@ -119,6 +127,15 @@ func (m *mock) GetPR(_ context.Context, _, _ string, n int) (forge.PullRequest, 
 		return forge.PullRequest{}, fmt.Errorf("get PR #%d", n)
 	}
 	return *m.prs[n], nil
+}
+func (m *mock) BranchHead(_ context.Context, _, _, branch string) (string, error) {
+	if m.branchHeads[branch] != "" {
+		return m.branchHeads[branch], nil
+	}
+	if m.branchHead != "" {
+		return m.branchHead, nil
+	}
+	return "anchor-" + branch, nil
 }
 func (m *mock) AutomergeState(_ context.Context, _, _ string, n int) (forge.AutomergeState, error) {
 	if m.beforeAutomergeState != nil {
@@ -200,6 +217,9 @@ func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error)
 	if m.runStatusSet || m.runStatus != "" {
 		return m.runStatus, nil
 	}
+	if m.gateOracle != nil {
+		return m.gateOracle(m.batchOf[sha]), nil
+	}
 	for _, n := range m.batchOf[sha] {
 		if n == m.badPR {
 			return "failure", nil
@@ -280,13 +300,14 @@ func (m *mock) advanceNative() {
 	}
 }
 
-func (m *mock) BuildStaging(_ context.Context, _, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
+func (m *mock) BuildStaging(_ context.Context, _, baseAnchor, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
 	var nums []int
 	for _, r := range refs {
 		nums = append(nums, r.PR)
 	}
 	m.staged = append(m.staged, append([]int(nil), nums...))
 	m.stagingBranches = append(m.stagingBranches, stagingBranch)
+	m.stagedAnchors = append(m.stagedAnchors, baseAnchor)
 	baseMerged := m.conflictBasePR > 0 && m.prs[m.conflictBasePR].Merged
 	if idx := indexOfNum(nums, m.conflictPR); idx > 0 || (idx == 0 && (m.conflictFirst || baseMerged)) {
 		return "", m.conflictPR, fmt.Errorf("staging conflict")
@@ -724,6 +745,562 @@ func TestBatchLingerResetsAfterBatchStarts(t *testing.T) {
 }
 
 // A 4-PR batch with one bad PR must land the 3 good PRs and isolate the bad one.
+func TestBisectionHoldsFailedLeafUntilSiblingTerminal(t *testing.T) {
+	m := newMock(1, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// Stage root, split its failed gate, stage left leaf, then observe its failure.
+	for range 4 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !m.automerge[1] {
+		t.Fatal("failed leaf mutated Forge before sibling leaf became terminal")
+	}
+	if len(m.statuses) != 0 {
+		t.Fatalf("source statuses = %v, want none before root terminal", m.statuses)
+	}
+}
+
+func TestBisectionStagesRightLeafOnAcceptedLeftBaseline(t *testing.T) {
+	m := newMock(2, 1, 2)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	for range 5 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [1]]" {
+		t.Fatalf("staged refs = %s, want root and left only; right reuses root exact key", got)
+	}
+}
+
+func TestBisectionRestagesRightAfterRejectedLeft(t *testing.T) {
+	m := newMock(2, 1, 2, 3)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	for range 9 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3] [1] [1 2] [1 3]]" {
+		t.Fatalf("staged refs = %s, want cumulative right frontier", got)
+	}
+}
+
+// TestEngineFrontierWorkedExample checks a seven-PR ordered frontier.
+// The test checks cached results, ordered decisions, and held leaves.
+func TestEngineFrontierWorkedExample(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4, 5, 6, 7)
+	pass := map[string]bool{
+		"[1]": true, "[1 4 5 6 7]": true,
+	}
+	m.gateOracle = func(prNums []int) string {
+		if pass[fmt.Sprint(prNums)] {
+			return "success"
+		}
+		return "failure"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	drive(e, 40)
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4 5 6 7] [1 2 3] [1] [1 2] [1 3] [1 4 5 6 7]]" {
+		t.Fatalf("staged = %s\nwant root, ABC, A, A+B, A+C, A+DEFG (ABC reused for A+BC)", got)
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 4 5 6 7]" {
+		t.Fatalf("merged = %s, want A,D,E,F,G", got)
+	}
+	if !m.bounced[2] || !m.bounced[3] {
+		t.Fatalf("bounced = %v, want B and C rejected", m.bounced)
+	}
+}
+
+// TestFrontierExactKeyScopedToAnchorAndMergeStyle checks exact-key inputs.
+// A cached result cannot cross a base anchor or merge-style change.
+func TestFrontierExactKeyScopedToAnchorAndMergeStyle(t *testing.T) {
+	prs := []forge.PullRequest{{Number: 1}, {Number: 2}}
+	prs[0].Head.Sha = "h1"
+	prs[1].Head.Sha = "h2"
+
+	a := New(Config{Owner: "o", Repo: "r", Base: "main", MergeStyle: "squash"}, newMock(-1), newMock(-1))
+	b := New(Config{Owner: "o", Repo: "r", Base: "main", MergeStyle: "rebase"}, newMock(-1), newMock(-1))
+
+	if a.exactKey("anchorX", prs) == a.exactKey("anchorY", prs) {
+		t.Fatal("exact key ignored the base anchor")
+	}
+	if a.exactKey("anchorX", prs) == b.exactKey("anchorX", prs) {
+		t.Fatal("exact key ignored the merge style")
+	}
+	if !strings.Contains(a.exactKey("anchorX", prs), "h1") || !strings.Contains(a.exactKey("anchorX", prs), "h2") {
+		t.Fatal("exact key dropped a pinned PR head")
+	}
+}
+
+// TestBisectionAnchorPinnedAndDurable checks the engine reads the base anchor
+// once when a root opens, keys every node under it, and restores it verbatim
+// on restart so the exact-outcome cache still matches.
+func TestBisectionAnchorPinnedAndDurable(t *testing.T) {
+	m := newMock(1, 1, 2)
+	m.branchHead = "deadbeefanchor"
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+	for range 4 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(store.saved.Trees) != 1 || store.saved.Trees[0].Anchor != "deadbeefanchor" {
+		t.Fatalf("tree anchor = %#v, want the pinned base head", store.saved.Trees)
+	}
+	for i, a := range m.stagedAnchors {
+		if a != "deadbeefanchor" {
+			t.Fatalf("staging call %d built on %q, want the pinned anchor", i, a)
+		}
+	}
+	for key := range store.saved.Trees[0].Results {
+		if !strings.Contains(key, "deadbeefanchor") {
+			t.Fatalf("cached key %q is not scoped to the anchor", key)
+		}
+	}
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.rootAnchor[store.saved.Trees[0].RunID]; got != "deadbeefanchor" {
+		t.Fatalf("restored rootAnchor = %q, want deadbeefanchor", got)
+	}
+}
+
+// TestFinalizationAbortsWhenBaseAdvancesBeforeAnyLanding checks base changes.
+// Shunt keeps completed bounces. Shunt requeues the unresolved suffix.
+func TestFinalizationAbortsWhenBaseAdvancesBeforeAnyLanding(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	m.branchHead = "base-v1"
+	// 1 and 2 fail; 3 passes on its own.
+	m.gateOracle = func(prNums []int) string {
+		if len(prNums) == 1 && prNums[0] == 3 {
+			return "success"
+		}
+		return "failure"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// Drive until the tree is ready ([1]✗ [2]✗ [3]✓, no unresolved node) and
+	// finalization has bounced both failures but not yet landed 3.
+	var tree *bisectionTree
+	var ready bool
+	for i := 0; i < 40; i++ {
+		_ = e.Reconcile(context.Background())
+		m.advanceNative()
+		tree, ready = nil, false
+		for id, tr := range e.trees {
+			tree = tr
+			ready = !e.treeHasUnresolvedNode(id)
+		}
+		if tree != nil && ready && tree.cursor == 2 {
+			break
+		}
+	}
+	if tree == nil || !ready || tree.cursor != 2 {
+		t.Fatalf("setup: want a ready tree with 2 bounced leaves, got %#v", tree)
+	}
+	if !m.bounced[1] || !m.bounced[2] {
+		t.Fatalf("PRs 1 and 2 should already be bounced: %v", m.bounced)
+	}
+
+	m.branchHead = "base-v2" // someone lands a change out-of-band
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.trees) != 0 {
+		t.Fatalf("tree survived a base advance during finalization: %#v", e.trees)
+	}
+	if len(m.merged) != 0 {
+		t.Fatalf("PR 3 merged on stale evidence: %v", m.merged)
+	}
+	sawAbort := false
+	for _, tr := range e.Transitions() {
+		if tr.Kind == "root_invalidated" && tr.Reason == "base branch advanced during finalization" {
+			sawAbort = true
+		}
+	}
+	if !sawAbort {
+		t.Fatal("no finalization-abort transition emitted")
+	}
+
+	// PR 3 re-resolves on the new base and lands.
+	for i := 0; i < 20; i++ {
+		_ = e.Reconcile(context.Background())
+		m.advanceNative()
+	}
+	if got := fmt.Sprint(m.merged); got != "[3]" {
+		t.Fatalf("merged = %s, want [3] after re-resolving the suffix", got)
+	}
+}
+
+func TestRootInvalidatedWhenBaseAdvancesMidTest(t *testing.T) {
+	m := newMock(2, 1, 2, 3)
+	m.branchHead = "base-v1"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// Root [1 2 3] fails its gate and bisects; the left leaf [1] stages.
+	for range 3 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.trees) != 1 {
+		t.Fatalf("expected one bisection tree mid-test, got %d", len(e.trees))
+	}
+	stagedBefore := len(m.staged)
+
+	m.branchHead = "base-v2" // main advances underneath the queue
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(e.trees) != 0 {
+		t.Fatalf("tree survived a base advance: %#v", e.trees)
+	}
+	if len(m.statuses) != 0 {
+		t.Fatalf("source gate statuses written during invalidation: %v", m.statuses)
+	}
+	for _, c := range m.calls {
+		if strings.HasPrefix(c, "cancel:") {
+			t.Fatalf("auto-merge cancelled during invalidation: %s", c)
+		}
+	}
+	if len(m.bounced) != 0 {
+		t.Fatalf("PRs bounced during invalidation: %v", m.bounced)
+	}
+	invalidated := false
+	for _, tr := range e.Transitions() {
+		if tr.Kind == "root_invalidated" {
+			invalidated = true
+		}
+	}
+	if !invalidated {
+		t.Fatal("no root_invalidated transition emitted")
+	}
+
+	// The candidates re-stage as one fresh root on the new base.
+	for range 3 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(m.staged) <= stagedBefore {
+		t.Fatal("candidates were not re-staged after re-rooting")
+	}
+	if got := m.stagedAnchors[len(m.stagedAnchors)-1]; got != "base-v2" {
+		t.Fatalf("re-rooted staging built on %q, want base-v2", got)
+	}
+	for id, a := range e.rootAnchor {
+		if a != "base-v2" {
+			t.Fatalf("rootAnchor[%s] = %q, want the new base head", id, a)
+		}
+	}
+}
+
+// TestSpeculativeFanoutResultSupersededWhenAccumulatorChanges: with fanout the
+// right subtree stages speculatively on an empty accumulator. When the left
+// subtree accepts a PR, the speculative gate result is against the wrong key
+// and must not be trusted — the node is re-staged on the real baseline. Here
+// main+3+4 passes but main+2+3+4 fails (an interaction), so trusting the
+// speculative pass would wrongly merge PR 4.
+func TestSpeculativeFanoutResultSupersededWhenAccumulatorChanges(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4)
+	pass := map[string]bool{"[2]": true, "[3 4]": true, "[2 3]": true}
+	m.gateOracle = func(prNums []int) string {
+		if pass[fmt.Sprint(prNums)] {
+			return "success"
+		}
+		return "failure"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", BisectFanout: 2}, m, m)
+	drive(e, 60)
+
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[2 3]" {
+		t.Fatalf("merged = %s, want [2 3] (speculative main+3+4 pass must not merge PR 4)", got)
+	}
+	if !m.bounced[1] || !m.bounced[4] {
+		t.Fatalf("bounced = %v, want PRs 1 and 4 rejected", m.bounced)
+	}
+	var spec, authoritative bool
+	for _, s := range m.staged {
+		switch fmt.Sprint(s) {
+		case "[3 4]":
+			spec = true // speculative: empty accumulator
+		case "[2 3 4]":
+			authoritative = true // re-staged on the resolved [2] baseline
+		}
+	}
+	if !spec || !authoritative {
+		t.Fatalf("staged = %v; want both the speculative [3 4] and the re-staged [2 3 4]", m.staged)
+	}
+}
+
+// TestRootInvalidatedWhenAcceptedCandidateHeadChanges: a PR that was already
+// held-success (in the accumulator, not currently active) gets a new head
+// mid-test. Its evidence — and every later key built on it — is now stale, so
+// the whole root is torn down and re-queued with nothing merged.
+func TestRootInvalidatedWhenAcceptedCandidateHeadChanges(t *testing.T) {
+	m := newMock(2, 1, 2, 3)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	// Root [1 2 3] fails, splits, left leaf [1] passes and is held-success.
+	for range 4 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var tree *bisectionTree
+	for _, tr := range e.trees {
+		tree = tr
+	}
+	if tree == nil || len(tree.accepted) != 1 || tree.accepted[0].Number != 1 {
+		t.Fatalf("expected PR 1 held-success in the accumulator, got %#v", e.trees)
+	}
+
+	m.prs[1].Head.Sha = "head-1-v2" // PR 1 is force-pushed while held
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.trees) != 0 {
+		t.Fatalf("tree survived an accepted-candidate head change: %#v", e.trees)
+	}
+	if len(m.merged) != 0 {
+		t.Fatalf("merged %v on stale evidence", m.merged)
+	}
+	got := ""
+	for _, tr := range e.Transitions() {
+		if tr.Kind == "root_invalidated" {
+			got = tr.Reason
+		}
+	}
+	if got == "" {
+		t.Fatal("no root_invalidated transition for the candidate change")
+	}
+}
+
+// TestSuccessorRootPreservesEvidencedPrefix checks a changed held candidate.
+// The successor root keeps prior evidence and rechecks the later suffix.
+func TestSuccessorRootPreservesEvidencedPrefix(t *testing.T) {
+	m := newMock(-1, 1, 2, 3, 4, 5)
+	// [1 2] passes as a group; everything with 3, 4, or 5 fails on that
+	// baseline — until PR 4 gets a new head, after which [1 2]+[4 5] passes.
+	m.gateOracle = func(prNums []int) string {
+		s := fmt.Sprint(prNums)
+		if s == "[1 2]" {
+			return "success"
+		}
+		if s == "[1 2 4 5]" && m.prs[4].Head.Sha == "head-4-v2" {
+			return "success"
+		}
+		return "failure"
+	}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	var tree *bisectionTree
+	for i := 0; i < 40; i++ {
+		_ = e.Reconcile(context.Background())
+		m.advanceNative()
+		tree = nil
+		for _, tr := range e.trees {
+			tree = tr
+		}
+		if tree != nil && len(tree.held) == 3 { // [1 2]✓, [3]✗, [4]✗
+			break
+		}
+	}
+	if tree == nil || len(tree.held) != 3 {
+		t.Fatalf("setup: want 3 held leaves, got %#v", tree)
+	}
+	oldRunID := ""
+	for id := range e.trees {
+		oldRunID = id
+	}
+
+	m.prs[4].Head.Sha = "head-4-v2" // PR 4 force-pushed while held-failure
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var succ *bisectionTree
+	for id, tr := range e.trees {
+		if id == oldRunID {
+			t.Fatalf("predecessor root %s survived", id)
+		}
+		succ = tr
+	}
+	if succ == nil {
+		t.Fatal("no successor root created — the [1 2] and [3] prefix should carry over")
+	}
+	if len(succ.held) != 2 {
+		t.Fatalf("successor preserved held = %+v, want [1 2]✓ and [3]✗", succ.held)
+	}
+	if fmt.Sprint(numbersOf(succ.accepted)) != "[1 2]" {
+		t.Fatalf("successor accepted = %v, want [1 2]", numbersOf(succ.accepted))
+	}
+	if len(m.merged) != 0 {
+		t.Fatalf("merged %v before the successor finalized", m.merged)
+	}
+
+	for i := 0; i < 60; i++ {
+		_ = e.Reconcile(context.Background())
+		m.advanceNative()
+		if len(e.trees) == 0 {
+			break
+		}
+	}
+	sort.Ints(m.merged)
+	if got := fmt.Sprint(m.merged); got != "[1 2 4 5]" {
+		t.Fatalf("merged = %s, want [1 2 4 5] after re-resolving the suffix", got)
+	}
+	if !m.bounced[3] {
+		t.Fatalf("PR 3 should remain bounced, bounced=%v", m.bounced)
+	}
+}
+
+// TestTerminalTransitionsCarryStableEventID: landed and bounced transitions
+// carry a deterministic event_id derived only from the durable run id, the
+// action, and the PR — so a redelivered reconcile response applies the
+// irreversible side effects exactly once.
+func TestTerminalTransitionsCarryStableEventID(t *testing.T) {
+	if got := terminalEventID("run-7", "landed", []int{3, 1, 2}); got != "run-7|landed|1,2,3" {
+		t.Fatalf("terminalEventID = %q, want sorted, run-scoped", got)
+	}
+
+	m := newMock(2, 1, 2, 3) // PR 2 is bad: 1 and 3 land, 2 bounces
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	seen := map[string]int{}
+	for range 30 {
+		_ = e.Reconcile(context.Background())
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "landed" || tr.Kind == "bounced" {
+				if tr.EventID == "" {
+					t.Fatalf("%s transition for PR %v has no event_id", tr.Kind, tr.PRs)
+				}
+				seen[tr.EventID]++
+			}
+		}
+		m.advanceNative()
+	}
+	if len(seen) != 3 {
+		t.Fatalf("distinct terminal event ids = %d (%v), want 3 (land 1, land 3, bounce 2)", len(seen), seen)
+	}
+}
+
+// TestTransitionOutboxSurvivesRestart: a terminal transition that has not yet
+// exhausted its retransmits is written to the checkpoint and re-emitted by a
+// freshly restarted engine, so a reconcile response dropped right before a
+// crash still reaches the consumer.
+func TestTransitionOutboxSurvivesRestart(t *testing.T) {
+	m := newMock(-1, 1) // PR 1 lands cleanly
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+
+	var landedSeen bool
+	for i := 0; i < 8; i++ {
+		_ = e.Reconcile(context.Background())
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "landed" {
+				landedSeen = true
+			}
+		}
+		m.advanceNative()
+		if landedSeen && len(store.saved.TransitionOutbox) > 0 {
+			break
+		}
+	}
+	if len(m.merged) != 1 {
+		t.Fatalf("PR 1 did not land: merged=%v", m.merged)
+	}
+	if len(store.saved.TransitionOutbox) == 0 {
+		t.Fatal("landed transition was not persisted to the outbox")
+	}
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tr := range restarted.Transitions() {
+		if tr.Kind == "landed" && tr.EventID != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("restarted engine did not re-emit the pending landed transition")
+	}
+}
+
+// TestAckTransitionsStopsRetransmit: once the consumer acknowledges a terminal
+// transition's event id, the engine drops it from the outbox and stops
+// re-carrying it instead of running out its full retransmit budget.
+func TestAckTransitionsStopsRetransmit(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	var landedID string
+	for i := 0; i < 8 && landedID == ""; i++ {
+		_ = e.Reconcile(context.Background())
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "landed" {
+				landedID = tr.EventID
+			}
+		}
+		m.advanceNative()
+	}
+	if landedID == "" {
+		t.Fatal("no landed transition observed")
+	}
+
+	e.AckTransitions([]string{landedID})
+	_ = e.Reconcile(context.Background())
+	for _, tr := range e.Transitions() {
+		if tr.EventID == landedID {
+			t.Fatalf("acked transition %q was still re-sent", landedID)
+		}
+	}
+}
+
+func TestCheckpointRestoresHeldBisectionLeaf(t *testing.T) {
+	m := newMock(1, 1, 2)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+	for range 4 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.saved == nil || len(store.saved.Trees) != 1 || len(store.saved.Trees[0].Held) != 1 {
+		t.Fatalf("checkpoint trees = %#v, want held leaf", store.saved)
+	}
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.stagingBranches[len(m.stagingBranches)-1]; !strings.HasSuffix(got, "-r1") {
+		t.Fatalf("resumed sibling branch = %q, want r1", got)
+	}
+	if !m.automerge[1] {
+		t.Fatal("restart finalized held leaf before sibling terminal")
+	}
+}
+
 func TestBisectionIsolatesBadPR(t *testing.T) {
 	m := newMock(3, 1, 2, 3, 4)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
@@ -744,6 +1321,111 @@ func TestBisectionIsolatesBadPR(t *testing.T) {
 	}
 	if got := strings.Join(m.comments[3], "\n"); !strings.Contains(got, "Bounced from merge queue") || !strings.Contains(got, "staging run/commit") {
 		t.Errorf("bounce comment missing reason/debug link:\n%s", got)
+	}
+}
+
+// TestTransitionsRecordFullBisectionLifecycle drives the same fixture as
+// TestBisectionIsolatesBadPR (PR 3 fails, gets isolated by bisection, 1/2/4
+// land) but asserts on the structured Transitions a caller would persist,
+// instead of the mock's side effects — this is the RFC-0032 write path's
+// entire data source, so its shape and completeness matter independently of
+// whether the engine's existing behavior (already covered above) is
+// otherwise correct.
+func TestTransitionsRecordFullBisectionLifecycle(t *testing.T) {
+	m := newMock(3, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	var all []Transition
+	// Terminal transitions (those with an EventID) are re-sent for several
+	// reconciles so a dropped response cannot lose them; the consumer de-dups
+	// by EventID, so do the same here.
+	seenEvent := map[string]bool{}
+	for i := 0; i < 30; i++ {
+		_ = e.Reconcile(context.Background())
+		for _, tr := range e.Transitions() {
+			if tr.EventID != "" {
+				if seenEvent[tr.EventID] {
+					continue
+				}
+				seenEvent[tr.EventID] = true
+			}
+			all = append(all, tr)
+		}
+		if mk, ok := e.fc.(*mock); ok {
+			mk.advanceNative()
+		}
+	}
+
+	byKind := map[string][]Transition{}
+	for _, tr := range all {
+		byKind[tr.Kind] = append(byKind[tr.Kind], tr)
+	}
+
+	if len(byKind["staged"]) < 2 {
+		t.Fatalf("want at least 2 'staged' transitions (root batch + a bisected child), got %d: %+v", len(byKind["staged"]), byKind["staged"])
+	}
+	for _, tr := range byKind["staged"] {
+		if tr.StagingBranch == "" {
+			t.Errorf("staged transition missing StagingBranch: %+v", tr)
+		}
+		if tr.LineagePath == "" {
+			t.Errorf("staged transition missing LineagePath: %+v", tr)
+		}
+	}
+
+	// [1 2 3 4] fails and splits into [1 2] (passes, lands) and [3 4] (fails
+	// again and splits into [3] bounced, [4] lands) -- two bisections, not
+	// one, to fully isolate the single bad PR.
+	if len(byKind["bisected"]) != 2 {
+		t.Fatalf("want exactly 2 'bisected' transitions, got %d: %+v", len(byKind["bisected"]), byKind["bisected"])
+	}
+	gotPRSets := map[string]bool{}
+	for _, tr := range byKind["bisected"] {
+		sort.Ints(tr.PRs)
+		gotPRSets[fmt.Sprint(tr.PRs)] = true
+		if tr.StagingBranch == "" || tr.LineagePath == "" {
+			t.Errorf("bisected transition missing StagingBranch/LineagePath: %+v", tr)
+		}
+	}
+	for _, want := range []string{"[1 2 3 4]", "[3 4]"} {
+		if !gotPRSets[want] {
+			t.Errorf("want a bisected transition for PRs %s, got sets %v", want, gotPRSets)
+		}
+	}
+
+	if len(byKind["bounced"]) != 1 {
+		t.Fatalf("want exactly 1 'bounced' transition (PR 3), got %d: %+v", len(byKind["bounced"]), byKind["bounced"])
+	}
+	if got := byKind["bounced"][0]; len(got.PRs) != 1 || got.PRs[0] != 3 {
+		t.Errorf("bounced transition PRs = %v, want [3]", got.PRs)
+	} else if got.StagingBranch == "" {
+		t.Errorf("bounced transition missing StagingBranch: %+v", got)
+	} else if got.Reason == "" {
+		t.Errorf("bounced transition missing Reason: %+v", got)
+	}
+
+	landedPRs := map[int]bool{}
+	for _, tr := range byKind["landed"] {
+		if len(tr.PRs) != 1 {
+			t.Errorf("landed transition should carry exactly one PR, got %+v", tr)
+			continue
+		}
+		landedPRs[tr.PRs[0]] = true
+		if tr.StagingBranch == "" {
+			t.Errorf("landed transition missing StagingBranch: %+v", tr)
+		}
+	}
+	for _, pr := range []int{1, 2, 4} {
+		if !landedPRs[pr] {
+			t.Errorf("want a 'landed' transition for PR %d, got landed=%v", pr, landedPRs)
+		}
+	}
+	if landedPRs[3] {
+		t.Error("PR 3 (the bounced culprit) must not also have a 'landed' transition")
+	}
+
+	if len(byKind["gate_success"]) == 0 {
+		t.Error("want at least one 'gate_success' transition for a batch that went on to land")
 	}
 }
 
@@ -819,6 +1501,9 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if store.saved == nil || len(store.saved.Active) != 1 {
 		t.Fatalf("checkpoint active batches = %v, want 1 active batch", store.saved)
 	}
+	if got := store.saved.FormatVersion; got != checkpoint.CurrentFormatVersion {
+		t.Fatalf("checkpoint format version = %d, want %d", got, checkpoint.CurrentFormatVersion)
+	}
 
 	restarted := New(cfg, m, m)
 	if err := restarted.Reconcile(context.Background()); err != nil {
@@ -834,8 +1519,61 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[1 2]" {
 		t.Errorf("merged after restore = %s, want [1 2]", got)
 	}
+	// The transition outbox keeps the checkpoint alive for a few more ticks so
+	// a dropped final response cannot lose the landed records; it drains and
+	// the checkpoint is then deleted.
+	drive(restarted, outboxMaxAttempts+2)
 	if !store.deleted {
-		t.Error("empty queue should delete checkpoint after restored batch lands")
+		t.Error("empty queue should delete checkpoint once the transition outbox drains")
+	}
+}
+
+func TestCheckpointDiscardsChangedActiveEvidence(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	staleBranch := m.stagingBranches[0]
+	m.prs[1].Head.Sha = "head-1-new"
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore changed batch: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [1 2]]" {
+		t.Fatalf("staged = %s, want fresh staging after the head changed", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+staleBranch) {
+		t.Fatalf("calls = %s, want stale staging branch deleted", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Fatalf("statuses = %s, want no release from stale evidence", got)
+	}
+}
+
+func TestCheckpointDoesNotDeleteBranchOutsideStagingNamespace(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		FormatVersion: checkpoint.CurrentFormatVersion,
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Active: []checkpoint.ActiveBatchSnapshot{{
+			PRs:           []checkpoint.PullRequestSnapshot{{Number: 1, HeadSHA: "head-1"}},
+			StagingBranch: "main",
+			StagingSHA:    "stage-1",
+		}},
+	}}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	if err := New(cfg, m, m).Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore queue: %v", err)
+	}
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "delete:main") {
+		t.Fatalf("calls = %s, must not delete a branch outside the staging namespace", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want fresh staging", got)
 	}
 }
 
@@ -891,8 +1629,8 @@ func TestCheckpointRestoresPendingBisectionFrontier(t *testing.T) {
 	restarted := New(cfg, m, m)
 	drive(restarted, 30)
 
-	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2] [3 4] [3] [4]]" {
-		t.Errorf("staged after restoring frontier = %s, want resumed bisection without root rerun", got)
+	if got := fmt.Sprint(m.staged); got != "[[1 2 3 4] [1 2] [1 2 3] [1 2 4]]" {
+		t.Errorf("staged after restoring frontier = %s, want cumulative resumed bisection without root rerun", got)
 	}
 	sort.Ints(m.merged)
 	if got := fmt.Sprint(m.merged); got != "[1 2 4]" {
@@ -915,6 +1653,55 @@ func TestAllGreenBatchLandsInOneRun(t *testing.T) {
 	}
 	if len(m.batchOf) != 1 {
 		t.Errorf("all-green batch should take exactly 1 staging run, took %d", len(m.batchOf))
+	}
+}
+
+func TestCheckpointRejectsFutureFormatBeforeQueueActions(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		FormatVersion: checkpoint.CurrentFormatVersion + 1,
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Pending:       [][]int{{1}},
+	}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging", Checkpoint: store}, m, m)
+
+	if err := e.Reconcile(context.Background()); err == nil {
+		t.Fatal("future checkpoint format reconciled successfully")
+	}
+	if got := len(m.staged); got != 0 {
+		t.Fatalf("staged batches = %d, want 0", got)
+	}
+}
+
+// A legacy (below-current, e.g. Postgres pre-versioning "0" or v1) checkpoint
+// with in-flight work cannot be resumed exactly, but it must not wedge the
+// queue forever: the engine discards the stale state and re-derives from the
+// forge, then persists a current-version checkpoint.
+func TestCheckpointDiscardsLegacyInFlightAndReDerives(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		FormatVersion: 0, // Postgres store before it persisted a version
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Pending:       [][]int{{9}}, // a stale PR that isn't even queued anymore
+	}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("legacy checkpoint wedged the queue: %v", err)
+	}
+	// The stale [9] is gone; the queue re-derived the real ready PRs.
+	for _, s := range m.staged {
+		for _, n := range s {
+			if n == 9 {
+				t.Fatalf("stale legacy candidate 9 was staged: %v", m.staged)
+			}
+		}
+	}
+	if len(m.staged) == 0 {
+		t.Fatal("queue did not re-derive after discarding the legacy checkpoint")
+	}
+	if store.saved == nil || store.saved.FormatVersion != checkpoint.CurrentFormatVersion {
+		t.Fatalf("re-saved checkpoint version = %v, want current", store.saved)
 	}
 }
 
@@ -2335,8 +3122,9 @@ func TestLeaseContentionSkipsQueueActions(t *testing.T) {
 func TestLeaseReacquisitionResetsVolatileStateAndReloadsCheckpoint(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
-		Key:     checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
-		Pending: [][]int{{1}},
+		FormatVersion: checkpoint.CurrentFormatVersion,
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Pending:       [][]int{{1}},
 	}}
 	lease := &testQueueLease{held: []bool{false, true}}
 	e := New(Config{
@@ -2781,7 +3569,7 @@ type contextBlockingStager struct {
 	hasDeadline bool
 }
 
-func (s *contextBlockingStager) BuildStaging(ctx context.Context, _ string, _ string, _ []gitops.MergedRef) (string, int, error) {
+func (s *contextBlockingStager) BuildStaging(ctx context.Context, _, _, _ string, _ []gitops.MergedRef) (string, int, error) {
 	s.deadline, s.hasDeadline = ctx.Deadline()
 	<-ctx.Done()
 	return "", 0, ctx.Err()
@@ -2831,4 +3619,143 @@ func (s *memoryCheckpointStore) DeleteQueue(_ context.Context, _ checkpoint.Queu
 	s.saved = nil
 	s.deleted = true
 	return nil
+}
+
+// Staging branch names encode bisection lineage.
+//
+// The name is `<prefix>-<runID>-<path>`, where every batch bisected out of one
+// root shares the runID and the path records the splits: "r" for the root,
+// "r0"/"r1" for its halves, "r01" for the second half of the first, and so on.
+// A branch's parent is its path minus the last character.
+//
+// The previous scheme, `<unixnano>-<seq>`, encoded nothing: the timestamp was
+// taken per staging operation so it was unique to each attempt, and seq counted
+// over the engine's lifetime. Under BisectFanout > 1 siblings stage at
+// effectively the same instant, so nothing in the name distinguished them and a
+// tree could not be drawn from the branches alone.
+func TestStagingBranchNamesEncodeBisectionLineage(t *testing.T) {
+	m := newMock(3, 1, 2, 3, 4)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+	drive(e, 30)
+
+	if len(m.stagingBranches) < 2 {
+		t.Fatalf("expected a bisection, got branches: %v", m.stagingBranches)
+	}
+
+	paths := map[string]bool{}
+	runs := map[string]bool{}
+	for _, branch := range m.stagingBranches {
+		rest := strings.TrimPrefix(branch, "mq/main/staging-")
+		if rest == branch {
+			t.Fatalf("branch %q lost the staging prefix", branch)
+		}
+		cut := strings.LastIndex(rest, "-")
+		if cut < 0 {
+			t.Fatalf("branch %q has no lineage path segment", branch)
+		}
+		run, path := rest[:cut], rest[cut+1:]
+		runs[run] = true
+		if !strings.HasPrefix(path, "r") {
+			t.Fatalf("branch %q path %q does not start at a root", branch, path)
+		}
+		for _, c := range path[1:] {
+			if c != '0' && c != '1' {
+				t.Fatalf("branch %q path %q is not a binary bisection path", branch, path)
+			}
+		}
+		if paths[run+"/"+path] {
+			t.Fatalf("staging branch reused for run %s path %s", run, path)
+		}
+		paths[run+"/"+path] = true
+	}
+
+	// The bisection of one root shares its run, so the tree groups by name.
+	if len(runs) != 1 {
+		t.Fatalf("one root batch should yield one run id, got %d: %v", len(runs), runs)
+	}
+
+	// Exact-key cache hits may resolve a node without staging its branch, so an
+	// actually staged grandchild can legitimately have an unstaged parent path.
+
+	// A real split must have happened, or this proves nothing.
+	if len(paths) < 2 {
+		t.Fatalf("expected at least one split, got paths: %v", paths)
+	}
+}
+
+// A batch restacked because a PR head changed is a fresh root, not a retry of
+// the same tree position: it must not reuse the previous branch name, or the
+// gate status attached to the old branch would still be there. Guards the
+// clock-only run id that broke TestStagingBranchesAreUniquePerAttempt.
+func TestRestackedBatchGetsANewRunEvenWithAFrozenClock(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return time.Unix(100, 0) }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.prs[1].Head.Sha = "head-1-updated"
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack updated head: %v", err)
+	}
+
+	if len(m.stagingBranches) != 2 {
+		t.Fatalf("staging branches = %d, want 2", len(m.stagingBranches))
+	}
+	if m.stagingBranches[0] == m.stagingBranches[1] {
+		t.Fatalf("staging branch reused across restack: %q", m.stagingBranches[0])
+	}
+	for _, b := range m.stagingBranches {
+		if !strings.HasSuffix(b, "-r") {
+			t.Errorf("restack should stage a root path, got %q", b)
+		}
+	}
+}
+
+// A consumer that acks a terminal transition on the SAME tick a fresh process
+// starts: the ack arrives before Reconcile restores the outbox from the
+// checkpoint. Regression — the ack used to be applied against an empty outbox
+// and lost, so the entry was redelivered forever and the checkpoint never
+// drained.
+func TestAckAppliedAfterCheckpointRestoreOnFreshProcess(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+
+	var landedID string
+	for i := 0; i < 8; i++ {
+		_ = e.Reconcile(context.Background())
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "landed" {
+				landedID = tr.EventID
+			}
+		}
+		m.advanceNative()
+		if landedID != "" && store.saved != nil && len(store.saved.TransitionOutbox) > 0 {
+			break
+		}
+	}
+	if landedID == "" || store.saved == nil || len(store.saved.TransitionOutbox) == 0 {
+		t.Fatalf("setup: landedID=%q outbox persisted=%v", landedID, store.saved != nil && len(store.saved.TransitionOutbox) > 0)
+	}
+
+	// Fresh process. Ack comes in on the reconcile request, before the outbox
+	// is restored.
+	restarted := New(cfg, m, m)
+	restarted.AckTransitions([]string{landedID})
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range restarted.Transitions() {
+		if tr.EventID == landedID {
+			t.Fatalf("acked transition %q was redelivered by the fresh process", landedID)
+		}
+	}
+	// The only outbox entry was acked, so the checkpoint drains entirely.
+	if store.saved != nil && len(store.saved.TransitionOutbox) != 0 {
+		t.Fatalf("outbox not drained after ack: %d entries", len(store.saved.TransitionOutbox))
+	}
 }

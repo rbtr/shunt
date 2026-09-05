@@ -111,6 +111,30 @@ func TestListReviewsParsesReviewFlags(t *testing.T) {
 	}
 }
 
+func TestBranchHeadReturnsTipCommit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/repos/o/r/branches/main" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"name":"main","commit":{"id":"abc123def456","message":"x"}}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	sha, err := c.BranchHead(context.Background(), "o", "r", "main")
+	if err != nil {
+		t.Fatalf("BranchHead: %v", err)
+	}
+	if sha != "abc123def456" {
+		t.Fatalf("BranchHead = %q, want abc123def456", sha)
+	}
+	if _, err := c.BranchHead(context.Background(), "o", "r", "gone"); err == nil {
+		t.Fatal("BranchHead on a missing branch returned no error")
+	}
+}
+
 func TestProtectedBranchParsesRequirementsAnd404MeansNoRule(t *testing.T) {
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

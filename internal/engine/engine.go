@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,6 +48,18 @@ type Config struct {
 	Logger        *slog.Logger
 }
 
+type heldLeaf struct {
+	batch   *activeBatch
+	outcome string
+}
+
+type bisectionTree struct {
+	accepted []forge.PullRequest
+	results  map[string]string
+	held     []heldLeaf
+	cursor   int
+}
+
 type activeBatch struct {
 	prs                []forge.PullRequest
 	stagingBranch      string
@@ -59,6 +72,10 @@ type activeBatch struct {
 	phase              string    // "waiting_gate", "waiting_merge", or "bisecting"
 	phaseSince         time.Time // when the current phase started
 	missingGateRetries int
+	exactKey           string
+	runID              string // the root batch this was bisected out of
+	lineagePath        string // "r", "r0", "r01", … ; parent is this minus one char
+	speculative        bool
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -69,6 +86,7 @@ type ForgeAPI interface {
 	AutomergeState(ctx context.Context, owner, repo string, index int) (forge.AutomergeState, error)
 	ListReviews(ctx context.Context, owner, repo string, index int) ([]forge.Review, error)
 	ProtectedBranch(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error)
+	BranchHead(ctx context.Context, owner, repo, branch string) (string, error)
 	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (forge.CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
@@ -102,9 +120,10 @@ var (
 	nativeMergePoll  = time.Second
 )
 
-// Stager builds an integration ("staging") branch from a base + PR head refs.
+// Stager builds a staging branch from a base and PR head references.
+// baseAnchor selects a fixed base commit when it is not empty.
 type Stager interface {
-	BuildStaging(ctx context.Context, base, stagingBranch string, refs []gitops.MergedRef) (sha string, conflictPR int, err error)
+	BuildStaging(ctx context.Context, base, baseAnchor, stagingBranch string, refs []gitops.MergedRef) (sha string, conflictPR int, err error)
 }
 
 type Engine struct {
@@ -121,6 +140,25 @@ type Engine struct {
 	baseGen        int
 	stagingSeq     int
 
+	// A staging branch records its position in one bisection tree.
+	//
+	//   <prefix>-<runID>-r      root batch
+	//   <prefix>-<runID>-r0     first child
+	//   <prefix>-<runID>-r01    second child of the first child
+	//
+	// The path identifies the parent and the child order.
+	// runID identifies one root batch and its child batches.
+	// lineage records the path for each pending candidate.
+	runID        string
+	lineage      map[int]string
+	lineageRunID map[int]string
+	trees        map[string]*bisectionTree
+	// rootAnchor pins the base-branch commit SHA read when each root runID was
+	// opened. Every staged integration and every exact test key under that root
+	// is anchored to it, so main moving between two nodes cannot silently
+	// change what a cached outcome means.
+	rootAnchor map[string]string
+
 	// bisectOrigins tracks the first PR number of each pending candidate that was
 	// produced by bisection. Checked in startNext to set phase = "bisecting".
 	bisectOrigins map[int]bool
@@ -135,7 +173,31 @@ type Engine struct {
 	checkpointExists bool
 	leaseHeld        bool
 	durableLease     bool
+
+	// transitions accumulates single-shot lifecycle records for the current
+	// Reconcile call; see transitions.go.
+	transitions []Transition
+	// outbox holds terminal transitions (those with an EventID, driving an
+	// irreversible side effect) until they have been re-sent enough times to
+	// survive a dropped reconcile response. It is checkpointed, so it also
+	// survives a restart. Redelivery is safe because the consumer de-dups by
+	// EventID.
+	outbox []outboxEntry
+	// pendingAcks are EventIDs the consumer confirmed on the reconcile request
+	// but that could not be applied yet because the outbox is loaded from the
+	// checkpoint inside Reconcile. Applied right after loadCheckpoint.
+	pendingAcks []string
 }
+
+type outboxEntry struct {
+	t        Transition
+	attempts int
+}
+
+// outboxMaxAttempts bounds how many reconcile responses re-carry a terminal
+// transition. Seven gives generous coverage for a dropped response without
+// letting the outbox grow without bound.
+const outboxMaxAttempts = 7
 
 func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 	durableLease := cfg.Lease != nil
@@ -162,12 +224,17 @@ func New(cfg Config, fc ForgeAPI, st Stager) *Engine {
 		terminalQueueComments: map[int]string{},
 		requeueStates:         map[int]string{},
 		mergeStrikes:          map[string]int{},
+		lineage:               map[int]string{},
+		lineageRunID:          map[int]string{},
+		trees:                 map[string]*bisectionTree{},
+		rootAnchor:            map[string]string{},
 		durableLease:          durableLease,
 	}
 }
 
 // Reconcile advances the queue by one step. Safe to call on a fixed interval.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	e.transitions = nil
 	if e.durableLease {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, e.cfg.LeaseTTL/2)
@@ -205,6 +272,12 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		e.observeQueue()
 		return err
 	}
+	// The outbox only exists once the checkpoint is loaded, so consumer acks
+	// and the retransmit-attempt count are applied here, not at the top of the
+	// call — otherwise a fresh process would drop neither and redeliver every
+	// terminal transition forever.
+	e.applyPendingAcks()
+	e.ageOutbox()
 	if err := e.reconcileContextErr(ctx); err != nil {
 		return err
 	}
@@ -291,10 +364,13 @@ func (e *Engine) resetVolatileQueueState() {
 	e.bisectOrigins = map[int]bool{}
 	e.baseGen = 0
 	e.stagingSeq = 0
+	e.runID = ""
+	e.lineage = nil
 	e.queueComments = map[int]string{}
 	e.terminalQueueComments = map[int]string{}
 	e.requeueStates = map[int]string{}
 	e.mergeStrikes = map[string]int{}
+	e.outbox = nil
 	e.checkpointLoaded = false
 	e.checkpointExists = false
 }
@@ -511,15 +587,48 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if len(prs) == 0 {
+		// Every PR of this candidate withdrew before it could be staged. If it
+		// was a bisection node, consume its lineage and record it so the root
+		// it belonged to is not left waiting on a node that will never run.
+		if len(cand) > 0 {
+			if runID := e.lineageRunID[cand[0]]; runID != "" {
+				path := e.lineage[cand[0]]
+				delete(e.lineage, cand[0])
+				delete(e.lineageRunID, cand[0])
+				delete(e.bisectOrigins, cand[0])
+				e.recordTransition(Transition{Kind: "bisected", RunID: runID, LineagePath: path})
+				e.logger.Info("bisection node dropped: all its candidates withdrew before staging", "prs", cand, "runID", runID)
+			}
+		}
 		return false, nil
 	}
 
-	refs := make([]gitops.MergedRef, len(prs))
-	for i, p := range prs {
+	runID, lineagePath := e.lineageFor(cand)
+	anchor, err := e.ensureRootAnchor(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	stagedPRs := prs
+	if tree, ok := e.trees[runID]; ok {
+		stagedPRs = append(append([]forge.PullRequest(nil), tree.accepted...), prs...)
+	}
+	refs := make([]gitops.MergedRef, len(stagedPRs))
+	for i, p := range stagedPRs {
 		refs[i] = gitops.MergedRef{PR: p.Number, Ref: fmt.Sprintf("refs/pull/%d/head", p.Number)}
 	}
-	stagingBranch := e.stagingBranch()
-	sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, stagingBranch, refs)
+	exactKey := e.exactKey(anchor, stagedPRs)
+	if tree, ok := e.trees[runID]; ok {
+		if outcome, cached := tree.results[exactKey]; cached {
+			e.active = append(e.active, &activeBatch{prs: prs, stagingBranch: e.stagingBranchFor(runID, lineagePath), outcome: outcome, phase: phaseForOutcome(outcome), phaseSince: e.now(), runID: runID, lineagePath: lineagePath, exactKey: exactKey})
+			return true, nil
+		}
+	}
+	stagingBranch := e.stagingBranchFor(runID, lineagePath)
+	// Every integration under a root is built on that root's immutable anchor,
+	// not the live base tip, so main moving mid-tree cannot change what a
+	// staged result means. Detecting and acting on such a move (root
+	// invalidation) is a separate change.
+	sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, anchor, stagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
 			if e.cfg.Metrics != nil {
@@ -541,12 +650,19 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		baseGen:       e.baseGen,
 		phase:         phase,
 		phaseSince:    e.now(),
+		runID:         runID,
+		lineagePath:   lineagePath,
+		exactKey:      exactKey,
 	}
 	e.active = append(e.active, a)
 	if e.cfg.Metrics != nil {
 		e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
 	}
 	e.logger.Info("testing batch", "prs", numbersOf(prs), "stagingBranch", a.stagingBranch, "sha", short(sha))
+	e.recordTransition(Transition{
+		Kind: "staged", PRs: numbersOf(prs), StagingBranch: a.stagingBranch,
+		RunID: a.runID, LineagePath: a.lineagePath,
+	})
 	return true, nil
 }
 
@@ -585,6 +701,15 @@ func missingGateGrace(retries int) time.Duration {
 }
 
 func (e *Engine) checkActive(ctx context.Context) (bool, error) {
+	if resolved, err := e.invalidateAdvancedRoots(ctx); resolved || err != nil {
+		return resolved, err
+	}
+	if resolved, err := e.invalidateRootsOnCandidateChange(ctx); resolved || err != nil {
+		return resolved, err
+	}
+	if resolved, err := e.finalizeReadyTree(ctx); resolved || err != nil {
+		return resolved, err
+	}
 	for _, a := range e.active {
 		if a.outcome == "" {
 			changed, err := e.requeueActiveIfHeadChanged(ctx, a)
@@ -613,9 +738,16 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 					continue
 				}
 				if a.missingGateRetries >= missingGateMaxRetries {
+					// A missing gate result cannot decide a source PR.
+					// Requeue the root when the retry limit is reached.
+					if e.requeuedTreeNode(ctx, a, "staging gate produced no result after retries",
+						"re-queued: the staging gate produced no result") {
+						e.logger.Error("bisection root aborted: a node's gate never ran", "prs", numbersOf(a.prs), "runID", a.runID)
+						return true, nil
+					}
 					e.cleanupBatch(ctx, a)
 					for _, staged := range a.prs {
-						e.bounce(ctx, staged.Number, staged.Head.Sha, "no CI gate run after 3 retries", "error", a.debugURL)
+						e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha, "no CI gate run after 3 retries", "error", "")
 					}
 					e.logger.Error("staging batch abandoned after missing gate retries", "prs", numbersOf(a.prs))
 					return true, nil
@@ -627,8 +759,12 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				for i, pr := range prs {
 					refs[i] = gitops.MergedRef{PR: pr.Number, Ref: fmt.Sprintf("refs/pull/%d/head", pr.Number)}
 				}
-				branch := e.stagingBranch()
-				sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, branch, refs)
+				// A missing-gate retry restages the SAME batch at the same
+				// point in the tree, so it keeps its run and path rather than
+				// becoming a new node. cleanupBatch above deleted the previous
+				// branch, so the name is free to reuse.
+				branch := e.stagingBranchFor(a.runID, a.lineagePath)
+				sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, e.rootAnchor[a.runID], branch, refs)
 				if err != nil {
 					if conflictPR > 0 {
 						return false, e.handleStagingConflict(ctx, prs, conflictPR)
@@ -638,12 +774,15 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				retry := a.missingGateRetries + 1
 				e.active = append(e.active, &activeBatch{
 					prs:                prs,
+					runID:              a.runID,
+					lineagePath:        a.lineagePath,
 					stagingBranch:      branch,
 					stagingSHA:         sha,
 					baseGen:            e.baseGen,
 					phase:              "waiting_gate",
 					phaseSince:         e.now(),
 					missingGateRetries: retry,
+					exactKey:           a.exactKey,
 				})
 				e.logger.Warn("staging batch re-staged after no gate result",
 					"prs", numbersOf(prs), "stagingBranch", branch, "retry", retry)
@@ -666,6 +805,9 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				}
 				a.outcome = status
 				a.debugURL = debugURL
+				if tree, ok := e.trees[a.runID]; ok {
+					tree.results[a.exactKey] = status
+				}
 				if e.cfg.Metrics != nil {
 					e.cfg.Metrics.IncGateOutcome(e.metricLabels(), status)
 					e.cfg.Metrics.ObserveGateDuration(e.metricLabels(), status, e.now().Sub(a.phaseSince))
@@ -673,6 +815,10 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				if status == "success" {
 					a.phase = "waiting_merge"
 					a.phaseSince = e.now()
+					e.recordTransition(Transition{
+						Kind: "gate_success", PRs: numbersOf(a.prs), StagingBranch: a.stagingBranch,
+						RunID: a.runID, LineagePath: a.lineagePath,
+					})
 				}
 			default: // running, waiting, blocked -> keep waiting
 				changed, err := e.invalidateStaleActive(ctx, a)
@@ -692,8 +838,22 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 			e.requeueStaleActive(ctx, a)
 			return true, nil
 		}
+		// A speculative result is valid only when its exact key still matches
+		// the resolved frontier. Re-stage the node when the keys differ.
+		if a.exactKey != "" {
+			if tree, ok := e.trees[a.runID]; ok {
+				staged := append(append([]forge.PullRequest(nil), tree.accepted...), a.prs...)
+				if want := e.exactKey(e.rootAnchor[a.runID], staged); want != a.exactKey {
+					e.supersedeSpeculative(ctx, a)
+					return true, nil
+				}
+			}
+		}
 		switch a.outcome {
 		case "success":
+			if e.holdTreeLeaf(ctx, a, "success") {
+				return true, nil
+			}
 			resolved, merged, err := e.land(ctx, a)
 			if merged > 0 {
 				e.baseGen++
@@ -765,6 +925,11 @@ func (e *Engine) invalidateStaleActive(ctx context.Context, a *activeBatch) (boo
 }
 
 func (e *Engine) discardIneligibleActive(ctx context.Context, a *activeBatch, pr int, reason string) {
+	if e.requeuedTreeNode(ctx, a, "a pinned candidate became ineligible", "re-queued: a pinned candidate became ineligible mid-test") {
+		e.observeQueueExit(pr, "ineligible")
+		e.logger.Info("bisection root torn down after a candidate became ineligible", "pr", pr, "reason", reason)
+		return
+	}
 	remaining := removeNum(numbersOf(a.prs), pr)
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after another PR became ineligible", remaining)
@@ -849,7 +1014,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
 				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
 				e.cleanupBatch(ctx, a)
-				e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+				e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
 				return true, merged, nil
 			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
@@ -885,7 +1050,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 					e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
 					e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
 					e.cleanupBatch(ctx, a)
-					e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+					e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
 					return true, merged, nil
 				}
 				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
@@ -914,7 +1079,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 					e.logger.Warn("PR bounced: auto-merge repeatedly cancelled during recovery", "pr", staged.Number, "head", short(staged.Head.Sha))
 					e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
 					e.cleanupBatch(ctx, a)
-					e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+					e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
 					return true, merged, nil
 				}
 				e.logger.Info("PR skipped during native merge recovery", "pr", staged.Number, "reason", "auto-merge is no longer scheduled")
@@ -943,7 +1108,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				e.logger.Warn("PR bounced: native merge repeatedly did not complete", "pr", staged.Number, "head", short(staged.Head.Sha))
 				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
 				e.cleanupBatch(ctx, a)
-				e.bounce(ctx, staged.Number, staged.Head.Sha,
+				e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha,
 					"the forge did not complete its scheduled merge after repeated attempts", "error", a.debugURL)
 				return true, merged, nil
 			}
@@ -997,7 +1162,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
 				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
 				e.cleanupBatch(ctx, a)
-				e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+				e.bounceFrom(ctx, a.runID, a.stagingBranch, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
 				return true, merged, nil
 			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
@@ -1135,6 +1300,11 @@ func (e *Engine) recordLanded(ctx context.Context, a *activeBatch, staged forge.
 		true,
 	)
 	e.logger.Info("PR merged", "pr", staged.Number)
+	e.recordTransition(Transition{
+		Kind: "landed", PRs: []int{staged.Number}, StagingBranch: a.stagingBranch,
+		RunID: a.runID, LineagePath: a.lineagePath,
+		EventID: terminalEventID(a.runID, "landed", []int{staged.Number}),
+	})
 }
 
 func (e *Engine) releasedByShunt(ctx context.Context, a *activeBatch, staged forge.PullRequest) (bool, error) {
@@ -1162,7 +1332,7 @@ func (e *Engine) handleStagingConflict(ctx context.Context, prs []forge.PullRequ
 		return fmt.Errorf("stager reported conflict on PR #%d outside candidate %v", conflictPR, nums)
 	}
 	if idx == 0 {
-		e.bounce(ctx, conflictPR, prs[idx].Head.Sha, "merge conflict while staging the PR", "error", "")
+		e.bounce(ctx, "", conflictPR, prs[idx].Head.Sha, "merge conflict while staging the PR", "error", "")
 		if len(nums) > 1 {
 			rest := append([]int(nil), nums[1:]...)
 			e.enqueueWithState("retrying after staging conflict; testing a smaller batch", rest)
@@ -1193,20 +1363,174 @@ func (e *Engine) skipLand(ctx context.Context, staged, current forge.PullRequest
 // bisectOrBounce: a size-1 failing batch bounces the culprit; a larger batch is
 // split in half, with the first half tested next (the good half lands, the
 // recursion isolates the bad PR(s)).
+// holdTreeLeaf moves a terminal-gate node of a bisection tree out of the
+// active list without publishing a source-PR decision; the decision is made
+// in queue order by finalizeReadyTree once every descendant is terminal.
+func (e *Engine) holdTreeLeaf(ctx context.Context, a *activeBatch, outcome string) bool {
+	tree, ok := e.trees[a.runID]
+	if !ok {
+		return false
+	}
+	e.cleanupBatch(ctx, a)
+	if outcome == "success" {
+		tree.accepted = append(tree.accepted, a.prs...)
+	}
+	tree.held = append(tree.held, heldLeaf{batch: a, outcome: outcome})
+	sort.Slice(tree.held, func(i, j int) bool {
+		return tree.held[i].batch.prs[0].Number < tree.held[j].batch.prs[0].Number
+	})
+	e.recordTransition(Transition{
+		Kind: "held", PRs: numbersOf(a.prs), StagingBranch: a.stagingBranch,
+		RunID: a.runID, LineagePath: a.lineagePath, Reason: outcome,
+	})
+	return true
+}
+
+// treeHasUnresolvedNode reports whether any candidate under runID is still
+// awaiting a gate result — staged in e.active, or waiting in e.pending. A tree
+// is ready to finalize exactly when this is false. It is derived on every read
+// rather than tracked as a counter so that no batch-removal path (a missing
+// gate, a requeue, a supersede) can strand a root by forgetting to decrement.
+func (e *Engine) treeHasUnresolvedNode(runID string) bool {
+	return e.unresolvedNodeCount(runID) > 0
+}
+
+func (e *Engine) unresolvedNodeCount(runID string) int {
+	n := 0
+	for _, a := range e.active {
+		if a.runID == runID {
+			n++
+		}
+	}
+	for _, node := range e.pending {
+		if len(node) > 0 && e.lineageRunID[node[0]] == runID {
+			n++
+		}
+	}
+	return n
+}
+
+// finalizeReadyTree performs one ordered source-PR decision only after every
+// descendant has produced terminal gate evidence.
+func (e *Engine) finalizeReadyTree(ctx context.Context) (bool, error) {
+	for runID, tree := range e.trees {
+		if e.treeHasUnresolvedNode(runID) {
+			continue
+		}
+		if tree.cursor == len(tree.held) {
+			delete(e.trees, runID)
+			delete(e.rootAnchor, runID)
+			return true, nil
+		}
+		// An external base advance while a ready root has not yet landed
+		// anything means every not-yet-performed decision used stale evidence.
+		// A bounce does not move main, so if we have only bounced so far and
+		// the anchor no longer matches, someone else landed a change; re-root
+		// the unperformed suffix on current main. (An external advance
+		// interleaved with our own landings is a narrower case left for later:
+		// once a success has landed, main legitimately moved and the
+		// acknowledged actions are irreversible facts.)
+		if anchor := e.rootAnchor[runID]; anchor != "" && !treeFinalizedASuccess(tree) {
+			head, err := e.fc.BranchHead(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+			if err != nil {
+				return false, err
+			}
+			if head != anchor {
+				e.reRootFinalizationSuffix(ctx, runID, tree)
+				return true, nil
+			}
+		}
+		leaf := tree.held[tree.cursor]
+		if leaf.outcome == "success" {
+			resolved, _, err := e.land(ctx, leaf.batch)
+			if err != nil {
+				return false, err
+			}
+			if !resolved {
+				return true, nil
+			}
+		} else {
+			staged := leaf.batch.prs[0]
+			e.bounceFrom(ctx, leaf.batch.runID, leaf.batch.stagingBranch, staged.Number, staged.Head.Sha,
+				fmt.Sprintf("merge-queue gate **%s**", leaf.outcome), gateOutcomeStatus(leaf.outcome), leaf.batch.debugURL)
+		}
+		tree.cursor++
+		return true, nil
+	}
+	return false, nil
+}
+
+// treeFinalizedASuccess reports whether any leaf up to the finalization cursor
+// was a success (and so legitimately moved the base branch).
+func treeFinalizedASuccess(tree *bisectionTree) bool {
+	for _, leaf := range tree.held[:tree.cursor] {
+		if leaf.outcome == "success" {
+			return true
+		}
+	}
+	return false
+}
+
+// reRootFinalizationSuffix handles an external base advance during a ready
+// root's finalization before any success has landed: the already-bounced
+// leaves stay bounced (irreversible), and every held leaf from the cursor
+// onward is re-queued as a fresh root on current main because its evidence
+// used the now-stale anchor.
+func (e *Engine) reRootFinalizationSuffix(ctx context.Context, runID string, tree *bisectionTree) {
+	suffix := map[int]bool{}
+	for _, leaf := range tree.held[tree.cursor:] {
+		for _, pr := range leaf.batch.prs {
+			suffix[pr.Number] = true
+		}
+		e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
+		e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: runID, LineagePath: leaf.batch.lineagePath})
+	}
+	nums := make([]int, 0, len(suffix))
+	for n := range suffix {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+
+	delete(e.trees, runID)
+	delete(e.rootAnchor, runID)
+	e.recordTransition(Transition{
+		Kind: "root_invalidated", PRs: nums, RunID: runID,
+		Reason:  "base branch advanced during finalization",
+		EventID: terminalEventID(runID, "root_invalidated", nums),
+	})
+	e.logger.Warn("root finalization aborted: base advanced before any decision landed; re-queuing the suffix",
+		"runID", runID, "suffix", nums)
+	if len(nums) > 0 {
+		e.enqueueWithState("re-queued: base advanced during finalization", nums)
+	}
+}
+
 func (e *Engine) bisectOrBounce(ctx context.Context, a *activeBatch, status string) (bool, error) {
 	nums := numbersOf(a.prs)
 	e.cleanupBatch(ctx, a)
 
 	if len(nums) == 1 {
-		bounced := e.bounce(ctx, nums[0], a.prs[0].Head.Sha, fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
+		if e.holdTreeLeaf(ctx, a, status) {
+			return true, nil
+		}
+		bounced := e.bounceFrom(ctx, a.runID, a.stagingBranch, nums[0], a.prs[0].Head.Sha, fmt.Sprintf("merge-queue gate **%s**", status), gateOutcomeStatus(status), a.debugURL)
 		return bounced, nil
 	}
 	mid := len(nums) / 2
 	first := append([]int(nil), nums[:mid]...)
 	second := append([]int(nil), nums[mid:]...)
+	if _, ok := e.trees[a.runID]; !ok {
+		e.trees[a.runID] = &bisectionTree{results: map[string]string{a.exactKey: status}}
+	}
 	e.markBisectOrigins(first[0], second[0])
+	e.markLineage(a.runID, a.lineagePath, first, second)
 	e.enqueueWithState("retrying after gate "+status+"; isolating the batch", first, second)
-	e.logger.Info("batch failed; bisecting", "prs", nums, "status", status, "first", first, "second", second)
+	e.logger.Info("batch failed; bisecting", "prs", nums, "status", status, "first", first, "second", second,
+		"stagingBranch", a.stagingBranch, "firstPath", e.lineage[first[0]], "secondPath", e.lineage[second[0]])
+	e.recordTransition(Transition{
+		Kind: "bisected", PRs: nums, StagingBranch: a.stagingBranch,
+		RunID: a.runID, LineagePath: a.lineagePath,
+	})
 	return true, nil
 }
 
@@ -1228,7 +1552,14 @@ func gateOutcomeStatus(status string) string {
 	return "error"
 }
 
-func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, statusState, debugURL string) bool {
+func (e *Engine) bounce(ctx context.Context, runID string, num int, expectedHeadSHA, reason, statusState, debugURL string) bool {
+	return e.bounceFrom(ctx, runID, "", num, expectedHeadSHA, reason, statusState, debugURL)
+}
+
+// bounceFrom is bounce with the batch's staging branch attached to the
+// resulting Transition, when the caller has one (every caller does, except
+// the missing-gate-retries path which has already torn its batch down).
+func (e *Engine) bounceFrom(ctx context.Context, runID, stagingBranch string, num int, expectedHeadSHA, reason, statusState, debugURL string) bool {
 	if pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, num); err == nil && pr.State == "open" && !pr.Merged {
 		if expectedHeadSHA != "" && pr.Head.Sha != expectedHeadSHA {
 			e.enqueueWithState("requeued after PR head changed", []int{num})
@@ -1247,6 +1578,15 @@ func (e *Engine) bounce(ctx context.Context, num int, expectedHeadSHA, reason, s
 		}
 	}
 	e.logger.Info("PR bounced", "pr", num, "reason", reason)
+	t := Transition{Kind: "bounced", PRs: []int{num}, StagingBranch: stagingBranch, Reason: reason, RunID: runID}
+	if runID != "" {
+		// Only a root-scoped bounce gets a stable de-dup id. The rootless
+		// staging-conflict bounce has no unique key (the same PR can conflict
+		// in successive attempts), so it stays non-idempotent — acceptable
+		// because it drives no merge counter.
+		t.EventID = terminalEventID(runID, "bounced", []int{num})
+	}
+	e.recordTransition(t)
 	return true
 }
 
@@ -1257,9 +1597,91 @@ func (e *Engine) activeLimit() int {
 	return 1
 }
 
-func (e *Engine) stagingBranch() string {
+// frontierKeyVersion is bumped whenever the meaning of an exact key changes,
+// so a key written by an older engine can never be mistaken for a current one.
+// v1 was PR head SHAs only; v2 adds the base anchor and merge style.
+const frontierKeyVersion = 2
+
+// exactKey identifies one gate result.
+// It includes the base anchor, merge style, and ordered PR heads.
+// Results with different keys are independent.
+func (e *Engine) exactKey(anchor string, prs []forge.PullRequest) string {
+	parts := make([]string, 0, len(prs)+3)
+	parts = append(parts, "v"+strconv.Itoa(frontierKeyVersion), anchor, e.cfg.MergeStyle)
+	for _, pr := range prs {
+		parts = append(parts, pr.Head.Sha)
+	}
+	return strings.Join(parts, "\x1f")
+}
+
+// ensureRootAnchor pins, once per root, the base branch's commit SHA. Every
+// staged integration and exact key under that root is scoped to it.
+func (e *Engine) ensureRootAnchor(ctx context.Context, runID string) (string, error) {
+	if a := e.rootAnchor[runID]; a != "" {
+		return a, nil
+	}
+	head, err := e.fc.BranchHead(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return "", fmt.Errorf("read base anchor for %q: %w", e.cfg.Base, err)
+	}
+	if e.rootAnchor == nil {
+		e.rootAnchor = map[string]string{}
+	}
+	e.rootAnchor[runID] = head
+	return head, nil
+}
+
+// stagingBranchFor names a staging branch for a batch at a known point in the
+// bisection tree. Callers pass the run this batch belongs to and its path.
+
+func (e *Engine) stagingBranchFor(runID, path string) string {
 	e.stagingSeq++
-	return fmt.Sprintf("%s-%d-%d", e.cfg.StagingBranch, e.now().UnixNano(), e.stagingSeq)
+	return fmt.Sprintf("%s-%s-%s", e.cfg.StagingBranch, runID, path)
+}
+
+// lineageFor returns the run and path for a candidate about to be staged,
+// consuming the entry recorded when it was split out of its parent. A
+// candidate with no recorded lineage is a new root: it starts a new run.
+func (e *Engine) lineageFor(cand []int) (string, string) {
+	if len(cand) > 0 {
+		if path, ok := e.lineage[cand[0]]; ok {
+			runID := e.lineageRunID[cand[0]]
+			delete(e.lineage, cand[0])
+			delete(e.lineageRunID, cand[0])
+			return runID, path
+		}
+	}
+	// The run id must be unique per root attempt, not merely per instant: a
+	// batch restacked because a PR head changed is a fresh root, and if it
+	// reused the name the gate status for the previous branch would still be
+	// attached to it. stagingSeq is monotonic over the engine's lifetime, so
+	// pairing it with the clock keeps roots distinct even when two are staged
+	// within the same nanosecond — which is exactly what happens under
+	// BisectFanout > 1, and in tests with a frozen clock.
+	e.runID = fmt.Sprintf("%d-%d", e.now().UnixNano(), e.stagingSeq)
+	return e.runID, "r"
+}
+
+// markLineage records the path each half of a split will stage under, keyed by
+// its first PR number so startNext can find it. Called before the halves are
+// enqueued.
+func (e *Engine) markLineage(runID, parentPath string, halves ...[]int) {
+	if e.lineage == nil {
+		e.lineage = map[int]string{}
+	}
+	if e.lineageRunID == nil {
+		e.lineageRunID = map[int]string{}
+	}
+	if parentPath == "" {
+		parentPath = "r"
+	}
+	for i, half := range halves {
+		if len(half) == 0 {
+			continue
+		}
+		e.lineage[half[0]] = fmt.Sprintf("%s%d", parentPath, i)
+		e.lineageRunID[half[0]] = runID
+	}
 }
 
 func (e *Engine) enqueue(cands ...[]int) {
@@ -1303,6 +1725,23 @@ func (e *Engine) readyToResolve(a *activeBatch) bool {
 	return true
 }
 
+// requeuedTreeNode intercepts a requeue/eviction that targets a live bisection
+// node. Detaching a node from its tree without accounting for it would leave
+// the root waiting forever on a slot nothing will fill. A candidate whose
+// evidence is now in doubt invalidates the whole immutable root, so tear it
+// down and re-queue every candidate as a fresh root. Returns true when it
+// handled the batch.
+func (e *Engine) requeuedTreeNode(ctx context.Context, a *activeBatch, reason, state string) bool {
+	if a.runID == "" {
+		return false
+	}
+	if _, ok := e.trees[a.runID]; !ok {
+		return false
+	}
+	e.tearDownAndRequeueRoot(ctx, a.runID, reason, state)
+	return true
+}
+
 func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 	if len(e.pending) == 0 || len(e.active) < e.activeLimit() {
 		return
@@ -1311,6 +1750,11 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 	idx := -1
 	latest := -1
 	for i, a := range e.active {
+		// A live bisection node must finish; do not evict it for a
+		// newly-arrived earlier candidate.
+		if _, inTree := e.trees[a.runID]; inTree && a.runID != "" {
+			continue
+		}
 		if first := firstPR(a.prs); first > earliestPending && first > latest {
 			idx = i
 			latest = first
@@ -1326,15 +1770,46 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 }
 
 func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
+	if e.requeuedTreeNode(ctx, a, "base branch advanced", "re-queued: base branch advanced mid-test") {
+		return
+	}
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after base branch advanced", numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
 }
 
 func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
+	if e.requeuedTreeNode(ctx, a, "a pinned candidate changed", "re-queued: a pinned candidate changed mid-test") {
+		return
+	}
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after PR head changed", numbersOf(a.prs))
 	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))
+}
+
+// supersedeSpeculative discards a fanout-staged bisection node whose gate ran
+// against an accumulator the resolved frontier no longer matches, and re-queues
+// the same node — keeping its run id and lineage path — so it re-stages on the
+// correct baseline. tree.open is untouched: the node still exists, unresolved.
+// A matching exact-key result already in tree.results is reused by startNext.
+func (e *Engine) supersedeSpeculative(ctx context.Context, a *activeBatch) {
+	first := a.prs[0].Number
+	e.recordTransition(Transition{
+		Kind: "node_superseded", StagingBranch: a.stagingBranch, PRs: numbersOf(a.prs),
+		RunID: a.runID, LineagePath: a.lineagePath,
+	})
+	e.cleanupBatch(ctx, a)
+	if e.lineage == nil {
+		e.lineage = map[int]string{}
+	}
+	if e.lineageRunID == nil {
+		e.lineageRunID = map[int]string{}
+	}
+	e.lineage[first] = a.lineagePath
+	e.lineageRunID[first] = a.runID
+	e.enqueueWithState("re-staged on the resolved frontier baseline", numbersOf(a.prs))
+	e.logger.Info("speculative batch superseded; re-staging on resolved baseline",
+		"prs", numbersOf(a.prs), "path", a.lineagePath)
 }
 
 func (e *Engine) requeueStaleActives(ctx context.Context) {
@@ -1342,6 +1817,288 @@ func (e *Engine) requeueStaleActives(ctx context.Context) {
 		if a.baseGen != e.baseGen {
 			e.requeueStaleActive(ctx, a)
 		}
+	}
+}
+
+// invalidateAdvancedRoots checks each testing root against its base anchor.
+// Shunt discards a root when the base changed. It requeues the root candidates.
+// Shunt does not publish a source decision during this operation.
+// A root in finalization has no unresolved nodes. Its base can move after a
+// Shunt merge.
+func (e *Engine) invalidateAdvancedRoots(ctx context.Context) (bool, error) {
+	testing := map[string]bool{}
+	for runID := range e.trees {
+		if e.treeHasUnresolvedNode(runID) {
+			testing[runID] = true
+		}
+	}
+	for _, a := range e.active {
+		if a.runID != "" && e.trees[a.runID] == nil {
+			testing[a.runID] = true
+		}
+	}
+	if len(testing) == 0 {
+		return false, nil
+	}
+	head, err := e.fc.BranchHead(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return false, err
+	}
+	for runID := range testing {
+		anchor := e.rootAnchor[runID]
+		if anchor == "" || anchor == head {
+			continue
+		}
+		e.tearDownAndRequeueRoot(ctx, runID, "base branch advanced",
+			"re-queued: base branch advanced mid-test")
+		return true, nil // one root per tick; re-observe on the next reconcile
+	}
+	return false, nil
+}
+
+// invalidateRootsOnCandidateChange checks every pinned candidate of a
+// still-testing root — accepted, held, AND the ones currently staged in an
+// active bisection node — for a head change, close, or merge. Any such change
+// invalidates the immutable root's evidence; reRootPreservingPrefix carries the
+// longest independently evidenced prefix into a successor, or the whole root is
+// torn down. Covering the active nodes here is what keeps a mid-test push from
+// falling through to requeueChangedActive, which would strand the tree.
+//
+// The GetPR sweep costs one call per distinct pinned candidate per reconcile.
+// That is the design's "revalidate every pinned root candidate on each
+// reconcile"; a root with no held leaves and one active node sweeps one PR.
+func (e *Engine) invalidateRootsOnCandidateChange(ctx context.Context) (bool, error) {
+	for runID := range e.trees {
+		if !e.treeHasUnresolvedNode(runID) {
+			continue // finalizing: acknowledged actions are irreversible facts
+		}
+		tree := e.trees[runID]
+		pinned := map[int]string{}
+		for _, pr := range tree.accepted {
+			pinned[pr.Number] = pr.Head.Sha
+		}
+		for _, leaf := range tree.held {
+			for _, pr := range leaf.batch.prs {
+				pinned[pr.Number] = pr.Head.Sha
+			}
+		}
+		for _, a := range e.active {
+			if a.runID == runID {
+				for _, pr := range a.prs {
+					pinned[pr.Number] = pr.Head.Sha
+				}
+			}
+		}
+		// Lowest changed PR number wins: the preserved prefix is everything
+		// strictly to its left.
+		changed := 0
+		for num, sha := range pinned {
+			cur, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, num)
+			if err != nil {
+				return false, err
+			}
+			if cur.State != "open" || cur.Merged || cur.Head.Sha != sha {
+				if changed == 0 || num < changed {
+					changed = num
+				}
+			}
+		}
+		if changed == 0 {
+			continue
+		}
+		e.logger.Warn("root invalidated: a pinned candidate changed",
+			"runID", runID, "pr", changed)
+		if !e.reRootPreservingPrefix(ctx, runID, changed) {
+			e.tearDownAndRequeueRoot(ctx, runID, "a pinned candidate changed",
+				"re-queued: a pinned candidate changed mid-test")
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// reRootPreservingPrefix handles a pinned-candidate change by carrying the
+// longest queue-order prefix of held decisions that is provably independent of
+// the changed candidate into a successor root, and re-resolving only the suffix
+// from the changed candidate onward. A held leaf is independent iff every PR in
+// it is strictly left of `changed` — a successful group is indivisible, so a
+// change inside one discards the whole group. Returns false when nothing can be
+// preserved, leaving the caller to tear the whole root down.
+//
+// The successor keeps the predecessor's base anchor (a candidate change is not
+// a base change) and its own held/accepted evidence, but starts a fresh
+// outcome cache and owns finalization for the whole resulting queue. Inherited
+// leaves keep their original run id for audit.
+func (e *Engine) reRootPreservingPrefix(ctx context.Context, oldRunID string, changed int) bool {
+	tree := e.trees[oldRunID]
+	if tree == nil {
+		return false
+	}
+	maxPR := func(prs []forge.PullRequest) int {
+		m := 0
+		for _, pr := range prs {
+			if pr.Number > m {
+				m = pr.Number
+			}
+		}
+		return m
+	}
+
+	var preserved []heldLeaf
+	for _, leaf := range tree.held { // tree.held is kept sorted by first PR
+		if maxPR(leaf.batch.prs) < changed {
+			preserved = append(preserved, leaf)
+			continue
+		}
+		break
+	}
+	if len(preserved) == 0 {
+		return false
+	}
+
+	// Suffix: every still-pinned PR from the changed candidate onward, plus
+	// active batches and pending nodes of this root. resolve() drops the ones
+	// that are no longer eligible (including a withdrawn `changed`).
+	suffix := map[int]bool{}
+	var preservedAccepted []forge.PullRequest
+	for _, leaf := range preserved {
+		if leaf.outcome == "success" {
+			preservedAccepted = append(preservedAccepted, leaf.batch.prs...)
+		}
+	}
+	for _, leaf := range tree.held[len(preserved):] {
+		for _, pr := range leaf.batch.prs {
+			suffix[pr.Number] = true
+		}
+		e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
+		e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: oldRunID, LineagePath: leaf.batch.lineagePath})
+	}
+	for _, a := range append([]*activeBatch(nil), e.active...) {
+		if a.runID == oldRunID {
+			for _, pr := range a.prs {
+				suffix[pr.Number] = true
+			}
+			e.recordTransition(Transition{Kind: "bisected", StagingBranch: a.stagingBranch, RunID: oldRunID, LineagePath: a.lineagePath})
+			e.cleanupBatch(ctx, a)
+		}
+	}
+	var keptPending [][]int
+	for _, node := range e.pending {
+		if len(node) > 0 && e.lineageRunID[node[0]] == oldRunID {
+			for _, n := range node {
+				suffix[n] = true
+			}
+			delete(e.lineage, node[0])
+			delete(e.lineageRunID, node[0])
+			delete(e.bisectOrigins, node[0])
+			continue
+		}
+		keptPending = append(keptPending, node)
+	}
+	e.pending = keptPending
+
+	suffixNums := make([]int, 0, len(suffix))
+	for n := range suffix {
+		suffixNums = append(suffixNums, n)
+	}
+	sort.Ints(suffixNums)
+
+	anchor := e.rootAnchor[oldRunID] // a candidate change does not move the base
+	newRunID := fmt.Sprintf("%d-%d-s", e.now().UnixNano(), e.stagingSeq)
+	delete(e.trees, oldRunID)
+	delete(e.rootAnchor, oldRunID)
+	e.trees[newRunID] = &bisectionTree{
+		accepted: preservedAccepted,
+		held:     preserved,
+		results:  map[string]string{},
+	}
+	e.rootAnchor[newRunID] = anchor
+
+	if e.lineage == nil {
+		e.lineage = map[int]string{}
+	}
+	if e.lineageRunID == nil {
+		e.lineageRunID = map[int]string{}
+	}
+	if len(suffixNums) > 0 {
+		e.lineage[suffixNums[0]] = "r"
+		e.lineageRunID[suffixNums[0]] = newRunID
+		e.enqueueWithState("re-resolved suffix after a pinned candidate changed", suffixNums)
+	}
+	// With no suffix the successor has no unresolved node, so
+	// treeHasUnresolvedNode reports it ready and finalizeReadyTree runs it out
+	// on the next pass.
+
+	e.recordTransition(Transition{
+		Kind: "root_invalidated", PRs: suffixNums, RunID: oldRunID,
+		Reason:  "a pinned candidate changed; prefix preserved",
+		EventID: terminalEventID(oldRunID, "root_invalidated", suffixNums),
+	})
+	e.logger.Info("root re-rooted with preserved prefix",
+		"oldRunID", oldRunID, "newRunID", newRunID,
+		"preservedLeaves", len(preserved), "suffix", suffixNums)
+	return true
+}
+
+func (e *Engine) tearDownAndRequeueRoot(ctx context.Context, runID, reason, requeueState string) {
+	var nums []int
+	seen := map[int]bool{}
+	add := func(ns ...int) {
+		for _, n := range ns {
+			if !seen[n] {
+				seen[n] = true
+				nums = append(nums, n)
+			}
+		}
+	}
+
+	var toClean []*activeBatch
+	for _, a := range e.active {
+		if a.runID == runID {
+			toClean = append(toClean, a)
+			add(numbersOf(a.prs)...)
+		}
+	}
+	if tree, ok := e.trees[runID]; ok {
+		for _, pr := range tree.accepted {
+			add(pr.Number)
+		}
+		for _, leaf := range tree.held {
+			add(numbersOf(leaf.batch.prs)...)
+			e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: runID, LineagePath: leaf.batch.lineagePath})
+			e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
+		}
+		delete(e.trees, runID)
+	}
+	var keptPending [][]int
+	for _, node := range e.pending {
+		if len(node) > 0 && e.lineageRunID[node[0]] == runID {
+			add(node...)
+			delete(e.lineage, node[0])
+			delete(e.lineageRunID, node[0])
+			delete(e.bisectOrigins, node[0])
+			continue
+		}
+		keptPending = append(keptPending, node)
+	}
+	e.pending = keptPending
+
+	for _, a := range toClean {
+		e.recordTransition(Transition{Kind: "bisected", StagingBranch: a.stagingBranch, RunID: runID, LineagePath: a.lineagePath})
+		e.cleanupBatch(ctx, a)
+	}
+
+	delete(e.rootAnchor, runID)
+
+	sort.Ints(nums)
+	e.logger.Warn("root invalidated; re-queuing its candidates as a fresh root",
+		"runID", runID, "reason", reason, "candidates", nums)
+	e.recordTransition(Transition{
+		Kind: "root_invalidated", PRs: nums, RunID: runID, Reason: reason,
+		EventID: terminalEventID(runID, "root_invalidated", nums),
+	})
+	if len(nums) > 0 {
+		e.enqueueWithState(requeueState, nums)
 	}
 }
 
@@ -1354,14 +2111,24 @@ func (e *Engine) removeActive(a *activeBatch) {
 	}
 }
 
-// cleanupBatch removes the batch from the active list and deletes its staging
-// branch. Called on every path that finishes with a batch (land, skip, bounce).
+// cleanupBatch removes a batch and its Shunt-owned staging branch.
 func (e *Engine) cleanupBatch(ctx context.Context, a *activeBatch) {
 	e.removeActive(a)
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("failed to delete staging branch",
-			"branch", a.stagingBranch, "error", err)
+	e.deleteStagingBranch(ctx, a.stagingBranch)
+}
+
+func (e *Engine) deleteStagingBranch(ctx context.Context, branch string) {
+	if !e.ownsStagingBranch(branch) {
+		e.logger.Warn("not deleting a branch outside the staging namespace", "branch", branch)
+		return
 	}
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, branch); err != nil {
+		e.logger.Warn("failed to delete staging branch", "branch", branch, "error", err)
+	}
+}
+
+func (e *Engine) ownsStagingBranch(branch string) bool {
+	return e.cfg.StagingBranch != "" && strings.HasPrefix(branch, e.cfg.StagingBranch+"-")
 }
 
 func firstPR(prs []forge.PullRequest) int {

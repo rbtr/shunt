@@ -24,6 +24,17 @@ var PostgresMigrationV1 string
 //go:embed migrations/002_queue_leases.sql
 var PostgresMigrationV2 string
 
+// PostgresMigrationV3 adds the checkpoint format version column.
+//
+//go:embed migrations/003_format_version.sql
+var PostgresMigrationV3 string
+
+// PostgresMigrationV4 adds the full-snapshot JSON column so no QueueSnapshot
+// field can be silently dropped by a store that predates it.
+//
+//go:embed migrations/004_snapshot_blob.sql
+var PostgresMigrationV4 string
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -102,7 +113,7 @@ func (p *Store) ApplyMigrations(ctx context.Context) error {
 	if err := p.ready(); err != nil {
 		return err
 	}
-	for _, migration := range []string{PostgresMigrationV1, PostgresMigrationV2} {
+	for _, migration := range []string{PostgresMigrationV1, PostgresMigrationV2, PostgresMigrationV3, PostgresMigrationV4} {
 		m := strings.ReplaceAll(migration, "shunt_queue_state", p.stateTbl)
 		m = strings.ReplaceAll(m, "shunt_queue_leases", p.leaseTbl)
 		if _, err := p.db.ExecContext(ctx, m); err != nil {
@@ -166,22 +177,31 @@ func (p *Store) SaveQueue(ctx context.Context, snapshot checkpoint.QueueSnapshot
 	if err != nil {
 		return fmt.Errorf("state: marshal active batches: %w", err)
 	}
+	// The whole snapshot, verbatim. This is the source of truth on load; the
+	// individual columns above are kept for external queries and the
+	// updated_at index but never lose a field the way hand-picked columns do.
+	full, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("state: marshal snapshot: %w", err)
+	}
 	var linger any
 	if !snapshot.LingerSince.IsZero() {
 		linger = snapshot.LingerSince.UTC()
 	}
 	_, err = p.db.ExecContext(ctx, fmt.Sprintf(`
 INSERT INTO %s (
-    owner, repo, base, pending, active, linger_since, base_generation, staging_sequence, updated_at
-) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, now())
+    owner, repo, base, pending, active, linger_since, base_generation, staging_sequence, format_version, snapshot, updated_at
+) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9, $10::jsonb, now())
 ON CONFLICT (owner, repo, base) DO UPDATE SET
     pending = EXCLUDED.pending,
     active = EXCLUDED.active,
     linger_since = EXCLUDED.linger_since,
     base_generation = EXCLUDED.base_generation,
     staging_sequence = EXCLUDED.staging_sequence,
+    format_version = EXCLUDED.format_version,
+    snapshot = EXCLUDED.snapshot,
     updated_at = now()
-`, p.stateTbl), snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, string(pending), string(active), linger, snapshot.BaseGeneration, snapshot.StagingSequence)
+`, p.stateTbl), snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, string(pending), string(active), linger, snapshot.BaseGeneration, snapshot.StagingSequence, snapshot.FormatVersion, string(full))
 	if err != nil {
 		return fmt.Errorf("state: save queue %s/%s@%s: %w", snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base, err)
 	}
@@ -197,19 +217,32 @@ func (p *Store) LoadQueue(ctx context.Context, key checkpoint.QueueKey) (checkpo
 	if err := key.Validate(); err != nil {
 		return checkpoint.QueueSnapshot{}, false, err
 	}
-	var pendingRaw, activeRaw []byte
+	var pendingRaw, activeRaw, snapshotRaw []byte
 	var linger sql.NullTime
-	var baseGeneration, stagingSequence int
+	var baseGeneration, stagingSequence, formatVersion int
 	err := p.db.QueryRowContext(ctx, fmt.Sprintf(`
-SELECT pending, active, linger_since, base_generation, staging_sequence
+SELECT pending, active, linger_since, base_generation, staging_sequence, format_version, snapshot
 FROM %s
 WHERE owner = $1 AND repo = $2 AND base = $3
-`, p.stateTbl), key.Owner, key.Repo, key.Base).Scan(&pendingRaw, &activeRaw, &linger, &baseGeneration, &stagingSequence)
+`, p.stateTbl), key.Owner, key.Repo, key.Base).Scan(&pendingRaw, &activeRaw, &linger, &baseGeneration, &stagingSequence, &formatVersion, &snapshotRaw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return checkpoint.QueueSnapshot{}, false, nil
 	}
 	if err != nil {
 		return checkpoint.QueueSnapshot{}, false, fmt.Errorf("state: load queue %s/%s@%s: %w", key.Owner, key.Repo, key.Base, err)
+	}
+	// Preferred path: the row carries the whole snapshot. Rows written before
+	// migration 004 have snapshot IS NULL and fall through to the columns.
+	if len(snapshotRaw) > 0 {
+		var snapshot checkpoint.QueueSnapshot
+		if err := json.Unmarshal(snapshotRaw, &snapshot); err != nil {
+			return checkpoint.QueueSnapshot{}, false, fmt.Errorf("state: decode snapshot: %w", err)
+		}
+		snapshot.Key = key
+		if err := snapshot.Validate(); err != nil {
+			return checkpoint.QueueSnapshot{}, false, err
+		}
+		return snapshot.Clone(), true, nil
 	}
 	var pending [][]int
 	if err := json.Unmarshal(pendingRaw, &pending); err != nil {
@@ -220,6 +253,7 @@ WHERE owner = $1 AND repo = $2 AND base = $3
 		return checkpoint.QueueSnapshot{}, false, fmt.Errorf("state: decode active batches: %w", err)
 	}
 	snapshot := checkpoint.QueueSnapshot{
+		FormatVersion:   formatVersion,
 		Key:             key,
 		Pending:         pending,
 		Active:          activeFromJSON(activeJSON),

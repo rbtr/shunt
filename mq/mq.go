@@ -196,6 +196,27 @@ func (eng *Engine) Reconcile(ctx context.Context) error {
 	return eng.e.Reconcile(ctx)
 }
 
+// Transition is a structured record of one merge-queue lifecycle event
+// (a batch staged, its gate passed, it bisected, a PR bounced, or a PR
+// landed) recorded during a Reconcile call. See LastTransitions.
+type Transition = engine.Transition
+
+// LastTransitions returns the transitions recorded during the most
+// recently completed Reconcile call, so a caller can persist what actually
+// happened without parsing log text. Safe to call after Reconcile returns;
+// the slice is replaced, not appended to, on the next call.
+func (eng *Engine) LastTransitions() []Transition {
+	return eng.e.Transitions()
+}
+
+// AckTransitions tells the engine which terminal lifecycle records the caller
+// has durably persisted, so it stops re-carrying them on the reconcile
+// response. Call before Reconcile with the event ids from the last response
+// the caller fully applied.
+func (eng *Engine) AckTransitions(eventIDs []string) {
+	eng.e.AckTransitions(eventIDs)
+}
+
 // ForgeClient is the interface that a forge client must satisfy to be used
 // with mq.New.
 type ForgeClient interface {
@@ -204,6 +225,7 @@ type ForgeClient interface {
 	AutomergeState(ctx context.Context, owner, repo string, index int) (AutomergeState, error)
 	ListReviews(ctx context.Context, owner, repo string, index int) ([]Review, error)
 	ProtectedBranch(ctx context.Context, owner, repo, branch string) (BranchProtection, error)
+	BranchHead(ctx context.Context, owner, repo, branch string) (string, error)
 	LatestCommitStatus(ctx context.Context, owner, repo, sha, statusContext string) (CommitStatus, bool, error)
 	RunStatus(ctx context.Context, owner, repo, sha, branch string) (string, error)
 	RunTargetURL(ctx context.Context, owner, repo, sha, branch string) (string, error)
@@ -216,8 +238,13 @@ type ForgeClient interface {
 
 // Stager is the interface that a staging implementation must satisfy to be used
 // with mq.New.
+//
+// baseAnchor, when non-empty, is an immutable commit SHA the integration must
+// be built on instead of the live tip of base. The merge queue pins it once
+// per bisection root so main moving mid-tree cannot change what a staged
+// result means.
 type Stager interface {
-	BuildStaging(ctx context.Context, base, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error)
+	BuildStaging(ctx context.Context, base, baseAnchor, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error)
 }
 
 // adapter wraps a mq.ForgeClient to satisfy engine.ForgeAPI.
@@ -274,6 +301,10 @@ func (a *adapter) ProtectedBranch(ctx context.Context, owner, repo, branch strin
 		IgnoreStaleApprovals:          p.IgnoreStaleApprovals,
 		DismissStaleApprovals:         p.DismissStaleApprovals,
 	}, nil
+}
+
+func (a *adapter) BranchHead(ctx context.Context, owner, repo, branch string) (string, error) {
+	return a.fc.BranchHead(ctx, owner, repo, branch)
 }
 
 func (a *adapter) GetPR(ctx context.Context, owner, repo string, index int) (forge.PullRequest, error) {
@@ -358,10 +389,10 @@ type stagerAdapter struct {
 	st Stager
 }
 
-func (s *stagerAdapter) BuildStaging(ctx context.Context, base, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
+func (s *stagerAdapter) BuildStaging(ctx context.Context, base, baseAnchor, stagingBranch string, refs []gitops.MergedRef) (string, int, error) {
 	refs2 := make([]MergedRef, len(refs))
 	for i, r := range refs {
 		refs2[i] = MergedRef{PR: r.PR, Ref: r.Ref}
 	}
-	return s.st.BuildStaging(ctx, base, stagingBranch, refs2)
+	return s.st.BuildStaging(ctx, base, baseAnchor, stagingBranch, refs2)
 }

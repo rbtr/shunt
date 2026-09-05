@@ -29,6 +29,7 @@ func TestPostgresSaveQueueUpsertsSnapshot(t *testing.T) {
 		LingerSince:     linger,
 		BaseGeneration:  2,
 		StagingSequence: 7,
+		FormatVersion:   checkpoint.CurrentFormatVersion,
 	}
 
 	if err := store.SaveQueue(context.Background(), snapshot); err != nil {
@@ -65,6 +66,100 @@ func TestPostgresSaveQueueUpsertsSnapshot(t *testing.T) {
 	if got := exec.args[6:8]; !reflect.DeepEqual(got, []any{2, 7}) {
 		t.Fatalf("generation args = %#v", got)
 	}
+	if got := exec.args[8]; got != checkpoint.CurrentFormatVersion {
+		t.Fatalf("format_version arg = %#v, want %d", got, checkpoint.CurrentFormatVersion)
+	}
+	if !strings.Contains(exec.query, "format_version") {
+		t.Fatalf("upsert does not write format_version:\n%s", exec.query)
+	}
+	// $10 is the whole snapshot, verbatim — the field nothing can drop.
+	if !strings.Contains(exec.query, "snapshot") {
+		t.Fatalf("upsert does not write the snapshot column:\n%s", exec.query)
+	}
+	var full checkpoint.QueueSnapshot
+	if err := json.Unmarshal([]byte(exec.args[9].(string)), &full); err != nil {
+		t.Fatalf("snapshot json: %v", err)
+	}
+	if !reflect.DeepEqual(full.Pending, snapshot.Pending) ||
+		!reflect.DeepEqual(full.Active, snapshot.Active) ||
+		full.FormatVersion != snapshot.FormatVersion ||
+		full.StagingSequence != snapshot.StagingSequence ||
+		!full.LingerSince.Equal(snapshot.LingerSince) {
+		t.Fatalf("snapshot blob did not round-trip: %#v", full)
+	}
+}
+
+func TestPostgresRoundTripsEveryField(t *testing.T) {
+	// A snapshot that exercises the fields the column layout never persisted:
+	// the bisection Trees (with anchor + results cache + held leaves), the
+	// PendingNodes lineage, the TransitionOutbox, and the per-batch RunID /
+	// BaseAnchor / ExactKey / LineagePath.
+	snapshot := checkpoint.QueueSnapshot{
+		Key:     checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"},
+		Pending: [][]int{{9}},
+		PendingNodes: []checkpoint.PendingNodeSnapshot{
+			{PRs: []int{9}, RunID: "run-9", Path: "L"},
+		},
+		Active: []checkpoint.ActiveBatchSnapshot{{
+			PRs:           []checkpoint.PullRequestSnapshot{{Number: 4, HeadSHA: "abc"}},
+			StagingBranch: "mq/main/staging-run-7-L",
+			StagingSHA:    "stage7",
+			RunID:         "run-7",
+			LineagePath:   "L",
+			ExactKey:      "v2|anchorsha|merge|4",
+			BaseAnchor:    "anchorsha",
+		}},
+		Trees: []checkpoint.BisectionTreeSnapshot{{
+			RunID:    "run-7",
+			Anchor:   "anchorsha",
+			Open:     1,
+			Cursor:   0,
+			Accepted: []checkpoint.PullRequestSnapshot{{Number: 3, HeadSHA: "cccc"}},
+			Results:  map[string]string{"v2|anchorsha|merge|3": "success"},
+			Held: []checkpoint.HeldLeafSnapshot{{
+				Batch: checkpoint.ActiveBatchSnapshot{
+					PRs:           []checkpoint.PullRequestSnapshot{{Number: 5, HeadSHA: "eeee"}},
+					StagingBranch: "mq/main/staging-run-7-LR",
+					StagingSHA:    "stage7lr",
+					RunID:         "run-7",
+					LineagePath:   "LR",
+				},
+				Outcome: "success",
+			}},
+		}},
+		TransitionOutbox: []checkpoint.OutboxTransitionSnapshot{{
+			Kind: "landed", PRs: []int{3}, RunID: "run-7", EventID: "run-7|landed|3", Attempts: 2,
+		}},
+		BaseGeneration:  1,
+		StagingSequence: 4,
+		FormatVersion:   checkpoint.CurrentFormatVersion,
+	}
+
+	db := &fakeDB{}
+	store := &Store{db: db, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
+	if err := store.SaveQueue(context.Background(), snapshot); err != nil {
+		t.Fatalf("SaveQueue: %v", err)
+	}
+	blob := db.execs[0].args[9].(string)
+
+	load := &fakeDB{rows: []fakeRow{{scan: func(dest ...any) error {
+		*dest[0].(*[]byte) = []byte(`[]`)
+		*dest[1].(*[]byte) = []byte(`[]`)
+		*dest[2].(*sql.NullTime) = sql.NullTime{}
+		*dest[3].(*int) = 0
+		*dest[4].(*int) = 0
+		*dest[5].(*int) = checkpoint.CurrentFormatVersion
+		*dest[6].(*[]byte) = []byte(blob)
+		return nil
+	}}}}
+	loadStore := &Store{db: load, stateTbl: "shunt_queue_state", leaseTbl: "shunt_queue_leases"}
+	got, ok, err := loadStore.LoadQueue(context.Background(), snapshot.Key)
+	if err != nil || !ok {
+		t.Fatalf("LoadQueue: ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(got, snapshot.Clone()) {
+		t.Fatalf("round trip lost data:\n got  %#v\n want %#v", got, snapshot.Clone())
+	}
 }
 
 func TestPostgresLoadQueueDecodesSnapshot(t *testing.T) {
@@ -76,6 +171,7 @@ func TestPostgresLoadQueueDecodesSnapshot(t *testing.T) {
 			*dest[2].(*sql.NullTime) = sql.NullTime{Time: linger, Valid: true}
 			*dest[3].(*int) = 2
 			*dest[4].(*int) = 7
+			*dest[5].(*int) = checkpoint.CurrentFormatVersion
 			return nil
 		},
 	}}}
@@ -104,7 +200,10 @@ func TestPostgresLoadQueueDecodesSnapshot(t *testing.T) {
 	if !snapshot.LingerSince.Equal(linger) || snapshot.BaseGeneration != 2 || snapshot.StagingSequence != 7 {
 		t.Fatalf("snapshot metadata = %#v", snapshot)
 	}
-	if len(db.queries) != 1 || !strings.Contains(db.queries[0].query, "SELECT pending, active") {
+	if snapshot.FormatVersion != checkpoint.CurrentFormatVersion {
+		t.Fatalf("format version = %d, want %d", snapshot.FormatVersion, checkpoint.CurrentFormatVersion)
+	}
+	if len(db.queries) != 1 || !strings.Contains(db.queries[0].query, "format_version") {
 		t.Fatalf("queries = %#v", db.queries)
 	}
 }
@@ -132,8 +231,8 @@ func TestPostgresApplyMigrationsAndDelete(t *testing.T) {
 	if err := store.DeleteQueue(context.Background(), checkpoint.QueueKey{Owner: "octo", Repo: "app", Base: "main"}); err != nil {
 		t.Fatalf("DeleteQueue: %v", err)
 	}
-	if len(db.execs) != 3 {
-		t.Fatalf("execs = %d, want 3", len(db.execs))
+	if len(db.execs) != 5 {
+		t.Fatalf("execs = %d, want 5", len(db.execs))
 	}
 	if !strings.Contains(db.execs[0].query, "CREATE TABLE IF NOT EXISTS shunt_queue_state") {
 		t.Fatalf("first migration query = %q", db.execs[0].query)
@@ -141,10 +240,16 @@ func TestPostgresApplyMigrationsAndDelete(t *testing.T) {
 	if !strings.Contains(db.execs[1].query, "CREATE TABLE IF NOT EXISTS shunt_queue_leases") {
 		t.Fatalf("second migration query = %q", db.execs[1].query)
 	}
-	if !strings.Contains(db.execs[2].query, "DELETE FROM shunt_queue_state") {
-		t.Fatalf("delete query = %q", db.execs[2].query)
+	if !strings.Contains(db.execs[2].query, "ADD COLUMN IF NOT EXISTS format_version") {
+		t.Fatalf("third migration query = %q", db.execs[2].query)
 	}
-	if got := db.execs[2].args; !reflect.DeepEqual(got, []any{"octo", "app", "main"}) {
+	if !strings.Contains(db.execs[3].query, "ADD COLUMN IF NOT EXISTS snapshot") {
+		t.Fatalf("fourth migration query = %q", db.execs[3].query)
+	}
+	if !strings.Contains(db.execs[4].query, "DELETE FROM shunt_queue_state") {
+		t.Fatalf("delete query = %q", db.execs[4].query)
+	}
+	if got := db.execs[4].args; !reflect.DeepEqual(got, []any{"octo", "app", "main"}) {
 		t.Fatalf("delete args = %#v", got)
 	}
 }

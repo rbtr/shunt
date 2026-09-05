@@ -52,7 +52,7 @@ type gitAuth struct {
 // it, and returns the resulting SHA. The caller must pass a fresh branch name for
 // each attempt. On a merge conflict it returns the offending PR number
 // (conflictPR > 0) with an error.
-func (s *Stager) BuildStaging(ctx context.Context, base, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error) {
+func (s *Stager) BuildStaging(ctx context.Context, base, baseAnchor, stagingBranch string, refs []MergedRef) (sha string, conflictPR int, err error) {
 	parent, err := os.MkdirTemp("", "shunt-stage-")
 	if err != nil {
 		return "", 0, err
@@ -93,8 +93,12 @@ func (s *Stager) BuildStaging(ctx context.Context, base, stagingBranch string, r
 	if _, err := run("config", "user.email", s.authorEmail); err != nil {
 		return "", 0, err
 	}
-	if out, err := run("checkout", "-B", stagingBranch, "origin/"+base); err != nil {
-		return "", 0, fmt.Errorf("checkout base %q: %v: %s", base, err, out)
+	startPoint := "origin/" + base
+	if baseAnchor != "" {
+		startPoint = baseAnchor // pin to the root's immutable base commit
+	}
+	if out, err := run("checkout", "-B", stagingBranch, startPoint); err != nil {
+		return "", 0, fmt.Errorf("checkout base %q: %v: %s", startPoint, err, out)
 	}
 	for _, r := range refs {
 		if out, err := run("fetch", "--quiet", "origin", r.Ref); err != nil {

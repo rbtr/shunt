@@ -78,22 +78,21 @@ State, per `(repo, base)`:
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
-The engine has a checkpoint boundary around that state: when configured with its
-consumer-side `CheckpointStore`, it loads one queue snapshot before the first
-reconcile tick, saves after each tick that leaves queue work in progress, and
-deletes the snapshot once the queue is idle. The production command can use
-bbolt with `SHUNT_STATE_PATH` or Postgres with `SHUNT_POSTGRES_DSN`; otherwise
-releases keep the historical process-local state.
+The engine saves queue state through `CheckpointStore`. It loads one snapshot
+before the first reconcile. It saves work after each reconcile. It deletes the
+snapshot when the queue is idle.
 
-When Postgres is configured, each `(owner, repo, base)` must first acquire its
-durable queue lease before loading a checkpoint or calling the forge. The lease
-is renewed once per `Reconcile()` call, and that call receives a deadline at
-half the configured lease TTL so no holder keeps mutating after its lease can
-expire. A replica that cannot acquire it does nothing for that queue; one that
-takes it over drops process-local queue and comment caches, then reloads the
-durable checkpoint. Restored active batches are re-staged, as on process
-restart. bbolt and in-memory state are single-process options and do not
-coordinate replicas.
+bbolt is the recommended local durable store. Set `SHUNT_STATE_PATH` to use
+bbolt. Set `SHUNT_POSTGRES_DSN` to use Postgres. Postgres is a supported store
+for replicas that need a shared queue lease. Without either setting, queue
+state exists only in the process.
+
+A Postgres replica acquires its queue lease before it loads state or calls the
+forge. Each `Reconcile()` call renews the lease. The call ends before half of
+the lease period expires. A replica that does not hold the lease does not act.
+A replica that acquires the lease clears its local queue and comment state. It
+then loads the durable checkpoint. bbolt and in-memory state support one
+process only.
 
 Each `Reconcile()` tick advances one step. Ticks are driven by relevant
 Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the
@@ -200,29 +199,25 @@ else:               mid = len/2
                     pending.push_front(nums[:mid], nums[mid:])   # test first half next
 ```
 
-Because candidates are just lists of PR numbers and staging is always rebuilt
-from the *current* base tip, a successful sub-batch that advances the base is
-handled safely: any later speculative staging run from the old base generation is
-abandoned and re-queued, then re-staged before it can land.
+Each bisection root uses one fixed base commit. Shunt builds each root child
+on this base commit. The exact gate key includes the base commit, merge style,
+and ordered PR heads. Shunt discards a speculative result when its exact key no
+longer matches the ordered frontier.
 
-The same preflight protects active batches from PR updates. While a gate is
-running, shunt rechecks every open PR head before accepting the result. During
-landing, it rechecks each PR immediately before release. A changed head is
-re-queued for fresh staging. A pull-request webhook wakes this path promptly;
-polling remains the backstop for missed webhook deliveries.
+Shunt checks each active PR head before it accepts a gate result. Shunt checks
+again before it releases a PR. A changed head starts fresh staging. A pull
+request webhook starts this check early. Polling starts the check if a webhook
+is missed.
 
-The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
-consumer-side store interface, and the concrete bbolt implementation lives in
-the more specific `checkpoint/bolt` package. Restored active batches are
-conservatively re-queued for fresh staging instead of resuming an old staging
-branch/run, so shunt does not release additional PRs from a result that may now
-be stale. A PR released before the restart may still finish through the forge;
-it was released only after a passing batch, and the remaining PRs are re-staged
-on the resulting base. The production command wires the default bbolt
-implementation when `SHUNT_STATE_PATH` is set. That store persists one snapshot
-per `(owner, repo, base)` and keeps the binary static/CGO-free;
-operators should place the database on persistent storage if they want queue
-state to survive pod replacement or host reboots.
+The `checkpoint` package defines the snapshot types. The engine owns the store
+interface. The `checkpoint/bolt` package provides the bbolt store. On restart,
+Shunt resumes an active staging attempt only when its stored evidence is valid.
+Otherwise, Shunt removes the staging branch and derives fresh queue work. A PR
+that Shunt released before restart can still merge through the forge.
+
+The bbolt store saves one snapshot for each `(owner, repo, base)` queue. The
+store keeps the binary static and free of CGO. Use persistent storage when queue
+state must survive host or pod replacement.
 
 ### Worked example
 
