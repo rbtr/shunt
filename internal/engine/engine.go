@@ -142,24 +142,15 @@ type Engine struct {
 	baseGen        int
 	stagingSeq     int
 
-	// Bisection lineage. A staging branch name carries where in the tree it
-	// sits, so the tree can be read off the names without a side channel:
+	// A staging branch records its position in one bisection tree.
 	//
 	//   <prefix>-<runID>-r      root batch
-	//   <prefix>-<runID>-r0     first half of the root
-	//   <prefix>-<runID>-r01    second half of that first half
+	//   <prefix>-<runID>-r0     first child
+	//   <prefix>-<runID>-r01    second child of the first child
 	//
-	// A branch's parent is its name with the last character removed, so the
-	// whole ancestry is in the name and siblings sort adjacent. The previous
-	// scheme was <unixnano>-<seq>: the timestamp was taken per staging
-	// operation so it was unique to each attempt, and seq counted over the
-	// engine's lifetime. Neither encoded lineage, and under BisectFanout > 1
-	// siblings stage at effectively the same instant, so nothing about the
-	// name distinguished them.
-	//
-	// runID identifies one root batch and everything bisected out of it.
-	// lineage maps a pending candidate to its path, keyed by the candidate's
-	// first PR number — the same idiom as bisectOrigins and requeueStates.
+	// The path identifies the parent and the child order.
+	// runID identifies one root batch and its child batches.
+	// lineage records the path for each pending candidate.
 	runID        string
 	lineage      map[int]string
 	lineageRunID map[int]string

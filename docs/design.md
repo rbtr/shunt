@@ -78,22 +78,21 @@ State, per `(repo, base)`:
 - `lingerSince` — when the idle engine first saw ready PRs while the optional
   batch-accumulation window was active.
 
-The engine has a checkpoint boundary around that state: when configured with its
-consumer-side `CheckpointStore`, it loads one queue snapshot before the first
-reconcile tick, saves after each tick that leaves queue work in progress, and
-deletes the snapshot once the queue is idle. The production command can use
-bbolt with `SHUNT_STATE_PATH` or Postgres with `SHUNT_POSTGRES_DSN`; otherwise
-releases keep the historical process-local state.
+The engine saves queue state through `CheckpointStore`. It loads one snapshot
+before the first reconcile. It saves work after each reconcile. It deletes the
+snapshot when the queue is idle.
 
-When Postgres is configured, each `(owner, repo, base)` must first acquire its
-durable queue lease before loading a checkpoint or calling the forge. The lease
-is renewed once per `Reconcile()` call, and that call receives a deadline at
-half the configured lease TTL so no holder keeps mutating after its lease can
-expire. A replica that cannot acquire it does nothing for that queue; one that
-takes it over drops process-local queue and comment caches, then reloads the
-durable checkpoint. Restored active batches are re-staged, as on process
-restart. bbolt and in-memory state are single-process options and do not
-coordinate replicas.
+The production command uses bbolt when `SHUNT_STATE_PATH` is set. This is the
+default durable store. Shunt can use Postgres when `SHUNT_POSTGRES_DSN` is set.
+Postgres is an optional store for replicas that need a shared queue lease.
+Without either setting, queue state exists only in the process.
+
+A Postgres replica acquires its queue lease before it loads state or calls the
+forge. Each `Reconcile()` call renews the lease. The call ends before half of
+the lease period expires. A replica that does not hold the lease does not act.
+A replica that acquires the lease clears its local queue and comment state. It
+then loads the durable checkpoint. bbolt and in-memory state support one
+process only.
 
 Each `Reconcile()` tick advances one step. Ticks are driven by relevant
 Forgejo/Gitea webhooks when available, with `SHUNT_POLL_INTERVAL` as the

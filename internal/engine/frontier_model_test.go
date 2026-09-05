@@ -50,8 +50,7 @@ type frontierResult struct {
 	lookups  []string
 }
 
-// resolveFrontier resolves one queue of the given size using exact-key caching
-// and left-first depth-first recursion. It is a direct port of resolve_queue.
+// resolveFrontier resolves one queue with exact keys and left-first recursion.
 func resolveFrontier(size int, outcomes map[string]bool) (frontierResult, error) {
 	var (
 		accepted []int
@@ -115,8 +114,7 @@ func resolveFrontier(size int, outcomes map[string]bool) (frontierResult, error)
 	return frontierResult{accepted, rejected, events, lookups}, nil
 }
 
-// preservedFrontierPrefix returns only whole held decisions strictly before a
-// changed candidate. Port of preserved_prefix.
+// preservedFrontierPrefix returns held decisions before a changed candidate.
 func preservedFrontierPrefix(events []frontierEvent, changed int) []frontierEvent {
 	var prefix []frontierEvent
 	for _, ev := range events {
