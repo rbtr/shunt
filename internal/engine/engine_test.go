@@ -1796,6 +1796,15 @@ func TestMissingGateRetriesWithBackoffThenBounces(t *testing.T) {
 		if got := e.active[0].missingGateRetries; got != retry {
 			t.Fatalf("missing-gate retries = %d, want %d", got, retry)
 		}
+		found := false
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "node_superseded" && tr.StagingBranch == m.stagingBranches[retry-1] {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("retry %d did not report the replaced staging attempt", retry)
+		}
 	}
 	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging") {
 		t.Fatalf("calls = %s, want stale staging branch deleted", got)
@@ -2190,6 +2199,16 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	}
 	if got := fmt.Sprint(e.pending); got != "[[1]]" {
 		t.Fatalf("pending = %s, want timed-out PR requeued", got)
+	}
+	var superseded bool
+	for _, transition := range e.Transitions() {
+		if transition.Kind == "node_superseded" && transition.StagingBranch == m.stagingBranches[0] {
+			superseded = true
+			break
+		}
+	}
+	if !superseded {
+		t.Fatalf("transitions = %v, want timed-out staging attempt marked superseded", e.Transitions())
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Merge did not complete") {
 		t.Fatalf("outcome comment = %q, want timeout outcome", got)

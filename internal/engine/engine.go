@@ -763,6 +763,7 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				}
 
 				prs := a.prs
+				e.markBatchSuperseded(a, "staging gate produced no result")
 				e.cleanupBatch(ctx, a)
 				refs := make([]gitops.MergedRef, len(prs))
 				for i, pr := range prs {
@@ -943,6 +944,7 @@ func (e *Engine) discardIneligibleActive(ctx context.Context, a *activeBatch, pr
 		return
 	}
 	remaining := removeNum(numbersOf(a.prs), pr)
+	e.markBatchSuperseded(a, "a candidate became ineligible")
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after another PR became ineligible", remaining)
 	e.observeQueueExit(pr, "ineligible")
@@ -996,6 +998,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 		if current.State != "open" {
 			e.skipLand(ctx, staged, current, fmt.Sprintf("state changed to %q", current.State), len(a.prs) > 1, a.debugURL, false)
 			e.requeueActiveRemainder("requeued after an earlier PR left the batch", a.prs[1:])
+			e.markBatchSuperseded(a, "a PR left the batch before landing")
 			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
@@ -1013,6 +1016,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				true,
 			)
 			e.requeueActiveRemainder("requeued after PR head changed", a.prs)
+			e.markBatchSuperseded(a, "a PR head changed before landing")
 			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
@@ -1031,6 +1035,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
+			e.markBatchSuperseded(a, "auto-merge was cancelled before landing")
 			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
@@ -1067,6 +1072,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				}
 				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
+				e.markBatchSuperseded(a, "auto-merge was cancelled during recovery")
 				e.cleanupBatch(ctx, a)
 				return true, merged, nil
 			}
@@ -1125,6 +1131,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				return true, merged, nil
 			}
 			e.requeueActiveRemainder("retrying after forge merge recovery", a.prs)
+			e.markBatchSuperseded(a, "native auto-merge timed out")
 			e.cleanupBatch(ctx, a)
 			if err := e.scheduleAutomerge(ctx, current); err != nil {
 				return false, merged, fmt.Errorf("restore auto-merge for PR #%d: %w", staged.Number, err)
@@ -1179,6 +1186,7 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
+			e.markBatchSuperseded(a, "auto-merge was cancelled before release")
 			e.cleanupBatch(ctx, a)
 			return true, merged, nil
 		}
@@ -1791,6 +1799,7 @@ func (e *Engine) freeSlotForEarlierPending(ctx context.Context) {
 		return
 	}
 	a := e.active[idx]
+	e.markBatchSuperseded(a, "an earlier queue entry took the staging slot")
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued; waiting for an earlier queue entry", numbersOf(a.prs))
 	e.logger.Info("speculative batch requeued for earlier candidate", "prs", numbersOf(a.prs), "earlier", e.pending[0])
@@ -1800,6 +1809,7 @@ func (e *Engine) requeueStaleActive(ctx context.Context, a *activeBatch) {
 	if e.requeuedTreeNode(ctx, a, "base branch advanced", "re-queued: base branch advanced mid-test") {
 		return
 	}
+	e.markBatchSuperseded(a, "base branch advanced")
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after base branch advanced", numbersOf(a.prs))
 	e.logger.Info("stale speculative batch requeued after base advanced", "prs", numbersOf(a.prs))
@@ -1809,9 +1819,24 @@ func (e *Engine) requeueChangedActive(ctx context.Context, a *activeBatch) {
 	if e.requeuedTreeNode(ctx, a, "a pinned candidate changed", "re-queued: a pinned candidate changed mid-test") {
 		return
 	}
+	e.markBatchSuperseded(a, "a PR head changed")
 	e.cleanupBatch(ctx, a)
 	e.enqueueWithState("requeued after PR head changed", numbersOf(a.prs))
 	e.logger.Info("active batch requeued after PR head changed", "prs", numbersOf(a.prs))
+}
+
+// markBatchSuperseded records that a staging attempt ended without a source
+// decision because its candidates will be tested again. The transition lets
+// callers retire the old staging row instead of leaving it as running.
+// `superseded` means "this attempt was replaced", not "a PR failed".
+func (e *Engine) markBatchSuperseded(a *activeBatch, reason string) {
+	if a.stagingBranch == "" {
+		return
+	}
+	e.recordTransition(Transition{
+		Kind: "node_superseded", PRs: numbersOf(a.prs), StagingBranch: a.stagingBranch,
+		RunID: a.runID, LineagePath: a.lineagePath, Reason: reason,
+	})
 }
 
 // supersedeSpeculative discards a fanout-staged bisection node whose gate ran
