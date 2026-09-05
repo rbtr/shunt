@@ -82,10 +82,10 @@ The engine saves queue state through `CheckpointStore`. It loads one snapshot
 before the first reconcile. It saves work after each reconcile. It deletes the
 snapshot when the queue is idle.
 
-The production command uses bbolt when `SHUNT_STATE_PATH` is set. This is the
-default durable store. Shunt can use Postgres when `SHUNT_POSTGRES_DSN` is set.
-Postgres is an optional store for replicas that need a shared queue lease.
-Without either setting, queue state exists only in the process.
+bbolt is the recommended local durable store. Set `SHUNT_STATE_PATH` to use
+bbolt. Set `SHUNT_POSTGRES_DSN` to use Postgres. Postgres is a supported store
+for replicas that need a shared queue lease. Without either setting, queue
+state exists only in the process.
 
 A Postgres replica acquires its queue lease before it loads state or calls the
 forge. Each `Reconcile()` call renews the lease. The call ends before half of
@@ -199,29 +199,25 @@ else:               mid = len/2
                     pending.push_front(nums[:mid], nums[mid:])   # test first half next
 ```
 
-Because candidates are just lists of PR numbers and staging is always rebuilt
-from the *current* base tip, a successful sub-batch that advances the base is
-handled safely: any later speculative staging run from the old base generation is
-abandoned and re-queued, then re-staged before it can land.
+Each bisection root uses one fixed base commit. Shunt builds each root child
+on this base commit. The exact gate key includes the base commit, merge style,
+and ordered PR heads. Shunt discards a speculative result when its exact key no
+longer matches the ordered frontier.
 
-The same preflight protects active batches from PR updates. While a gate is
-running, shunt rechecks every open PR head before accepting the result. During
-landing, it rechecks each PR immediately before release. A changed head is
-re-queued for fresh staging. A pull-request webhook wakes this path promptly;
-polling remains the backstop for missed webhook deliveries.
+Shunt checks each active PR head before it accepts a gate result. Shunt checks
+again before it releases a PR. A changed head starts fresh staging. A pull
+request webhook starts this check early. Polling starts the check if a webhook
+is missed.
 
-The neutral `checkpoint` package defines the snapshot DTOs. The engine owns the
-consumer-side store interface, and the concrete bbolt implementation lives in
-the more specific `checkpoint/bolt` package. Restored active batches are
-conservatively re-queued for fresh staging instead of resuming an old staging
-branch/run, so shunt does not release additional PRs from a result that may now
-be stale. A PR released before the restart may still finish through the forge;
-it was released only after a passing batch, and the remaining PRs are re-staged
-on the resulting base. The production command wires the default bbolt
-implementation when `SHUNT_STATE_PATH` is set. That store persists one snapshot
-per `(owner, repo, base)` and keeps the binary static/CGO-free;
-operators should place the database on persistent storage if they want queue
-state to survive pod replacement or host reboots.
+The `checkpoint` package defines the snapshot types. The engine owns the store
+interface. The `checkpoint/bolt` package provides the bbolt store. On restart,
+Shunt resumes an active staging attempt only when its stored evidence is valid.
+Otherwise, Shunt removes the staging branch and derives fresh queue work. A PR
+that Shunt released before restart can still merge through the forge.
+
+The bbolt store saves one snapshot for each `(owner, repo, base)` queue. The
+store keeps the binary static and free of CGO. Use persistent storage when queue
+state must survive host or pod replacement.
 
 ### Worked example
 

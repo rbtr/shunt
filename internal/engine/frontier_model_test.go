@@ -258,10 +258,8 @@ func TestFrontierModelExhaustive(t *testing.T) {
 	}
 }
 
-// TestFrontierModelWorkedExample is the A…G scenario from
-// bisection-tree-finalization.md: ABC fails, A passes, B and C each fail on the
-// A baseline, DEFG passes on the A baseline. Exactly six distinct CI runs, and
-// the ABC key is looked up twice (once tested, once as the A+BC cache hit).
+// TestFrontierModelWorkedExample checks a seven-candidate frontier.
+// It checks gate results, exact-key reuse, and the number of gate runs.
 func TestFrontierModelWorkedExample(t *testing.T) {
 	outcomes := map[string]bool{
 		"0,1,2,3,4,5,6": false,

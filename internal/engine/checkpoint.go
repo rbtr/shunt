@@ -227,14 +227,17 @@ func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSna
 		return fmt.Errorf("queue checkpoint format %d is newer than this engine (%d)", snapshot.FormatVersion, checkpoint.CurrentFormatVersion)
 	}
 	if snapshot.FormatVersion < checkpoint.CurrentFormatVersion && (len(snapshot.Pending) > 0 || len(snapshot.Active) > 0) {
-		// A legacy checkpoint lacks the base anchor, accepted accumulator and
-		// lineage the ordered frontier needs to resume a partly-tested queue
-		// exactly. Do not error forever (that wedges the queue): discard the
-		// in-flight state and re-derive from the forge. Staged branches from
-		// the old attempt orphan and are cleaned up by the stale-branch sweep.
-		e.logger.Warn("discarding a legacy queue checkpoint with in-flight work; re-deriving the queue from the forge",
-			"format_version", snapshot.FormatVersion, "current", checkpoint.CurrentFormatVersion,
-			"pending", len(snapshot.Pending), "active", len(snapshot.Active))
+		e.logger.Warn("discarding a legacy queue checkpoint with in-flight work", "format_version", snapshot.FormatVersion)
+		e.discardSnapshotBranches(ctx, snapshot)
+		snapshot = checkpoint.QueueSnapshot{FormatVersion: checkpoint.CurrentFormatVersion, Key: snapshot.Key}
+	}
+	stale, err := e.snapshotActiveStale(ctx, snapshot.Active)
+	if err != nil {
+		return err
+	}
+	if stale {
+		e.logger.Warn("discarding checkpoint with stale active evidence")
+		e.discardSnapshotBranches(ctx, snapshot)
 		snapshot = checkpoint.QueueSnapshot{FormatVersion: checkpoint.CurrentFormatVersion, Key: snapshot.Key}
 	}
 	e.pending = clonePending(snapshot.Pending)
@@ -259,10 +262,7 @@ func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSna
 			return err
 		}
 		if len(prs) == 0 {
-			// Every PR landed during the downtime — remove the empty branch.
-			if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, snap.StagingBranch); err != nil {
-				e.logger.Warn("resume: failed to delete drained staging branch", "branch", snap.StagingBranch, "error", err)
-			}
+			e.deleteStagingBranch(ctx, snap.StagingBranch)
 			continue
 		}
 		active = append(active, e.restoreBatch(snap, prs))
@@ -317,6 +317,45 @@ func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSna
 
 // phaseForOutcome derives the batch phase from a persisted gate outcome so a
 // resumed batch flows through checkActive correctly.
+func (e *Engine) snapshotActiveStale(ctx context.Context, active []checkpoint.ActiveBatchSnapshot) (bool, error) {
+	for _, batch := range active {
+		if !e.ownsStagingBranch(batch.StagingBranch) {
+			return true, nil
+		}
+		for _, saved := range batch.PRs {
+			pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, saved.Number)
+			if err != nil {
+				return false, fmt.Errorf("check checkpoint PR #%d: %w", saved.Number, err)
+			}
+			if pr.Merged {
+				continue
+			}
+			if pr.State != "open" || pr.Head.Sha != saved.HeadSHA {
+				return true, nil
+			}
+			state, err := e.fc.AutomergeState(ctx, e.cfg.Owner, e.cfg.Repo, saved.Number)
+			if err != nil {
+				return false, fmt.Errorf("check checkpoint PR #%d auto-merge: %w", saved.Number, err)
+			}
+			if !state.Scheduled {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (e *Engine) discardSnapshotBranches(ctx context.Context, snapshot checkpoint.QueueSnapshot) {
+	for _, batch := range snapshot.Active {
+		e.deleteStagingBranch(ctx, batch.StagingBranch)
+	}
+	for _, tree := range snapshot.Trees {
+		for _, leaf := range tree.Held {
+			e.deleteStagingBranch(ctx, leaf.Batch.StagingBranch)
+		}
+	}
+}
+
 func orNow(t, fallback time.Time) time.Time {
 	if t.IsZero() {
 		return fallback

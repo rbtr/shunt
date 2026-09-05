@@ -120,10 +120,8 @@ var (
 	nativeMergePoll  = time.Second
 )
 
-// Stager builds an integration ("staging") branch from a base + PR head refs.
-// baseAnchor, when non-empty, is an immutable commit SHA to build on instead
-// of the live tip of base (see bisection-tree-finalization.md,
-// "Immutable-base requirement").
+// Stager builds a staging branch from a base and PR head references.
+// baseAnchor selects a fixed base commit when it is not empty.
 type Stager interface {
 	BuildStaging(ctx context.Context, base, baseAnchor, stagingBranch string, refs []gitops.MergedRef) (sha string, conflictPR int, err error)
 }
@@ -740,11 +738,8 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 					continue
 				}
 				if a.missingGateRetries >= missingGateMaxRetries {
-					// The design (bisection-tree-finalization.md, outcome
-					// table): a node whose gate never runs, after the retry
-					// budget, aborts the *root* with no source-PR mutation —
-					// an infra failure must not be published as a PR rejection.
-					// Tear the root down and re-queue every candidate fresh.
+					// A missing gate result cannot decide a source PR.
+					// Requeue the root when the retry limit is reached.
 					if e.requeuedTreeNode(ctx, a, "staging gate produced no result after retries",
 						"re-queued: the staging gate produced no result") {
 						e.logger.Error("bisection root aborted: a node's gate never ran", "prs", numbersOf(a.prs), "runID", a.runID)
@@ -843,13 +838,8 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 			e.requeueStaleActive(ctx, a)
 			return true, nil
 		}
-		// Fanout can stage a bisection node speculatively, before its left
-		// siblings have resolved. Its gate ran against an assumed accumulator;
-		// the result is authoritative only if its exact key still equals the
-		// key the resolved frontier now asks for. If a left sibling has since
-		// been accepted, the key differs and this node is superseded and
-		// re-staged on the real baseline (bisection-tree-finalization.md,
-		// "Speculative fanout").
+		// A speculative result is valid only when its exact key still matches
+		// the resolved frontier. Re-stage the node when the keys differ.
 		if a.exactKey != "" {
 			if tree, ok := e.trees[a.runID]; ok {
 				staged := append(append([]forge.PullRequest(nil), tree.accepted...), a.prs...)
@@ -1492,11 +1482,7 @@ func (e *Engine) reRootFinalizationSuffix(ctx context.Context, runID string, tre
 		for _, pr := range leaf.batch.prs {
 			suffix[pr.Number] = true
 		}
-		if leaf.batch.stagingBranch != "" {
-			if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, leaf.batch.stagingBranch); err != nil {
-				e.logger.Warn("re-root: failed to delete held staging branch", "branch", leaf.batch.stagingBranch, "error", err)
-			}
-		}
+		e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
 		e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: runID, LineagePath: leaf.batch.lineagePath})
 	}
 	nums := make([]int, 0, len(suffix))
@@ -1616,10 +1602,9 @@ func (e *Engine) activeLimit() int {
 // v1 was PR head SHAs only; v2 adds the base anchor and merge style.
 const frontierKeyVersion = 2
 
-// exactKey is the identity of one gate question: the base anchor, the merge
-// style, and the ordered pinned PR heads of (accepted baseline + candidate).
-// Different keys have no logical relationship even if their PR sets overlap
-// (bisection-tree-finalization.md, "Formal model").
+// exactKey identifies one gate result.
+// It includes the base anchor, merge style, and ordered PR heads.
+// Results with different keys are independent.
 func (e *Engine) exactKey(anchor string, prs []forge.PullRequest) string {
 	parts := make([]string, 0, len(prs)+3)
 	parts = append(parts, "v"+strconv.Itoa(frontierKeyVersion), anchor, e.cfg.MergeStyle)
@@ -1835,15 +1820,11 @@ func (e *Engine) requeueStaleActives(ctx context.Context) {
 	}
 }
 
-// invalidateAdvancedRoots re-reads the base branch head once per reconcile.
-// If it has moved since a still-testing root pinned its anchor, that root's
-// evidence was gathered against a base that no longer exists as tested, so the
-// whole root is torn down and its candidates are re-queued as one fresh root
-// on the new base. The design forbids inheriting any decision prefix across a
-// base-anchor change, and no source-PR status, auto-merge release, or
-// cancellation is published (bisection-tree-finalization.md, "Base and
-// candidate invalidation"). Trees already in finalization (no unresolved node)
-// are skipped: their base moves are the engine's own merges.
+// invalidateAdvancedRoots checks each testing root against its base anchor.
+// Shunt discards a root when the base changed. It requeues the root candidates.
+// Shunt does not publish a source decision during this operation.
+// A root in finalization has no unresolved nodes. Its base can move after a
+// Shunt merge.
 func (e *Engine) invalidateAdvancedRoots(ctx context.Context) (bool, error) {
 	testing := map[string]bool{}
 	for runID := range e.trees {
@@ -1989,11 +1970,7 @@ func (e *Engine) reRootPreservingPrefix(ctx context.Context, oldRunID string, ch
 		for _, pr := range leaf.batch.prs {
 			suffix[pr.Number] = true
 		}
-		if leaf.batch.stagingBranch != "" {
-			if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, leaf.batch.stagingBranch); err != nil {
-				e.logger.Warn("re-root: failed to delete discarded held branch", "branch", leaf.batch.stagingBranch, "error", err)
-			}
-		}
+		e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
 		e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: oldRunID, LineagePath: leaf.batch.lineagePath})
 	}
 	for _, a := range append([]*activeBatch(nil), e.active...) {
@@ -2089,11 +2066,7 @@ func (e *Engine) tearDownAndRequeueRoot(ctx context.Context, runID, reason, requ
 		for _, leaf := range tree.held {
 			add(numbersOf(leaf.batch.prs)...)
 			e.recordTransition(Transition{Kind: "bisected", StagingBranch: leaf.batch.stagingBranch, RunID: runID, LineagePath: leaf.batch.lineagePath})
-			if leaf.batch.stagingBranch != "" {
-				if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, leaf.batch.stagingBranch); err != nil {
-					e.logger.Warn("re-root: failed to delete held staging branch", "branch", leaf.batch.stagingBranch, "error", err)
-				}
-			}
+			e.deleteStagingBranch(ctx, leaf.batch.stagingBranch)
 		}
 		delete(e.trees, runID)
 	}
@@ -2138,17 +2111,24 @@ func (e *Engine) removeActive(a *activeBatch) {
 	}
 }
 
-// cleanupBatch removes the batch from the active list and deletes its staging
-// branch. Called on every path that finishes with a batch (land, skip, bounce).
+// cleanupBatch removes a batch and its Shunt-owned staging branch.
 func (e *Engine) cleanupBatch(ctx context.Context, a *activeBatch) {
 	e.removeActive(a)
-	if a.stagingBranch == "" {
+	e.deleteStagingBranch(ctx, a.stagingBranch)
+}
+
+func (e *Engine) deleteStagingBranch(ctx context.Context, branch string) {
+	if !e.ownsStagingBranch(branch) {
+		e.logger.Warn("not deleting a branch outside the staging namespace", "branch", branch)
 		return
 	}
-	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, a.stagingBranch); err != nil {
-		e.logger.Warn("failed to delete staging branch",
-			"branch", a.stagingBranch, "error", err)
+	if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, branch); err != nil {
+		e.logger.Warn("failed to delete staging branch", "branch", branch, "error", err)
 	}
+}
+
+func (e *Engine) ownsStagingBranch(branch string) bool {
+	return e.cfg.StagingBranch != "" && strings.HasPrefix(branch, e.cfg.StagingBranch+"-")
 }
 
 func firstPR(prs []forge.PullRequest) int {

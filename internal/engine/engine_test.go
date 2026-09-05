@@ -789,13 +789,8 @@ func TestBisectionRestagesRightAfterRejectedLeft(t *testing.T) {
 	}
 }
 
-// TestEngineFrontierWorkedExample drives the real engine through the A..G
-// scenario from bisection-tree-finalization.md and asserts its trace matches
-// the reference model: ABC fails, A passes, the A+BC key is a cache hit (no
-// re-stage), B and C each fail on the A baseline, DEFG passes on the A
-// baseline. Six distinct staging calls; accept A,D,E,F,G; reject B,C; every
-// source decision deferred until the whole root is terminal, then applied in
-// queue order.
+// TestEngineFrontierWorkedExample checks a seven-PR ordered frontier.
+// The test checks cached results, ordered decisions, and held leaves.
 func TestEngineFrontierWorkedExample(t *testing.T) {
 	m := newMock(-1, 1, 2, 3, 4, 5, 6, 7)
 	pass := map[string]bool{
@@ -822,10 +817,8 @@ func TestEngineFrontierWorkedExample(t *testing.T) {
 	}
 }
 
-// TestFrontierExactKeyScopedToAnchorAndMergeStyle proves an exact key is not a
-// bare list of PR heads: the base anchor and merge style are part of it, so a
-// cached outcome can never be reused across a re-rooted queue or a config
-// change (bisection-tree-finalization.md, "Formal model").
+// TestFrontierExactKeyScopedToAnchorAndMergeStyle checks exact-key inputs.
+// A cached result cannot cross a base anchor or merge-style change.
 func TestFrontierExactKeyScopedToAnchorAndMergeStyle(t *testing.T) {
 	prs := []forge.PullRequest{{Number: 1}, {Number: 2}}
 	prs[0].Head.Sha = "h1"
@@ -882,15 +875,8 @@ func TestBisectionAnchorPinnedAndDurable(t *testing.T) {
 	}
 }
 
-// TestRootInvalidatedWhenBaseAdvancesMidTest: an external advance of the base
-// branch during testing tears the whole root down with no source-PR decision
-// and re-queues its candidates as one fresh root on the new base
-// (bisection-tree-finalization.md, "Base and candidate invalidation").
-// TestFinalizationAbortsWhenBaseAdvancesBeforeAnyLanding: a ready root that has
-// only bounced so far (bounces do not move main) sees the base advance under
-// it; the already-bounced PRs stay bounced and the unperformed suffix is
-// re-queued on current main (bisection-tree-finalization.md, "Base and
-// candidate invalidation").
+// TestFinalizationAbortsWhenBaseAdvancesBeforeAnyLanding checks base changes.
+// Shunt keeps completed bounces. Shunt requeues the unresolved suffix.
 func TestFinalizationAbortsWhenBaseAdvancesBeforeAnyLanding(t *testing.T) {
 	m := newMock(-1, 1, 2, 3)
 	m.branchHead = "base-v1"
@@ -1104,10 +1090,8 @@ func TestRootInvalidatedWhenAcceptedCandidateHeadChanges(t *testing.T) {
 	}
 }
 
-// TestSuccessorRootPreservesEvidencedPrefix: when a held candidate that is not
-// the first changes, the successor root carries the held decisions strictly to
-// its left and re-resolves only the suffix (bisection-tree-finalization.md,
-// "Successor roots and preserved prefixes").
+// TestSuccessorRootPreservesEvidencedPrefix checks a changed held candidate.
+// The successor root keeps prior evidence and rechecks the later suffix.
 func TestSuccessorRootPreservesEvidencedPrefix(t *testing.T) {
 	m := newMock(-1, 1, 2, 3, 4, 5)
 	// [1 2] passes as a group; everything with 3, 4, or 5 fails on that
@@ -1541,6 +1525,55 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	drive(restarted, outboxMaxAttempts+2)
 	if !store.deleted {
 		t.Error("empty queue should delete checkpoint once the transition outbox drains")
+	}
+}
+
+func TestCheckpointDiscardsChangedActiveEvidence(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	store := &memoryCheckpointStore{}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	e := New(cfg, m, m)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	staleBranch := m.stagingBranches[0]
+	m.prs[1].Head.Sha = "head-1-new"
+
+	restarted := New(cfg, m, m)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore changed batch: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [1 2]]" {
+		t.Fatalf("staged = %s, want fresh staging after the head changed", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+staleBranch) {
+		t.Fatalf("calls = %s, want stale staging branch deleted", got)
+	}
+	if got := fmt.Sprint(m.statuses); got != "[]" {
+		t.Fatalf("statuses = %s, want no release from stale evidence", got)
+	}
+}
+
+func TestCheckpointDoesNotDeleteBranchOutsideStagingNamespace(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		FormatVersion: checkpoint.CurrentFormatVersion,
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Active: []checkpoint.ActiveBatchSnapshot{{
+			PRs:           []checkpoint.PullRequestSnapshot{{Number: 1, HeadSHA: "head-1"}},
+			StagingBranch: "main",
+			StagingSHA:    "stage-1",
+		}},
+	}}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+	if err := New(cfg, m, m).Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore queue: %v", err)
+	}
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "delete:main") {
+		t.Fatalf("calls = %s, must not delete a branch outside the staging namespace", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want fresh staging", got)
 	}
 }
 
