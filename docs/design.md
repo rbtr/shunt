@@ -290,9 +290,9 @@ bad PR, bounce it, and land the good PRs.
   released to the forge may finish while shunt restarts.
   With `SHUNT_STATE_PATH`, shunt persists the pending frontier, linger state,
   bisection counters, and active batch metadata in bbolt. On restore, shunt
-  removes each in-flight staging branch and re-stages its PRs, so no additional
-  PR is released from a pre-restart result that may have been invalidated by a
-  base or source-head change.
+  removes each known staging branch and re-stages its PRs, so no additional PR
+  is released from a pre-restart result that may have been invalidated by a base
+  or source-head change.
 
 ## Observability
 

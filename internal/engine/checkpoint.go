@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/rbtr/shunt/internal/checkpoint"
 )
@@ -105,12 +106,16 @@ func (e *Engine) snapshot() checkpoint.QueueSnapshot {
 // applySnapshot restores unresolved candidates. In-flight staging attempts are
 // deliberately not resumed: after a restart, Shunt cannot prove their gate
 // evidence still includes the current base and source heads. It removes each
-// old staging branch and re-queues its PRs for fresh staging instead.
+// Shunt-owned staging branch and re-queues its PRs for fresh staging instead.
 func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSnapshot) error {
 	e.pending = clonePending(snapshot.Pending)
 	for _, active := range snapshot.Active {
-		if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, active.StagingBranch); err != nil {
-			e.logger.Warn("failed to delete restored staging branch", "branch", active.StagingBranch, "error", err)
+		if e.ownsStagingBranch(active.StagingBranch) {
+			if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, active.StagingBranch); err != nil {
+				e.logger.Warn("failed to delete restored staging branch", "branch", active.StagingBranch, "error", err)
+			}
+		} else {
+			e.logger.Warn("not deleting restored branch outside staging namespace", "branch", active.StagingBranch)
 		}
 		nums := make([]int, len(active.PRs))
 		for i, pr := range active.PRs {
@@ -126,6 +131,10 @@ func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSna
 	e.baseGen = snapshot.BaseGeneration
 	e.stagingSeq = snapshot.StagingSequence
 	return nil
+}
+
+func (e *Engine) ownsStagingBranch(branch string) bool {
+	return e.cfg.StagingBranch != "" && strings.HasPrefix(branch, e.cfg.StagingBranch+"-")
 }
 
 func clonePending(in [][]int) [][]int {

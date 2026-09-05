@@ -897,6 +897,29 @@ func TestCheckpointRestoreKeepsActiveCandidateBeforeLaterPendingWork(t *testing.
 	}
 }
 
+func TestCheckpointRestoreDoesNotDeleteBranchOutsideStagingNamespace(t *testing.T) {
+	m := newMock(-1, 1)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		Key: checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Active: []checkpoint.ActiveBatchSnapshot{{
+			PRs:           []checkpoint.PullRequestSnapshot{{Number: 1, HeadSHA: "head-1"}},
+			StagingBranch: "main",
+			StagingSHA:    "stage-old",
+		}},
+	}}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+
+	if err := New(cfg, m, m).Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore queue: %v", err)
+	}
+	if got := fmt.Sprint(m.calls); strings.Contains(got, "delete:main") {
+		t.Fatalf("calls = %s, must not delete a branch outside the staging namespace", got)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want PR requeued for fresh staging", got)
+	}
+}
+
 func TestCheckpointRestartRestagesRemainderAfterReleasedPRMerges(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	store := &memoryCheckpointStore{}
