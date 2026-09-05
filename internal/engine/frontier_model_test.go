@@ -9,17 +9,12 @@ import (
 	"testing"
 )
 
-// This file is the Go port of docs/architecture/bisection-frontier-model.py:
-// an exhaustive, deterministic reference model for the ordered bisection
-// frontier. It is executable design documentation. It explores every reachable
-// Boolean-oracle path for queues of up to seven candidates and checks the
-// invariants stated in docs/architecture/bisection-tree-finalization.md, so the
-// engine's own traces can later be compared against a proven oracle without
-// adding Python to the build.
+// This file contains an exhaustive model of the ordered frontier.
+// It checks all Boolean gate outcomes for queues of up to seven candidates.
+// The tests check that the model preserves the order of queue decisions.
 //
-// Candidates are identified by their queue index (0 = "A", 1 = "B", …). An
-// exact test key is the ordered accepted accumulator followed by the candidate
-// under test, encoded as a comma-joined string of indices.
+// Candidates use their queue index. An exact key contains the accepted prefix
+// and the candidate under test. The key uses comma-separated indexes.
 
 func frontierKeyOf(nums []int) string {
 	parts := make([]string, len(nums))
