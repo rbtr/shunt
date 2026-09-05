@@ -362,6 +362,32 @@ func TestAdmissionAllowsPRWithEnoughApprovals(t *testing.T) {
 	}
 }
 
+func TestAdmissionBlocksUnsatisfiedRequiredStatusBeforeStaging(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     forge.CommitStatus
+		wantStaged bool
+	}{
+		{name: "missing", wantStaged: false},
+		{name: "failure", status: forge.CommitStatus{Context: "ci", Status: "failure"}, wantStaged: false},
+		{name: "success", status: forge.CommitStatus{Context: "ci", Status: "success"}, wantStaged: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMock(-1, 1)
+			m.protection = forge.BranchProtection{EnableStatusCheck: true, StatusCheckContexts: []string{"merge-queue", "ci"}}
+			m.latestStatus[1] = tc.status
+			e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+			if err := e.Reconcile(context.Background()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if got := fmt.Sprint(m.staged); (got == "[[1]]") != tc.wantStaged {
+				t.Fatalf("staged = %s, want staged = %v", got, tc.wantStaged)
+			}
+		})
+	}
+}
+
 // TestAdmissionGateHonestState is the honest-state sibling: the gate blocks
 // only when the branch-protection rule actually requires something. A PR with
 // a dismissed reject, a non-official reject, or no protection rule at all must

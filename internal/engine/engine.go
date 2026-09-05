@@ -313,7 +313,7 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	gate := admissionGate{protection: protection}
+	gate := admissionGate{protection: protection, statusCtx: e.cfg.StatusCtx}
 	var nums []int
 	for _, p := range prs {
 		// Quick check: if the PR is not scheduled, it was likely a bounced
@@ -343,10 +343,10 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 			continue
 		}
 		// For an already-scheduled PR the 409 path skips Forgejo's 422
-		// requirement validation, so re-check the review policy ourselves:
-		// a PR blocked by approvals or a live changes-requested review would
-		// never merge and must not consume a staging/CI run.
-		if blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, p.Number); err != nil {
+		// requirement validation, so re-check branch protection ourselves:
+		// a PR blocked by a required status or review policy would never merge
+		// and must not consume a staging/CI run.
+		if blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, p.Number, p.Head.Sha); err != nil {
 			return nil, err
 		} else if blocked {
 			e.logger.Info("PR blocked from merge queue by review policy", "pr", p.Number, "reason", reason)
@@ -368,23 +368,35 @@ func (e *Engine) readyNumbers(ctx context.Context) ([]int, error) {
 	return nums, nil
 }
 
-// admissionGate replicates the branch-protection review policy that Forgejo's
-// merge gate applies, so shunt can refuse to queue a PR that can never merge.
-// The rule only blocks when it actually requires something; a repo with no
-// protection rule (or one without approval/review requirements) admits freely.
+// admissionGate replicates the branch-protection status and review policy
+// that Forgejo's merge gate applies, so shunt can refuse to queue a PR that
+// can never merge. shunt's own status is excluded because it is only written
+// after the staged batch passes.
 type admissionGate struct {
 	protection forge.BranchProtection
+	statusCtx  string
 }
 
-// blocks reports whether the PR is barred from the queue by the base-branch
-// review policy, and why. It mirrors HasEnoughApprovals,
-// MergeBlockedByRejectedReview, and MergeBlockedByOfficialReviewRequests:
-// approvals must be official, non-dismissed, and (when IgnoreStaleApprovals)
-// non-stale; a live REQUEST_CHANGES blocks when BlockOnRejectedReviews; an
-// outstanding official review request blocks when
-// BlockOnOfficialReviewRequests.
-func (g admissionGate) blocks(ctx context.Context, fc ForgeAPI, owner, repo string, num int) (bool, string, error) {
+// blocks reports whether the PR is barred from the queue by base-branch
+// protection. Required statuses other than shunt's own must be successful.
+// Review semantics mirror HasEnoughApprovals, MergeBlockedByRejectedReview,
+// and MergeBlockedByOfficialReviewRequests.
+func (g admissionGate) blocks(ctx context.Context, fc ForgeAPI, owner, repo string, num int, sha string) (bool, string, error) {
 	p := g.protection
+	if p.EnableStatusCheck {
+		for _, context := range p.StatusCheckContexts {
+			if context == g.statusCtx {
+				continue
+			}
+			status, ok, err := fc.LatestCommitStatus(ctx, owner, repo, sha, context)
+			if err != nil {
+				return false, "", err
+			}
+			if !ok || status.Status != "success" {
+				return true, fmt.Sprintf("required status check %q is not successful", context), nil
+			}
+		}
+	}
 	if p.RequiredApprovals == 0 && !p.BlockOnRejectedReviews && !p.BlockOnOfficialReviewRequests {
 		return false, "", nil
 	}
