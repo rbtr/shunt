@@ -34,11 +34,13 @@ type sqlExecutor interface {
 }
 
 type activeBatchJSON struct {
-	PRs            []pullRequestJSON `json:"prs"`
-	StagingBranch  string            `json:"staging_branch"`
-	StagingSHA     string            `json:"staging_sha"`
-	BaseGeneration int               `json:"base_generation"`
-	Outcome        string            `json:"outcome,omitempty"`
+	PRs                []pullRequestJSON `json:"prs"`
+	StagingBranch      string            `json:"staging_branch"`
+	StagingSHA         string            `json:"staging_sha"`
+	BaseGeneration     int               `json:"base_generation"`
+	Outcome            string            `json:"outcome,omitempty"`
+	PhaseSince         time.Time         `json:"phase_since,omitempty"`
+	MissingGateRetries int               `json:"missing_gate_retries,omitempty"`
 }
 
 type pullRequestJSON struct {
@@ -269,11 +271,13 @@ func activeToJSON(in []checkpoint.ActiveBatchSnapshot) []activeBatchJSON {
 			prs[j] = pullRequestJSON{Number: pr.Number, HeadSHA: pr.HeadSHA}
 		}
 		out[i] = activeBatchJSON{
-			PRs:            prs,
-			StagingBranch:  active.StagingBranch,
-			StagingSHA:     active.StagingSHA,
-			BaseGeneration: active.BaseGeneration,
-			Outcome:        active.Outcome,
+			PRs:                prs,
+			StagingBranch:      active.StagingBranch,
+			StagingSHA:         active.StagingSHA,
+			BaseGeneration:     active.BaseGeneration,
+			Outcome:            active.Outcome,
+			PhaseSince:         active.PhaseSince,
+			MissingGateRetries: active.MissingGateRetries,
 		}
 	}
 	return out
@@ -290,11 +294,13 @@ func activeFromJSON(in []activeBatchJSON) []checkpoint.ActiveBatchSnapshot {
 			prs[j] = checkpoint.PullRequestSnapshot{Number: pr.Number, HeadSHA: pr.HeadSHA}
 		}
 		out[i] = checkpoint.ActiveBatchSnapshot{
-			PRs:            prs,
-			StagingBranch:  active.StagingBranch,
-			StagingSHA:     active.StagingSHA,
-			BaseGeneration: active.BaseGeneration,
-			Outcome:        active.Outcome,
+			PRs:                prs,
+			StagingBranch:      active.StagingBranch,
+			StagingSHA:         active.StagingSHA,
+			BaseGeneration:     active.BaseGeneration,
+			Outcome:            active.Outcome,
+			PhaseSince:         active.PhaseSince,
+			MissingGateRetries: active.MissingGateRetries,
 		}
 	}
 	return out

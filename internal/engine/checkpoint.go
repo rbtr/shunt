@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/rbtr/shunt/internal/checkpoint"
+	"github.com/rbtr/shunt/internal/forge"
 )
 
 // CheckpointStore persists queue snapshots for one engine-managed queue.
@@ -33,7 +35,9 @@ func (e *Engine) loadCheckpoint(ctx context.Context) error {
 	if snapshot.Key != e.queueKey() {
 		return fmt.Errorf("queue checkpoint key mismatch: got %s/%s@%s", snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base)
 	}
-	e.applySnapshot(snapshot)
+	if err := e.applySnapshot(ctx, snapshot); err != nil {
+		return err
+	}
 	e.checkpointLoaded = true
 	e.checkpointExists = true
 	return nil
@@ -80,11 +84,13 @@ func (e *Engine) snapshot() checkpoint.QueueSnapshot {
 			prs[j] = checkpoint.PullRequestSnapshot{Number: pr.Number, HeadSHA: pr.Head.Sha}
 		}
 		active[i] = checkpoint.ActiveBatchSnapshot{
-			PRs:            prs,
-			StagingBranch:  a.stagingBranch,
-			StagingSHA:     a.stagingSHA,
-			BaseGeneration: a.baseGen,
-			Outcome:        a.outcome,
+			PRs:                prs,
+			StagingBranch:      a.stagingBranch,
+			StagingSHA:         a.stagingSHA,
+			BaseGeneration:     a.baseGen,
+			Outcome:            a.outcome,
+			PhaseSince:         a.phaseSince,
+			MissingGateRetries: a.missingGateRetries,
 		}
 	}
 	return checkpoint.QueueSnapshot{
@@ -97,19 +103,73 @@ func (e *Engine) snapshot() checkpoint.QueueSnapshot {
 	}
 }
 
-func (e *Engine) applySnapshot(snapshot checkpoint.QueueSnapshot) {
+// applySnapshot restores queue state from a durable snapshot. Unlike the
+// previous behavior (which re-queued staged batches for fresh staging), it
+// RESUMES the staged branch: the staging branch, SHA, gate outcome and PR
+// identities are durable, so a restart mid-cycle continues landing the
+// already-gated batch instead of abandoning it (and orphaning the branch).
+// Each PR is re-fetched so the active batch carries a full PullRequest; PRs
+// that closed or merged during the downtime are dropped (a merged PR is
+// observed in land()), and a fully-drained branch is deleted.
+func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSnapshot) error {
 	e.pending = clonePending(snapshot.Pending)
-	for _, active := range snapshot.Active {
-		nums := make([]int, len(active.PRs))
-		for i, pr := range active.PRs {
-			nums[i] = pr.Number
-		}
-		e.pending = append(e.pending, nums)
-	}
-	e.active = nil
 	e.lingerSince = snapshot.LingerSince
 	e.baseGen = snapshot.BaseGeneration
 	e.stagingSeq = snapshot.StagingSequence
+
+	active := make([]*activeBatch, 0, len(snapshot.Active))
+	for _, snap := range snapshot.Active {
+		prs := make([]forge.PullRequest, 0, len(snap.PRs))
+		for _, ps := range snap.PRs {
+			pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, ps.Number)
+			if err != nil {
+				return fmt.Errorf("resume staged batch: re-fetch PR #%d: %w", ps.Number, err)
+			}
+			if pr.State != "open" || pr.Merged {
+				continue // merged or closed during downtime
+			}
+			prs = append(prs, pr)
+		}
+		if len(prs) == 0 {
+			// Every PR landed during the downtime — remove the empty branch.
+			if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, snap.StagingBranch); err != nil {
+				e.logger.Warn("resume: failed to delete drained staging branch", "branch", snap.StagingBranch, "error", err)
+			}
+			continue
+		}
+		active = append(active, &activeBatch{
+			prs:                prs,
+			stagingBranch:      snap.StagingBranch,
+			stagingSHA:         snap.StagingSHA,
+			baseGen:            snap.BaseGeneration,
+			outcome:            snap.Outcome,
+			phase:              phaseForOutcome(snap.Outcome),
+			phaseSince:         orNow(snap.PhaseSince, e.now()),
+			missingGateRetries: snap.MissingGateRetries,
+		})
+	}
+	e.active = active
+	return nil
+}
+
+// phaseForOutcome derives the batch phase from a persisted gate outcome so a
+// resumed batch flows through checkActive correctly.
+func orNow(t, fallback time.Time) time.Time {
+	if t.IsZero() {
+		return fallback
+	}
+	return t
+}
+
+func phaseForOutcome(outcome string) string {
+	switch outcome {
+	case "success":
+		return "waiting_merge"
+	case "failure", "cancelled", "error":
+		return "bisecting"
+	default:
+		return "waiting_gate"
+	}
 }
 
 func clonePending(in [][]int) [][]int {

@@ -44,6 +44,7 @@ type mock struct {
 	conflictFirst        bool
 	statuses             []string
 	runStatus            string
+	runStatusSet         bool
 	staged               [][]int
 	stagingBranches      []string
 	merged               []int
@@ -53,6 +54,7 @@ type mock struct {
 	runURLs              map[string]string
 	scheduled            []int
 	scheduleRejected     bool
+	cancelOnPending      bool
 	calls                []string
 	eventSeq             int64
 	beforeNative         func(int)
@@ -152,6 +154,9 @@ func (m *mock) SetCommitStatus(_ context.Context, _, _, sha, statusContext, stat
 	m.calls = append(m.calls, "status:"+state)
 	for n, pr := range m.prs {
 		if pr.Head.Sha == sha {
+			if state == "pending" && m.cancelOnPending {
+				m.automerge[n] = false
+			}
 			m.latestStatus[n] = forge.CommitStatus{
 				ID:          m.eventSeq,
 				Status:      state,
@@ -192,7 +197,7 @@ func (m *mock) RunStatus(_ context.Context, _, _, sha, _ string) (string, error)
 	if m.runStatusErr != nil {
 		return "", m.runStatusErr
 	}
-	if m.runStatus != "" {
+	if m.runStatusSet || m.runStatus != "" {
 		return m.runStatus, nil
 	}
 	for _, n := range m.batchOf[sha] {
@@ -819,8 +824,8 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if err := restarted.Reconcile(context.Background()); err != nil {
 		t.Fatalf("restage restored batch: %v", err)
 	}
-	if got := len(m.staged); got != 2 {
-		t.Fatalf("restored active batch should be restaged; staged = %d, want 2", got)
+	if got := len(m.staged); got != 1 {
+		t.Fatalf("restored active batch should be resumed, not restaged; staged = %d, want 1", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Fatalf("merged after restage = %s, want []", got)
@@ -834,7 +839,7 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	}
 }
 
-func TestCheckpointRestartRestagesRemainderAfterReleasedPRMerges(t *testing.T) {
+func TestCheckpointRestartResumesRemainderAfterReleasedPRMerges(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	store := &memoryCheckpointStore{}
 	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
@@ -853,11 +858,14 @@ func TestCheckpointRestartRestagesRemainderAfterReleasedPRMerges(t *testing.T) {
 		t.Fatalf("restore queue: %v", err)
 	}
 
-	if got := fmt.Sprint(m.staged); got != "[[1 2] [2]]" {
-		t.Fatalf("staged = %s, want remaining PR restaged on the advanced base", got)
+	// The staged branch is resumed, not re-staged: the remaining PR keeps the
+	// already-gated branch rather than triggering a fresh staging run.
+	if got := fmt.Sprint(m.staged); got != "[[1 2]]" {
+		t.Fatalf("staged = %s, want remaining PR resumed on the same staging branch", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
-		t.Fatalf("statuses = %s, want second PR blocked until its fresh gate passes", got)
+	drive(restarted, 4)
+	if got := fmt.Sprint(m.merged); got != "[1 2]" {
+		t.Fatalf("merged after resume = %s, want [1 2]", got)
 	}
 }
 
@@ -910,6 +918,78 @@ func TestAllGreenBatchLandsInOneRun(t *testing.T) {
 	}
 }
 
+func TestCheckpointPreservesMissingGateRetryMetadata(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+	phaseSince := time.Unix(123, 0)
+	e.active = []*activeBatch{{
+		prs: []forge.PullRequest{*m.prs[1]}, stagingBranch: "mq/main/staging-1", stagingSHA: "stage-1",
+		phase: "waiting_gate", phaseSince: phaseSince, missingGateRetries: 2,
+	}}
+	snapshot := e.snapshot()
+
+	restored := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+	restored.now = func() time.Time { return time.Unix(999, 0) }
+	if err := restored.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+	if got := restored.active[0].missingGateRetries; got != 2 {
+		t.Fatalf("missing-gate retries = %d, want 2", got)
+	}
+	if got := restored.active[0].phaseSince; !got.Equal(phaseSince) {
+		t.Fatalf("phase since = %v, want %v", got, phaseSince)
+	}
+}
+
+func TestMissingGateRetriesWithBackoffThenBounces(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatusSet = true // a staging ref that never triggered CI has no status.
+	now := time.Unix(100, 0)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StagingBranch: "mq/main/staging"}, m, m)
+	e.now = func() time.Time { return now }
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("stage batch: %v", err)
+	}
+	for retry := 1; retry <= missingGateMaxRetries; retry++ {
+		now = now.Add(missingGateGrace(retry-1) - time.Second)
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatalf("wait before retry %d: %v", retry, err)
+		}
+		if got := len(m.staged); got != retry {
+			t.Fatalf("staging runs before retry %d = %d, want %d", retry, got, retry)
+		}
+
+		now = now.Add(time.Second)
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatalf("retry %d: %v", retry, err)
+		}
+		if got := len(m.staged); got != retry+1 {
+			t.Fatalf("staging runs after retry %d = %d, want %d", retry, got, retry+1)
+		}
+		if got := e.active[0].missingGateRetries; got != retry {
+			t.Fatalf("missing-gate retries = %d, want %d", got, retry)
+		}
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging") {
+		t.Fatalf("calls = %s, want stale staging branch deleted", got)
+	}
+
+	now = now.Add(missingGateGrace(missingGateMaxRetries))
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("terminal missing gate: %v", err)
+	}
+	if len(e.active) != 0 || len(e.pending) != 0 {
+		t.Fatalf("active=%v pending=%v, want stopped queue", e.active, e.pending)
+	}
+	if !m.bounced[1] || m.automerge[1] {
+		t.Fatalf("missing gate must bounce and cancel auto-merge: bounced=%v automerge=%v", m.bounced[1], m.automerge[1])
+	}
+	if got := fmt.Sprint(m.statuses); got != "[head-1:error]" {
+		t.Fatalf("statuses = %s, want terminal error", got)
+	}
+}
+
 func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	m := newMock(-1, 1, 2)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
@@ -921,10 +1001,10 @@ func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 		t.Fatalf("release first PR: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
 		t.Fatalf("statuses before first merge = %s, want only PR 1 released", got)
 	}
-	if got := fmt.Sprint(m.calls); got != "[schedule:1 schedule:2 status:pending status:success]" {
+	if got := fmt.Sprint(m.calls); got != "[schedule:1 schedule:2 status:success]" {
 		t.Fatalf("landing calls = %s, want status-only native release", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
@@ -939,7 +1019,7 @@ func TestNativeLandingReleasesOnePRAtATime(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[1]" {
 		t.Fatalf("merged = %s, want [1]", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-2:pending head-2:success]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-2:success]" {
 		t.Fatalf("statuses after first merge = %s, want PR 2 released only after PR 1 merged", got)
 	}
 }
@@ -1112,8 +1192,8 @@ func TestForgeCompletedMergeDoesNotOverwriteSuccessStatus(t *testing.T) {
 		t.Fatalf("observe merge: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success]" {
-		t.Errorf("statuses = %s, want pending then success", got)
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success]" {
+		t.Errorf("statuses = %s, want release success", got)
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Landed via merge queue") {
 		t.Errorf("comments missing landed outcome:\n%s", got)
@@ -1269,13 +1349,13 @@ func TestNativeMergeTimeoutBlocksRestoresAndRequeues(t *testing.T) {
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Fatalf("merged = %s, want []", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1:pending]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error head-1:pending]" {
 		t.Fatalf("statuses = %s, want success blocked before restoration", got)
 	}
 	// The branch name is recorded by the mock at staging time; assert the
 	// full call sequence with the exact branch so the delete is pinned to
 	// its position in the recovery path.
-	wantCalls := fmt.Sprintf("[schedule:1 status:pending status:success status:error delete:%s schedule:1 status:pending]", m.stagingBranches[0])
+	wantCalls := fmt.Sprintf("[schedule:1 status:success status:error delete:%s schedule:1 status:pending]", m.stagingBranches[0])
 	if got := fmt.Sprint(m.calls); got != wantCalls {
 		t.Fatalf("recovery calls = %s, want %s", got, wantCalls)
 	}
@@ -1317,7 +1397,7 @@ func TestNativeMergeTimeoutRequeuesBeforeRestoreStatusFailure(t *testing.T) {
 	if len(e.active) != 0 {
 		t.Fatalf("active batches = %d, want old passing batch discarded", len(e.active))
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error]" {
 		t.Fatalf("statuses = %s, want no second success from the old batch", got)
 	}
 
@@ -1327,7 +1407,7 @@ func TestNativeMergeTimeoutRequeuesBeforeRestoreStatusFailure(t *testing.T) {
 	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
 		t.Fatalf("staged = %s, want a fresh run after partial recovery", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error]" {
 		t.Fatalf("statuses after restage = %s, want no release before the fresh gate resolves", got)
 	}
 }
@@ -1396,7 +1476,7 @@ func TestNativeMergeTimeoutRechecksCancellationBeforeRestore(t *testing.T) {
 	if got := fmt.Sprint(m.scheduled); got != "[]" {
 		t.Fatalf("restored schedules = %s, want newer cancellation preserved", got)
 	}
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error]" {
 		t.Fatalf("statuses = %s, want timed-out success blocked without a duplicate status", got)
 	}
 	if got := strings.Join(m.comments[1], "\n"); !strings.Contains(got, "Skipped by merge queue") {
@@ -1404,27 +1484,24 @@ func TestNativeMergeTimeoutRechecksCancellationBeforeRestore(t *testing.T) {
 	}
 }
 
-func TestCancellationBetweenClaimAndReleaseWins(t *testing.T) {
+func TestCancellationBeforeReleaseWins(t *testing.T) {
 	m := newMock(-1, 1)
-	m.beforeGetPR = func(n int) {
-		status, ok := m.latestStatus[n]
-		if !ok || status.Status != "pending" || status.Description != landingClaimDescription {
-			return
-		}
-		m.scheduleLive[n] = false
-		m.automerge[n] = false
-		m.automergeAt[n] = m.nextEventTime()
-	}
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
 
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("start batch: %v", err)
 	}
+	m.beforeGetPR = func(n int) {
+		m.beforeGetPR = nil
+		m.scheduleLive[n] = false
+		m.automerge[n] = false
+		m.automergeAt[n] = m.nextEventTime()
+	}
 	if err := e.Reconcile(context.Background()); err != nil {
 		t.Fatalf("observe cancellation: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:error]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:error]" {
 		t.Fatalf("statuses = %s, want cancellation to prevent success", got)
 	}
 	if got := fmt.Sprint(m.scheduled); got != "[]" {
@@ -1596,6 +1673,98 @@ func TestActiveBatchRestacksChangedHeadImmediately(t *testing.T) {
 	}
 }
 
+func TestActiveBatchRequeuesEligibleRemainderAfterDismissedApproval(t *testing.T) {
+	m := newMock(-1, 1, 2)
+	m.runStatus = "running"
+	m.protection = forge.BranchProtection{RequiredApprovals: 1}
+	m.reviews[1] = []forge.Review{{State: "APPROVED", Official: true}}
+	m.reviews[2] = []forge.Review{{State: "APPROVED", Official: true}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.reviews[1][0].Dismissed = true
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("discard unapproved batch: %v", err)
+	}
+
+	if got := fmt.Sprint(m.staged); got != "[[1 2] [2]]" {
+		t.Fatalf("staged = %s, want eligible remainder restaged", got)
+	}
+	if len(e.active) != 1 || fmt.Sprint(numbersOf(e.active[0].prs)) != "[2]" {
+		t.Fatalf("active = %v, want only PR 2", e.active)
+	}
+}
+
+func TestActiveBatchRestacksChangedHeadBeforeGateStatus(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.prs[1].Head.Sha = "head-1-new"
+	m.runStatusErr = errors.New("gate unavailable")
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("restack changed batch before gate status: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
+		t.Fatalf("staged = %s, want immediate restack", got)
+	}
+}
+
+func TestActiveBatchDiscardsCancelledPR(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.automerge[1] = false
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("discard cancelled batch: %v", err)
+	}
+
+	if len(e.active) != 0 {
+		t.Fatalf("active batches = %d, want 0", len(e.active))
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want no replacement batch", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+m.stagingBranches[0]) {
+		t.Fatalf("calls = %s, want stale branch deleted", got)
+	}
+}
+
+func TestActiveBatchDiscardsDismissedApproval(t *testing.T) {
+	m := newMock(-1, 1)
+	m.runStatus = "running"
+	m.protection = forge.BranchProtection{RequiredApprovals: 1}
+	m.reviews[1] = []forge.Review{{State: "APPROVED", Official: true}}
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.reviews[1][0].Dismissed = true
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("discard unapproved batch: %v", err)
+	}
+
+	if len(e.active) != 0 {
+		t.Fatalf("active batches = %d, want 0", len(e.active))
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want no replacement batch", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+m.stagingBranches[0]) {
+		t.Fatalf("calls = %s, want stale branch deleted", got)
+	}
+}
+
 func TestTerminalFailureRestacksIfHeadChangesWhileReadingStatus(t *testing.T) {
 	m := newMock(-1, 1)
 	m.runStatus = "failure"
@@ -1687,6 +1856,30 @@ func TestTerminalFailureRestacksIfHeadChangesDuringBounce(t *testing.T) {
 	}
 }
 
+func TestLandDoesNotRefreshPendingStatusBeforeRelease(t *testing.T) {
+	m := newMock(-1, 1)
+	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("start batch: %v", err)
+	}
+	m.cancelOnPending = true
+	statuses := len(m.statuses)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("release batch: %v", err)
+	}
+	if got := m.statuses[statuses:]; !reflect.DeepEqual(got, []string{"head-1:success"}) {
+		t.Fatalf("release statuses = %v, want only success", got)
+	}
+	m.advanceNative()
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("observe merge: %v", err)
+	}
+	if got := fmt.Sprint(m.merged); got != "[1]" {
+		t.Fatalf("merged = %s, want [1]", got)
+	}
+}
+
 func TestLandSkipsCancelledAutomerge(t *testing.T) {
 	m := newMock(-1, 1)
 	e := New(Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging"}, m, m)
@@ -1765,7 +1958,7 @@ func TestNativeLandingHandlesHeadChangeAfterRelease(t *testing.T) {
 		t.Fatalf("requeue changed PR: %v", err)
 	}
 
-	if got := fmt.Sprint(m.statuses); got != "[head-1:pending head-1:success head-1:error head-1-new:error]" {
+	if got := fmt.Sprint(m.statuses); got != "[head-1:success head-1:error head-1-new:error]" {
 		t.Errorf("statuses = %s, want success cleared on tested and current heads", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
@@ -2198,8 +2391,8 @@ func TestLeasePreventsDuplicateEffectsUntilTakeover(t *testing.T) {
 	if err := second.Reconcile(context.Background()); err != nil {
 		t.Fatalf("takeover Reconcile: %v", err)
 	}
-	if got := fmt.Sprint(m.staged); got != "[[1] [1]]" {
-		t.Fatalf("staged = %s, want durable active batch re-staged after takeover", got)
+	if got := fmt.Sprint(m.staged); got != "[[1]]" {
+		t.Fatalf("staged = %s, want resumed active batch (no re-stage) after takeover", got)
 	}
 }
 

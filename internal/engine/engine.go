@@ -48,16 +48,17 @@ type Config struct {
 }
 
 type activeBatch struct {
-	prs           []forge.PullRequest
-	stagingBranch string
-	stagingSHA    string
-	debugURL      string
-	baseGen       int
-	outcome       string
-	releasedPR    int
-	releasedAt    time.Time
-	phase         string    // "waiting_gate", "waiting_merge", or "bisecting"
-	phaseSince    time.Time // when the current phase started
+	prs                []forge.PullRequest
+	stagingBranch      string
+	stagingSHA         string
+	debugURL           string
+	baseGen            int
+	outcome            string
+	releasedPR         int
+	releasedAt         time.Time
+	phase              string    // "waiting_gate", "waiting_merge", or "bisecting"
+	phaseSince         time.Time // when the current phase started
+	missingGateRetries int
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -83,6 +84,7 @@ const (
 	landingSuccessDescription = "merge queue: batch passed"
 	queueRestoreDescription   = "merge queue: re-queued after incomplete native merge"
 	nativeMergeTimeout        = 5 * time.Minute
+	missingGateMaxRetries     = 3
 	// mergeStrikeCap is how many consecutive native-merge failures on the
 	// same PR head bounce the PR out of the queue instead of re-queueing it
 	// forever. A never-mergeable PR (approval-blocked, changes requested,
@@ -416,6 +418,11 @@ func (g admissionGate) blocks(ctx context.Context, fc ForgeAPI, owner, repo stri
 // resolve drops PRs from a candidate that are no longer open or no longer have
 // auto-merge scheduled (e.g. merged in a prior sub-batch, or bounced).
 func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, error) {
+	protection, err := e.fc.ProtectedBranch(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return nil, err
+	}
+	gate := admissionGate{protection: protection}
 	var out []forge.PullRequest
 	for _, n := range nums {
 		pr, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, n)
@@ -435,6 +442,13 @@ func (e *Engine) resolve(ctx context.Context, nums []int) ([]forge.PullRequest, 
 		if !state.Scheduled {
 			e.logger.Info("dropping PR in resolve: not scheduled", "pr", n)
 			e.observeQueueExit(n, "dropped")
+			continue
+		}
+		if blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, n); err != nil {
+			return nil, err
+		} else if blocked {
+			e.logger.Info("dropping PR in resolve: blocked by review policy", "pr", n, "reason", reason)
+			e.observeQueueExit(n, "ineligible")
 			continue
 		}
 		ok, err := e.queued(ctx, pr)
@@ -546,10 +560,28 @@ func (e *Engine) linger(ready []int) bool {
 	now := e.now()
 	if e.lingerSince.IsZero() {
 		e.lingerSince = now
-		e.logger.Info("batch linger started", "linger", e.cfg.BatchLinger, "target", e.cfg.BatchTarget, "ready", ready)
+	}
+	if now.Sub(e.lingerSince) < e.cfg.BatchLinger {
+		// Log every tick so the host's backoff scheduler treats a lingering
+		// repo as active (it must keep polling until the batch builds).
+		e.logger.Info("batch linger active", "linger", e.cfg.BatchLinger, "elapsed", now.Sub(e.lingerSince), "ready", ready)
 		return true
 	}
-	return now.Sub(e.lingerSince) < e.cfg.BatchLinger
+	return false
+}
+
+func missingGateGrace(retries int) time.Duration {
+	// retries is the number of fresh staging refs already attempted.
+	switch retries {
+	case 0:
+		return 10 * time.Minute
+	case 1:
+		return 20 * time.Minute
+	case 2:
+		return 40 * time.Minute
+	default:
+		return 60 * time.Minute
+	}
 }
 
 func (e *Engine) checkActive(ctx context.Context) (bool, error) {
@@ -567,6 +599,55 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				return false, err
 			}
 			switch status {
+			case "":
+				changed, err := e.invalidateStaleActive(ctx, a)
+				if err != nil {
+					return false, err
+				}
+				if changed {
+					return false, nil
+				}
+				// A staging ref without any gate result cannot make progress. Back off
+				// re-staging attempts, then bounce rather than creating refs forever.
+				if e.now().Sub(a.phaseSince) < missingGateGrace(a.missingGateRetries) {
+					continue
+				}
+				if a.missingGateRetries >= missingGateMaxRetries {
+					e.cleanupBatch(ctx, a)
+					for _, staged := range a.prs {
+						e.bounce(ctx, staged.Number, staged.Head.Sha, "no CI gate run after 3 retries", "error", a.debugURL)
+					}
+					e.logger.Error("staging batch abandoned after missing gate retries", "prs", numbersOf(a.prs))
+					return true, nil
+				}
+
+				prs := a.prs
+				e.cleanupBatch(ctx, a)
+				refs := make([]gitops.MergedRef, len(prs))
+				for i, pr := range prs {
+					refs[i] = gitops.MergedRef{PR: pr.Number, Ref: fmt.Sprintf("refs/pull/%d/head", pr.Number)}
+				}
+				branch := e.stagingBranch()
+				sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, branch, refs)
+				if err != nil {
+					if conflictPR > 0 {
+						return false, e.handleStagingConflict(ctx, prs, conflictPR)
+					}
+					return false, err
+				}
+				retry := a.missingGateRetries + 1
+				e.active = append(e.active, &activeBatch{
+					prs:                prs,
+					stagingBranch:      branch,
+					stagingSHA:         sha,
+					baseGen:            e.baseGen,
+					phase:              "waiting_gate",
+					phaseSince:         e.now(),
+					missingGateRetries: retry,
+				})
+				e.logger.Warn("staging batch re-staged after no gate result",
+					"prs", numbersOf(prs), "stagingBranch", branch, "retry", retry)
+				return true, nil
 			case "success", "failure", "cancelled", "error":
 				changed, err := e.requeueActiveIfHeadChanged(ctx, a)
 				if err != nil {
@@ -593,7 +674,14 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 					a.phase = "waiting_merge"
 					a.phaseSince = e.now()
 				}
-			default: // "", running, waiting, blocked -> keep waiting
+			default: // running, waiting, blocked -> keep waiting
+				changed, err := e.invalidateStaleActive(ctx, a)
+				if err != nil {
+					return false, err
+				}
+				if changed {
+					return false, nil
+				}
 				continue
 			}
 		}
@@ -634,25 +722,65 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (e *Engine) requeueActiveIfHeadChanged(ctx context.Context, a *activeBatch) (bool, error) {
-	changed, err := e.activeHeadChanged(ctx, a)
-	if err != nil || !changed {
-		return changed, err
+// invalidateStaleActive discards a staged batch whose PR changed or is no
+// longer eligible. A head change is re-queued; cancellation or a review-policy
+// change is not, so it cannot recreate the batch until the PR becomes ready.
+func (e *Engine) invalidateStaleActive(ctx context.Context, a *activeBatch) (bool, error) {
+	protection, err := e.fc.ProtectedBranch(ctx, e.cfg.Owner, e.cfg.Repo, e.cfg.Base)
+	if err != nil {
+		return false, err
 	}
-	e.requeueChangedActive(ctx, a)
-	return true, nil
-}
-
-func (e *Engine) activeHeadChanged(ctx context.Context, a *activeBatch) (bool, error) {
+	gate := admissionGate{protection: protection}
 	for _, staged := range a.prs {
 		current, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
 		if err != nil {
 			return false, err
 		}
 		if current.State != "open" || current.Merged {
-			continue
+			e.discardIneligibleActive(ctx, a, staged.Number, "closed")
+			return true, nil
 		}
 		if current.Head.Sha != staged.Head.Sha {
+			e.requeueChangedActive(ctx, a)
+			return true, nil
+		}
+		eligible, err := e.queueEligibility(ctx, current)
+		if err != nil {
+			return false, err
+		}
+		if !eligible {
+			e.discardIneligibleActive(ctx, a, staged.Number, "auto-merge cancelled")
+			return true, nil
+		}
+		blocked, reason, err := gate.blocks(ctx, e.fc, e.cfg.Owner, e.cfg.Repo, staged.Number)
+		if err != nil {
+			return false, err
+		}
+		if blocked {
+			e.discardIneligibleActive(ctx, a, staged.Number, reason)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (e *Engine) discardIneligibleActive(ctx context.Context, a *activeBatch, pr int, reason string) {
+	remaining := removeNum(numbersOf(a.prs), pr)
+	e.cleanupBatch(ctx, a)
+	e.enqueueWithState("requeued after another PR became ineligible", remaining)
+	e.observeQueueExit(pr, "ineligible")
+	e.logger.Info("active batch discarded after PR became ineligible",
+		"pr", pr, "reason", reason, "prs", numbersOf(a.prs), "requeued", remaining)
+}
+
+func (e *Engine) requeueActiveIfHeadChanged(ctx context.Context, a *activeBatch) (bool, error) {
+	for _, staged := range a.prs {
+		current, err := e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
+		if err != nil {
+			return false, err
+		}
+		if current.State == "open" && !current.Merged && current.Head.Sha != staged.Head.Sha {
+			e.requeueChangedActive(ctx, a)
 			return true, nil
 		}
 	}
@@ -717,6 +845,13 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			return false, merged, err
 		}
 		if !queued {
+			if e.strikeMergeFailure(staged) {
+				e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
+				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+				e.cleanupBatch(ctx, a)
+				e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+				return true, merged, nil
+			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 			e.cleanupBatch(ctx, a)
@@ -746,6 +881,13 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				return false, merged, err
 			}
 			if !state.Scheduled {
+				if e.strikeMergeFailure(staged) {
+					e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
+					e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+					e.cleanupBatch(ctx, a)
+					e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+					return true, merged, nil
+				}
 				e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 				e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 				e.cleanupBatch(ctx, a)
@@ -768,6 +910,13 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 				return false, merged, err
 			}
 			if !state.Scheduled {
+				if e.strikeMergeFailure(staged) {
+					e.logger.Warn("PR bounced: auto-merge repeatedly cancelled during recovery", "pr", staged.Number, "head", short(staged.Head.Sha))
+					e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+					e.cleanupBatch(ctx, a)
+					e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+					return true, merged, nil
+				}
 				e.logger.Info("PR skipped during native merge recovery", "pr", staged.Number, "reason", "auto-merge is no longer scheduled")
 				e.notifyPR(
 					ctx,
@@ -829,18 +978,6 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			e.logger.Error("native auto-merge timed out", "pr", staged.Number)
 			return true, merged, nil
 		}
-		if err := e.fc.SetCommitStatus(
-			ctx,
-			e.cfg.Owner,
-			e.cfg.Repo,
-			staged.Head.Sha,
-			e.cfg.StatusCtx,
-			"pending",
-			landingClaimDescription,
-			e.commitURL(a.stagingSHA),
-		); err != nil {
-			return false, merged, err
-		}
 		current, err = e.fc.GetPR(ctx, e.cfg.Owner, e.cfg.Repo, staged.Number)
 		if err != nil {
 			return false, merged, err
@@ -856,6 +993,13 @@ func (e *Engine) land(ctx context.Context, a *activeBatch) (resolved bool, merge
 			return false, merged, err
 		}
 		if !state.Scheduled {
+			if e.strikeMergeFailure(staged) {
+				e.logger.Warn("PR bounced: auto-merge repeatedly cancelled", "pr", staged.Number, "head", short(staged.Head.Sha))
+				e.requeueActiveRemainder("requeued after an earlier PR failed to merge", a.prs[1:])
+				e.cleanupBatch(ctx, a)
+				e.bounce(ctx, staged.Number, staged.Head.Sha, "auto-merge was repeatedly cancelled before the merge completed", "error", a.debugURL)
+				return true, merged, nil
+			}
 			e.skipLand(ctx, staged, current, "auto-merge is no longer scheduled", len(a.prs) > 1, a.debugURL, true)
 			e.requeueActiveRemainder("requeued after auto-merge was cancelled", a.prs)
 			e.cleanupBatch(ctx, a)
