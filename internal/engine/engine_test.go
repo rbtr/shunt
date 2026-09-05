@@ -840,6 +840,13 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	if store.saved == nil || len(store.saved.Active) != 1 {
 		t.Fatalf("checkpoint active batches = %v, want 1 active batch", store.saved)
 	}
+	if got := store.saved.Active[0].Phase; got != "waiting_gate" {
+		t.Fatalf("checkpoint phase = %q, want waiting_gate", got)
+	}
+	if store.saved.Active[0].PhaseSince.IsZero() {
+		t.Fatal("checkpoint phase timestamp is zero")
+	}
+	staleBranch := m.stagingBranches[0]
 
 	restarted := New(cfg, m, m)
 	if err := restarted.Reconcile(context.Background()); err != nil {
@@ -847,6 +854,9 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	}
 	if got := len(m.staged); got != 2 {
 		t.Fatalf("restored active batch should be restaged; staged = %d, want 2", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:"+staleBranch) {
+		t.Fatalf("calls = %s, want stale staging branch deleted", got)
 	}
 	if got := fmt.Sprint(m.merged); got != "[]" {
 		t.Fatalf("merged after restage = %s, want []", got)
@@ -857,6 +867,33 @@ func TestCheckpointRestoresActiveBatchByRestaging(t *testing.T) {
 	}
 	if !store.deleted {
 		t.Error("empty queue should delete checkpoint after restored batch lands")
+	}
+}
+
+func TestCheckpointRestoreKeepsActiveCandidateBeforeLaterPendingWork(t *testing.T) {
+	m := newMock(-1, 1, 2, 3)
+	store := &memoryCheckpointStore{saved: &checkpoint.QueueSnapshot{
+		Key:     checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		Pending: [][]int{{3}},
+		Active: []checkpoint.ActiveBatchSnapshot{{
+			PRs: []checkpoint.PullRequestSnapshot{
+				{Number: 1, HeadSHA: "head-1"},
+				{Number: 2, HeadSHA: "head-2"},
+			},
+			StagingBranch: "mq/main/staging-old",
+			StagingSHA:    "stage-old",
+		}},
+	}}
+	cfg := Config{Owner: "o", Repo: "r", Base: "main", StatusCtx: "merge-queue", StagingBranch: "mq/main/staging", Checkpoint: store}
+
+	if err := New(cfg, m, m).Reconcile(context.Background()); err != nil {
+		t.Fatalf("restore queue: %v", err)
+	}
+	if got := fmt.Sprint(m.staged); got != "[[1 2]]" {
+		t.Fatalf("staged = %s, want the restored active candidate before later work", got)
+	}
+	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging-old") {
+		t.Fatalf("calls = %s, want restored staging branch deleted", got)
 	}
 }
 

@@ -29,15 +29,17 @@ type QueueSnapshot struct {
 	StagingSequence int                   `json:"StagingSequence"`
 }
 
-// ActiveBatchSnapshot records a staging branch currently waiting on its gate.
-// On restore the engine re-queues these PRs for fresh staging (applySnapshot
-// sets active = nil) — it does not resume the staged branch.
+// ActiveBatchSnapshot records a staging attempt that was in flight. On
+// restore the engine removes its staging branch and re-queues its PRs for fresh
+// staging, rather than trusting evidence from before the restart.
 type ActiveBatchSnapshot struct {
 	PRs            []PullRequestSnapshot `json:"PRs"`
 	StagingBranch  string                `json:"StagingBranch"`
 	StagingSHA     string                `json:"StagingSHA"`
 	BaseGeneration int                   `json:"BaseGeneration"`
 	Outcome        string                `json:"Outcome"`
+	Phase          string                `json:"Phase"`
+	PhaseSince     time.Time             `json:"PhaseSince"`
 }
 
 // PullRequestSnapshot is the PR identity needed to re-queue a batch.
@@ -91,6 +93,9 @@ func (s QueueSnapshot) Validate() error {
 		}
 		if active.Outcome != "" && active.Outcome != "success" && active.Outcome != "failure" && active.Outcome != "cancelled" && active.Outcome != "error" {
 			return fmt.Errorf("queue checkpoint active batch %d has invalid outcome %q", i, active.Outcome)
+		}
+		if active.Phase != "" && active.Phase != "waiting_gate" && active.Phase != "waiting_merge" && active.Phase != "bisecting" {
+			return fmt.Errorf("queue checkpoint active batch %d has invalid phase %q", i, active.Phase)
 		}
 		if len(active.PRs) == 0 {
 			return fmt.Errorf("queue checkpoint active batch %d has no PRs", i)

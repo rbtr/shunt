@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/rbtr/shunt/internal/checkpoint"
 )
@@ -33,7 +34,9 @@ func (e *Engine) loadCheckpoint(ctx context.Context) error {
 	if snapshot.Key != e.queueKey() {
 		return fmt.Errorf("queue checkpoint key mismatch: got %s/%s@%s", snapshot.Key.Owner, snapshot.Key.Repo, snapshot.Key.Base)
 	}
-	e.applySnapshot(snapshot)
+	if err := e.applySnapshot(ctx, snapshot); err != nil {
+		return err
+	}
 	e.checkpointLoaded = true
 	e.checkpointExists = true
 	return nil
@@ -85,6 +88,8 @@ func (e *Engine) snapshot() checkpoint.QueueSnapshot {
 			StagingSHA:     a.stagingSHA,
 			BaseGeneration: a.baseGen,
 			Outcome:        a.outcome,
+			Phase:          a.phase,
+			PhaseSince:     a.phaseSince,
 		}
 	}
 	return checkpoint.QueueSnapshot{
@@ -97,19 +102,30 @@ func (e *Engine) snapshot() checkpoint.QueueSnapshot {
 	}
 }
 
-func (e *Engine) applySnapshot(snapshot checkpoint.QueueSnapshot) {
+// applySnapshot restores unresolved candidates. In-flight staging attempts are
+// deliberately not resumed: after a restart, Shunt cannot prove their gate
+// evidence still includes the current base and source heads. It removes each
+// old staging branch and re-queues its PRs for fresh staging instead.
+func (e *Engine) applySnapshot(ctx context.Context, snapshot checkpoint.QueueSnapshot) error {
 	e.pending = clonePending(snapshot.Pending)
 	for _, active := range snapshot.Active {
+		if err := e.fc.DeleteBranch(ctx, e.cfg.Owner, e.cfg.Repo, active.StagingBranch); err != nil {
+			e.logger.Warn("failed to delete restored staging branch", "branch", active.StagingBranch, "error", err)
+		}
 		nums := make([]int, len(active.PRs))
 		for i, pr := range active.PRs {
 			nums[i] = pr.Number
 		}
 		e.pending = append(e.pending, nums)
 	}
+	sort.SliceStable(e.pending, func(i, j int) bool {
+		return e.pending[i][0] < e.pending[j][0]
+	})
 	e.active = nil
 	e.lingerSince = snapshot.LingerSince
 	e.baseGen = snapshot.BaseGeneration
 	e.stagingSeq = snapshot.StagingSequence
+	return nil
 }
 
 func clonePending(in [][]int) [][]int {

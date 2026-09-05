@@ -32,6 +32,8 @@ func TestStoreSavesLoadsAndDeletesQueue(t *testing.T) {
 			StagingSHA:     "stage-4",
 			BaseGeneration: 2,
 			Outcome:        "failure",
+			Phase:          "bisecting",
+			PhaseSince:     time.Date(2026, 6, 24, 10, 1, 0, 0, time.UTC),
 		}},
 		LingerSince:     time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
 		BaseGeneration:  2,
@@ -102,7 +104,7 @@ func TestQueueSnapshotJSONReadsLegacyFieldNames(t *testing.T) {
 	data := []byte(`{
 		"Key":{"Owner":"o","Repo":"r","Base":"main"},
 		"Pending":[[1]],
-		"Active":[{"PRs":[{"Number":1,"HeadSHA":"head-1"}],"StagingBranch":"mq/main/staging","StagingSHA":"stage-1","BaseGeneration":2,"Outcome":"failure"}],
+		"Active":[{"PRs":[{"Number":1,"HeadSHA":"head-1"}],"StagingBranch":"mq/main/staging","StagingSHA":"stage-1","BaseGeneration":2,"Outcome":"failure","Phase":"bisecting","PhaseSince":"2026-06-24T10:01:00Z"}],
 		"LingerSince":"0001-01-01T00:00:00Z",
 		"BaseGeneration":2,
 		"StagingSequence":7
@@ -119,5 +121,8 @@ func TestQueueSnapshotJSONReadsLegacyFieldNames(t *testing.T) {
 	}
 	if got := snapshot.StagingSequence; got != 7 {
 		t.Fatalf("staging sequence = %d, want 7", got)
+	}
+	if got := snapshot.Active[0].Phase; got != "bisecting" {
+		t.Fatalf("phase = %q, want bisecting", got)
 	}
 }
