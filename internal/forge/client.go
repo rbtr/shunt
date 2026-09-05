@@ -537,7 +537,7 @@ func (c *Client) ListReviews(ctx context.Context, owner, repo string, index int)
 // ProtectedBranch returns the branch-protection rule for branch, or
 // (zero-value, nil) when the branch has no protection rule (not blocked).
 func (c *Client) ProtectedBranch(ctx context.Context, owner, repo, branch string) (BranchProtection, error) {
-	data, err := c.doRaw(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branches/%s/protection", repoPath(owner, repo), url.PathEscape(branch)), nil)
+	data, err := c.doRaw(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/branch_protections/%s", repoPath(owner, repo), url.PathEscape(branch)), nil)
 	if errors.Is(err, ErrNotFound) {
 		return BranchProtection{}, nil
 	}

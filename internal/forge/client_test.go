@@ -115,7 +115,7 @@ func TestProtectedBranchParsesRequirementsAnd404MeansNoRule(t *testing.T) {
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
-		if r.URL.Path == "/api/v1/repos/o/r/branches/main/protection" {
+		if r.URL.Path == "/api/v1/repos/o/r/branch_protections/main" {
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"required_approvals":2,"block_on_rejected_reviews":true,"block_on_official_review_requests":true,"ignore_stale_approvals":true}`)
 			return
@@ -132,8 +132,8 @@ func TestProtectedBranchParsesRequirementsAnd404MeansNoRule(t *testing.T) {
 	if p.RequiredApprovals != 2 || !p.BlockOnRejectedReviews || !p.BlockOnOfficialReviewRequests || !p.IgnoreStaleApprovals {
 		t.Fatalf("protection = %+v", p)
 	}
-	if !strings.Contains(path, "branches/main/protection") {
-		t.Fatalf("path = %s, want protection endpoint", path)
+	if !strings.Contains(path, "branch_protections/main") {
+		t.Fatalf("path = %s, want Forgejo branch-protection endpoint", path)
 	}
 
 	// A branch with no rule returns a zero-value rule, not an error.
