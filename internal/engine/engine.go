@@ -75,7 +75,8 @@ type activeBatch struct {
 	exactKey           string
 	runID              string // the root batch this was bisected out of
 	lineagePath        string // "r", "r0", "r01", … ; parent is this minus one char
-	speculative        bool
+	// speculative marks a batch staged ahead of the authoritative frontier.
+	speculative bool
 }
 
 // ForgeAPI is the subset of the forge client the engine needs (interface so the
@@ -587,9 +588,8 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if len(prs) == 0 {
-		// Every PR of this candidate withdrew before it could be staged. If it
-		// was a bisection node, consume its lineage and record it so the root
-		// it belonged to is not left waiting on a node that will never run.
+		// Remove lineage when all PRs leave a candidate before staging.
+		// This lets its root continue finalization.
 		if len(cand) > 0 {
 			if runID := e.lineageRunID[cand[0]]; runID != "" {
 				path := e.lineage[cand[0]]
@@ -609,8 +609,16 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	stagedPRs := prs
+	speculative := false
 	if tree, ok := e.trees[runID]; ok {
-		stagedPRs = append(append([]forge.PullRequest(nil), tree.accepted...), prs...)
+		baseline := append([]forge.PullRequest(nil), tree.accepted...)
+		// Include unresolved earlier nodes in a speculative staging attempt.
+		// checkActive replaces this attempt when its baseline is not valid.
+		if earlier := e.unresolvedEarlier(runID, cand[0]); len(earlier) > 0 {
+			baseline = append(baseline, earlier...)
+			speculative = true
+		}
+		stagedPRs = append(baseline, prs...)
 	}
 	refs := make([]gitops.MergedRef, len(stagedPRs))
 	for i, p := range stagedPRs {
@@ -619,15 +627,12 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 	exactKey := e.exactKey(anchor, stagedPRs)
 	if tree, ok := e.trees[runID]; ok {
 		if outcome, cached := tree.results[exactKey]; cached {
-			e.active = append(e.active, &activeBatch{prs: prs, stagingBranch: e.stagingBranchFor(runID, lineagePath), outcome: outcome, phase: phaseForOutcome(outcome), phaseSince: e.now(), runID: runID, lineagePath: lineagePath, exactKey: exactKey})
+			e.active = append(e.active, &activeBatch{prs: prs, stagingBranch: e.stagingBranchFor(runID, lineagePath), outcome: outcome, phase: phaseForOutcome(outcome), phaseSince: e.now(), runID: runID, lineagePath: lineagePath, exactKey: exactKey, speculative: speculative})
 			return true, nil
 		}
 	}
 	stagingBranch := e.stagingBranchFor(runID, lineagePath)
-	// Every integration under a root is built on that root's immutable anchor,
-	// not the live base tip, so main moving mid-tree cannot change what a
-	// staged result means. Detecting and acting on such a move (root
-	// invalidation) is a separate change.
+	// Build each root child on the root's fixed base anchor.
 	sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, anchor, stagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
@@ -653,10 +658,14 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		runID:         runID,
 		lineagePath:   lineagePath,
 		exactKey:      exactKey,
+		speculative:   speculative,
 	}
 	e.active = append(e.active, a)
 	if e.cfg.Metrics != nil {
 		e.cfg.Metrics.IncBatchesStarted(e.metricLabels())
+		if speculative {
+			e.cfg.Metrics.IncSpeculativeStarted(e.metricLabels())
+		}
 	}
 	e.logger.Info("testing batch", "prs", numbersOf(prs), "stagingBranch", a.stagingBranch, "sha", short(sha))
 	e.recordTransition(Transition{
@@ -846,6 +855,9 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				if want := e.exactKey(e.rootAnchor[a.runID], staged); want != a.exactKey {
 					e.supersedeSpeculative(ctx, a)
 					return true, nil
+				}
+				if a.speculative && a.outcome != "" && e.cfg.Metrics != nil {
+					e.cfg.Metrics.IncSpeculativePromoted(e.metricLabels())
 				}
 			}
 		}
@@ -1631,6 +1643,21 @@ func (e *Engine) ensureRootAnchor(ctx context.Context, runID string) (string, er
 	return head, nil
 }
 
+// unresolvedEarlier returns, in PR order, the candidate PRs of every active
+// batch of runID whose first PR is left of beforePR. These are the earlier
+// nodes a speculatively-staged node is racing ahead of; assuming they all pass
+// gives the single most likely accumulator for the speculative integration.
+func (e *Engine) unresolvedEarlier(runID string, beforePR int) []forge.PullRequest {
+	var out []forge.PullRequest
+	for _, a := range e.active {
+		if a.runID == runID && len(a.prs) > 0 && a.prs[0].Number < beforePR {
+			out = append(out, a.prs...)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	return out
+}
+
 // stagingBranchFor names a staging branch for a batch at a known point in the
 // bisection tree. Callers pass the run this batch belongs to and its path.
 
@@ -1810,6 +1837,9 @@ func (e *Engine) supersedeSpeculative(ctx context.Context, a *activeBatch) {
 	e.enqueueWithState("re-staged on the resolved frontier baseline", numbersOf(a.prs))
 	e.logger.Info("speculative batch superseded; re-staging on resolved baseline",
 		"prs", numbersOf(a.prs), "path", a.lineagePath)
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.IncSpeculativeSuperseded(e.metricLabels())
+	}
 }
 
 func (e *Engine) requeueStaleActives(ctx context.Context) {
