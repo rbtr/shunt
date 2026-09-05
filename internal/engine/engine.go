@@ -588,9 +588,8 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if len(prs) == 0 {
-		// Every PR of this candidate withdrew before it could be staged. If it
-		// was a bisection node, consume its lineage and record it so the root
-		// it belonged to is not left waiting on a node that will never run.
+		// Remove lineage when all PRs leave a candidate before staging.
+		// This lets its root continue finalization.
 		if len(cand) > 0 {
 			if runID := e.lineageRunID[cand[0]]; runID != "" {
 				path := e.lineage[cand[0]]
@@ -613,11 +612,8 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 	speculative := false
 	if tree, ok := e.trees[runID]; ok {
 		baseline := append([]forge.PullRequest(nil), tree.accepted...)
-		// If earlier nodes of this root are still unresolved, this node is
-		// being staged ahead of the frontier (fanout). Assume every earlier
-		// unresolved sibling passes and include its PRs — the single most
-		// likely accumulator. checkActive supersedes and re-stages if the
-		// assumption turns out wrong.
+		// Include unresolved earlier nodes in a speculative staging attempt.
+		// checkActive replaces this attempt when its baseline is not valid.
 		if earlier := e.unresolvedEarlier(runID, cand[0]); len(earlier) > 0 {
 			baseline = append(baseline, earlier...)
 			speculative = true
@@ -636,10 +632,7 @@ func (e *Engine) startNext(ctx context.Context) (bool, error) {
 		}
 	}
 	stagingBranch := e.stagingBranchFor(runID, lineagePath)
-	// Every integration under a root is built on that root's immutable anchor,
-	// not the live base tip, so main moving mid-tree cannot change what a
-	// staged result means. Detecting and acting on such a move (root
-	// invalidation) is a separate change.
+	// Build each root child on the root's fixed base anchor.
 	sha, conflictPR, err := e.st.BuildStaging(ctx, e.cfg.Base, anchor, stagingBranch, refs)
 	if err != nil {
 		if conflictPR > 0 {
