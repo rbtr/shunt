@@ -444,6 +444,33 @@ func TestRunStatusSucceedsWhenNewestMatchingTasksAreTerminalGreen(t *testing.T) 
 	}
 }
 
+func TestRunStatusFailsWhenAnyLatestMatchingWorkflowFails(t *testing.T) {
+	c := newRunStatusDualEndpointClient(t,
+		runsResponse{WorkflowRuns: []workflowRun{
+			{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 9, WorkflowID: "gate.yaml", Status: "failure"},
+			{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 8, WorkflowID: "ci.yaml", Status: "success"},
+		}},
+		tasksResponse{},
+	)
+	status, err := c.RunStatus(context.Background(), "o", "r", "sha", "mq/main/staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "failure" {
+		t.Fatalf("RunStatus = %q, want failure", status)
+	}
+}
+
+func TestRunStatusWaitsForWorkflowWithoutStatus(t *testing.T) {
+	status := aggregateMatchingRuns([]workflowRun{
+		{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 9, WorkflowID: "gate.yaml"},
+		{CommitSHA: "sha", PrettyRef: "mq/main/staging", IndexInRepo: 8, WorkflowID: "ci.yaml", Status: "success"},
+	}, "sha", "mq/main/staging")
+	if status != "" {
+		t.Fatalf("aggregateMatchingRuns = %q, want empty status", status)
+	}
+}
+
 func TestRunStatusUsesRunAggregateBeforeMaterializedTaskRows(t *testing.T) {
 	c := newRunStatusDualEndpointClient(t,
 		runsResponse{WorkflowRuns: []workflowRun{
