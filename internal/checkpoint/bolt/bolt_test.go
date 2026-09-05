@@ -19,23 +19,48 @@ func TestStoreSavesLoadsAndDeletesQueue(t *testing.T) {
 	defer store.Close()
 
 	snapshot := checkpoint.QueueSnapshot{
-		Key: checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
+		FormatVersion: checkpoint.CurrentFormatVersion,
+		Key:           checkpoint.QueueKey{Owner: "o", Repo: "r", Base: "main"},
 		Pending: [][]int{
 			{1, 2},
 			{3},
 		},
+		PendingNodes: []checkpoint.PendingNodeSnapshot{{PRs: []int{3}, RunID: "run-1", Path: "r1"}},
 		Active: []checkpoint.ActiveBatchSnapshot{{
 			PRs: []checkpoint.PullRequestSnapshot{
 				{Number: 4, HeadSHA: "head-4"},
 			},
-			StagingBranch:  "mq/main/staging",
+			StagingBranch:  "mq/main/staging-4",
 			StagingSHA:     "stage-4",
 			BaseGeneration: 2,
 			Outcome:        "failure",
+			PhaseSince:     time.Date(2026, 6, 24, 10, 1, 0, 0, time.UTC),
+			RunID:          "run-1",
+			LineagePath:    "r0",
+			ExactKey:       "base-1|head-4",
+			BaseAnchor:     "base-1",
+			DebugURL:       "https://forge.example/runs/4",
+			Speculative:    true,
 		}},
 		LingerSince:     time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
 		BaseGeneration:  2,
 		StagingSequence: 7,
+		Trees: []checkpoint.BisectionTreeSnapshot{{
+			RunID:    "run-1",
+			Anchor:   "base-1",
+			Open:     1,
+			Accepted: []checkpoint.PullRequestSnapshot{{Number: 1, HeadSHA: "head-1"}},
+			Results:  map[string]string{"base-1|head-1": "success"},
+			Held: []checkpoint.HeldLeafSnapshot{{
+				Batch: checkpoint.ActiveBatchSnapshot{
+					PRs:           []checkpoint.PullRequestSnapshot{{Number: 2, HeadSHA: "head-2"}},
+					StagingBranch: "mq/main/staging-2",
+					StagingSHA:    "stage-2",
+				},
+				Outcome: "failure",
+			}},
+		}},
+		TransitionOutbox: []checkpoint.OutboxTransitionSnapshot{{Kind: "replaced", PRs: []int{4}, EventID: "event-4"}},
 	}
 
 	if err := store.SaveQueue(context.Background(), snapshot); err != nil {
