@@ -763,6 +763,7 @@ func (e *Engine) checkActive(ctx context.Context) (bool, error) {
 				}
 
 				prs := a.prs
+				e.markBatchSuperseded(a, "staging gate produced no result")
 				e.cleanupBatch(ctx, a)
 				refs := make([]gitops.MergedRef, len(prs))
 				for i, pr := range prs {

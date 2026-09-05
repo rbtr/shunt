@@ -1796,6 +1796,15 @@ func TestMissingGateRetriesWithBackoffThenBounces(t *testing.T) {
 		if got := e.active[0].missingGateRetries; got != retry {
 			t.Fatalf("missing-gate retries = %d, want %d", got, retry)
 		}
+		found := false
+		for _, tr := range e.Transitions() {
+			if tr.Kind == "node_superseded" && tr.StagingBranch == m.stagingBranches[retry-1] {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("retry %d did not report the replaced staging attempt", retry)
+		}
 	}
 	if got := fmt.Sprint(m.calls); !strings.Contains(got, "delete:mq/main/staging") {
 		t.Fatalf("calls = %s, want stale staging branch deleted", got)
